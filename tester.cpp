@@ -5,18 +5,45 @@
 #include "spallocator/slab.hpp"
 
 
-TEST(SlabTest, CreateSmallSlab)
+TEST(SlabTest, CreateSlabs)
 {
-    spallocator::Slab<64> small_slab;
-    EXPECT_EQ(small_slab.getElemSize(), 64);
-    EXPECT_EQ(small_slab.getSlabAllocSize(), 4096);
-}
+    {
+        spallocator::Slab<64> slab;
+        EXPECT_EQ(slab.getElemSize(), 64);
+        EXPECT_EQ(slab.getAllocSize(), 4_KB);
+    }
 
-TEST(SlabTest, CreateLargeSlab)
-{
-    spallocator::Slab<8_K> large_slab;
-    EXPECT_EQ(large_slab.getElemSize(), 8_K);
-    EXPECT_EQ(large_slab.getSlabAllocSize(), 32_K);
+    {
+        spallocator::Slab<128> slab;
+        EXPECT_EQ(slab.getElemSize(), 128);
+        EXPECT_EQ(slab.getAllocSize(), 4_KB);
+    }
+
+    {
+        spallocator::Slab<1_KB> slab;
+        EXPECT_EQ(slab.getElemSize(), 1_KB);
+        EXPECT_EQ(slab.getAllocSize(), 4_KB);
+    }
+
+    {
+        spallocator::Slab<2_KB> slab;
+        EXPECT_EQ(slab.getElemSize(), 2_KB);
+        EXPECT_EQ(slab.getAllocSize(), 8_KB);
+    }
+
+    {
+        spallocator::Slab<16_KB> slab;
+        EXPECT_EQ(slab.getElemSize(), 16_KB);
+        EXPECT_EQ(slab.getAllocSize(), 64_KB);
+    }
+
+    {
+        // not an even multiple of 1024
+        spallocator::Slab<12345> slab;
+        EXPECT_EQ(slab.getElemSize(), 12345);
+        EXPECT_EQ(slab.getAllocSize(), 49380);
+    }
+
 }
 
 
