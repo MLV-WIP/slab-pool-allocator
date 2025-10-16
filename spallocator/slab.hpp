@@ -28,19 +28,44 @@ namespace spallocator
     }
 
 
+    class AbstractSlab
+    {
+    public: // methods
+        virtual std::byte* allocateItem() = 0;
+        virtual void deallocateItem(std::byte* item) = 0;
+
+        virtual ~AbstractSlab() = default;
+
+    protected: // methods
+        AbstractSlab() = default;
+
+        virtual constexpr std::size_t getElemSize() const = 0;
+        virtual constexpr std::size_t getAllocSize() const = 0;
+        virtual const std::size_t getAllocatedMemory() const = 0;
+
+    private: // methods
+        AbstractSlab(const AbstractSlab&) = delete;
+        AbstractSlab& operator=(const AbstractSlab&) = delete;
+        AbstractSlab(AbstractSlab&&) = delete;
+        AbstractSlab& operator=(AbstractSlab&&) = delete;
+    };
+
+
     template<const std::size_t ElemSize>
-    class Slab
+    class Slab: public AbstractSlab
     {
     public: // methods
         std::byte* allocateItem();
-        void freeItem(std::byte* item);
-
-        Slab();
-        ~Slab();
+        void deallocateItem(std::byte* item);
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
         constexpr std::size_t getAllocSize() const { return slab_alloc_size; }
         const std::size_t getAllocatedMemory() const { return slab_data.size() * slab_alloc_size; }
+
+        std::optional<std::size_t> findSlabForItem(std::byte* item) const;
+
+        Slab();
+        virtual ~Slab();
 
     private: // methods
         Slab(const Slab&) = delete;
@@ -68,6 +93,8 @@ namespace spallocator
         std::vector<std::bitset<slab_alloc_size / ElemSize>> slab_map;
         static constexpr std::size_t max_slabs{4_GB / slab_alloc_size};
         std::bitset<max_slabs> slab_available_map;
+
+        std::map<std::byte*, std::size_t> base_address_map;
     };
 
 
@@ -148,37 +175,69 @@ namespace spallocator
 
 
     template<const std::size_t ElemSize>
-    void Slab<ElemSize>::freeItem(std::byte* item)
+    std::optional<std::size_t> Slab<ElemSize>::findSlabForItem(std::byte* item) const
     {
-        // Find which slab this item belongs to
-        for (std::size_t slab_index = 0; slab_index < slab_data.size(); ++slab_index)
+        auto it = base_address_map.upper_bound(item);
+        if (it != base_address_map.begin())
         {
-            auto slab_start = slab_data[slab_index];
+            --it;
+            auto slab_start = it->first;
             auto slab_end = slab_start + slab_alloc_size;
             if (item >= slab_start && item < slab_end)
             {
-                // Calculate the item index within the slab
-                std::size_t item_index = (item - slab_start) / ElemSize;
-                auto& slab_slots = slab_map[slab_index];
-                if (slab_slots.test(item_index))
-                {
-                    // Free the item
-                    slab_slots.reset(item_index);
-                    // This slab now has free space
-                    slab_available_map.set(slab_index);
-                    println("Item freed ({}/{}), slab_map: {}",
-                            slab_index, item_index, printHex(slab_slots));
-                    return;
-                }
-                else
-                {
-                    throw std::invalid_argument("Item is already free");
-                }
+                return it->second;
+            }
+            else
+            {
+                // given the pointer base ranges, it should be here, but it turns
+                // out not to be within the begin-end range
+                println("Item {} cannot be found in slab range {} - {}",
+                        static_cast<void*>(item),
+                        static_cast<void*>(slab_start),
+                        static_cast<void*>(slab_end));
+            }
+        }
+        return std::nullopt;
+    }
+
+
+    template<const std::size_t ElemSize>
+    void Slab<ElemSize>::deallocateItem(std::byte* item)
+    {
+        // Find which slab this item belongs to
+        if (auto slab_index_opt = findSlabForItem(item); !slab_index_opt.has_value())
+        {
+            throw std::invalid_argument("Invalid item pointer");
+        }
+        else
+        {
+            auto slab_index = *slab_index_opt;
+
+            auto slab_start = slab_data[slab_index];
+            auto slab_end = slab_start + slab_alloc_size;
+
+            // Calculate the item index within the slab
+            std::size_t item_index = (item - slab_start) / ElemSize;
+            auto& slab_slots = slab_map[slab_index];
+            if (slab_slots.test(item_index))
+            {
+                // Free the item
+                slab_slots.reset(item_index);
+                // This slab now has free space
+                slab_available_map.set(slab_index);
+                println("Item freed ({}/{}), slab_map: {}",
+                        slab_index, item_index, printHex(slab_slots));
+                return;
+            }
+            else
+            {
+                throw std::invalid_argument("Item is already free");
             }
         }
 
         throw std::invalid_argument("Invalid item pointer");
     }
+
 
     template<const std::size_t ElemSize>
     Slab<ElemSize>::Slab()
@@ -214,6 +273,7 @@ namespace spallocator
         // allocate a new slab of memory
         std::byte* new_slab = new std::byte[slab_alloc_size];
         slab_data.push_back(new_slab);
+        base_address_map[new_slab] = slab_data.size() - 1;
         slab_map.emplace_back();
     }
 
