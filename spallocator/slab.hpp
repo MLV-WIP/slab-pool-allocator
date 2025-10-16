@@ -3,6 +3,14 @@
 
 #include <cstddef>
 #include <type_traits>
+#include <vector>
+#include <bitset>
+#include <stdexcept>
+#include <string>
+#include <format>
+#include <iostream>
+
+#include "helper.hpp"
 
 
 namespace spallocator
@@ -10,10 +18,10 @@ namespace spallocator
 
     template<std::size_t ElemSize>
     constexpr std::size_t selectBufferSize() {
-        if constexpr (ElemSize <= 1_KB) {
+        // for small element sizes, pre-allocate a buffer large enough to
+        // hold multiple elements to reduce the number of allocations
+        if constexpr (ElemSize < 1_KB) {
             return 4_KB;
-        } else if constexpr (ElemSize <= 2_KB) {
-            return 8_KB;
         } else {
             return ElemSize * 4;
         }
@@ -23,18 +31,26 @@ namespace spallocator
     template<const std::size_t ElemSize>
     class Slab
     {
-    public:
+    public: // methods
+        std::byte* allocateItem();
+        void freeItem(std::byte* item);
+
         Slab();
-        ~Slab() = default;
+        ~Slab();
+
+        constexpr std::size_t getElemSize() const { return ElemSize; }
+        constexpr std::size_t getAllocSize() const { return slab_alloc_size; }
+        const std::size_t getAllocatedMemory() const { return slab_data.size() * slab_alloc_size; }
+
+    private: // methods
         Slab(const Slab&) = delete;
         Slab& operator=(const Slab&) = delete;
         Slab(Slab&&) = delete;
         Slab& operator=(Slab&&) = delete;
 
-        constexpr std::size_t getElemSize() const { return ElemSize; }
-        constexpr std::size_t getAllocSize() const { return slab_alloc_size; }
-
-    private:
+        void allocateNewSlab();
+    
+    private: // data members
         static constexpr std::size_t slab_alloc_size{selectBufferSize<ElemSize>()};
         static_assert(slab_alloc_size >= 4_KB, "Allocation size must be greater than 4096 bytes");
         static_assert(
@@ -45,15 +61,162 @@ namespace spallocator
         static constexpr std::size_t alloc_multiplier{2};
         static_assert(alloc_multiplier >= 2, "Allocation multiplier must be at least 2");
         static_assert(alloc_multiplier % 2 == 0, "Allocation multiplier must be a multiple of 2");
+
+        std::vector<std::byte*> slab_data;
+        // bitsets could be optimized more by creating custom bitset class
+        // with 64-bit chunks that can be compared atomically
+        std::vector<std::bitset<slab_alloc_size / ElemSize>> slab_map;
+        static constexpr std::size_t max_slabs{4_GB / slab_alloc_size};
+        std::bitset<max_slabs> slab_available_map;
     };
 
+
+    // Helper for debug output
+    template<std::size_t N>
+    std::string printHex(const std::bitset<N>& bits)
+    {
+        std::string out;
+
+        // Process in 32-bit chunks from high to low
+        for (std::size_t chunk = (N + 31) / 32; chunk-- > 0; )
+        {
+            std::size_t start = chunk * 32;
+            std::size_t end = std::min(start + 32, N);
+
+            // Extract 32-bit value
+            uint32_t value = 0;
+            for (std::size_t i = start; i < end; ++i)
+            {
+                if (bits[i])
+                {
+                    value |= (1U << (i - start));
+                }
+            }
+
+            // Print with separator
+            if (chunk < (N + 31) / 32 - 1)
+            {
+                out += " ";
+            }
+            out += std::format("{:08X}", value);
+        }
+        return out;
+    }
+
+
+    template<const std::size_t ElemSize>
+    std::byte* Slab<ElemSize>::allocateItem()
+    {
+        // Find a free item in the slabs
+        for (std::size_t slab_index = 0; slab_index <= slab_map.size(); ++slab_index)
+        {
+            if (!slab_available_map.test(slab_index))
+            {
+                // this slab is full
+                continue;
+            }
+
+            while (slab_index >= slab_data.size())
+            {
+                // need to allocate a new slab
+                allocateNewSlab();
+                println("New slab allocated, total slabs: {}/{}",
+                        slab_data.size(), slab_map.size());
+            }
+
+            auto& slab_slots = slab_map[slab_index];
+            for (std::size_t item_index = 0; item_index < slab_slots.size(); ++item_index)
+            {
+                if (!slab_slots.test(item_index))
+                {
+                    // Found a free item
+                    slab_slots.set(item_index);
+                    if (slab_slots.all())
+                    {
+                        // this slab is now full
+                        slab_available_map.reset(slab_index);
+                    }
+                    println("Item allocated ({}/{}), slab_map: {}",
+                            slab_index, item_index, printHex(slab_slots));
+                    return slab_data[slab_index] + item_index * ElemSize;
+                }
+            }
+        }
+
+        throw std::out_of_range(std::format("Memory for {}-byte slab has been exhausted", ElemSize));
+    }
+
+
+    template<const std::size_t ElemSize>
+    void Slab<ElemSize>::freeItem(std::byte* item)
+    {
+        // Find which slab this item belongs to
+        for (std::size_t slab_index = 0; slab_index < slab_data.size(); ++slab_index)
+        {
+            auto slab_start = slab_data[slab_index];
+            auto slab_end = slab_start + slab_alloc_size;
+            if (item >= slab_start && item < slab_end)
+            {
+                // Calculate the item index within the slab
+                std::size_t item_index = (item - slab_start) / ElemSize;
+                auto& slab_slots = slab_map[slab_index];
+                if (slab_slots.test(item_index))
+                {
+                    // Free the item
+                    slab_slots.reset(item_index);
+                    // This slab now has free space
+                    slab_available_map.set(slab_index);
+                    println("Item freed ({}/{}), slab_map: {}",
+                            slab_index, item_index, printHex(slab_slots));
+                    return;
+                }
+                else
+                {
+                    throw std::invalid_argument("Item is already free");
+                }
+            }
+        }
+
+        throw std::invalid_argument("Invalid item pointer");
+    }
 
     template<const std::size_t ElemSize>
     Slab<ElemSize>::Slab()
     {
         println("Slab created with element size: {}, allocation size: {}, and multiplier: {}",
                 getElemSize(), getAllocSize(), alloc_multiplier);
+        
+        // all slabs are initially available
+        slab_available_map.set();
+
+        allocateNewSlab();
     }
+
+    template<const std::size_t ElemSize>
+    Slab<ElemSize>::~Slab()
+    {
+        println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
+        for (auto ptr : slab_data) {
+            delete[] ptr;
+        }
+    }
+
+    template<const std::size_t ElemSize>
+    void Slab<ElemSize>::allocateNewSlab()
+    {
+        if (slab_data.size() >= max_slabs)
+        {
+            throw std::out_of_range(
+                std::format("Cannot allocate more than {} slabs of size {} bytes",
+                            max_slabs, slab_alloc_size));
+        }
+    
+        // allocate a new slab of memory
+        std::byte* new_slab = new std::byte[slab_alloc_size];
+        slab_data.push_back(new_slab);
+        slab_map.emplace_back();
+    }
+
 
 }; // namespace spallocator
 

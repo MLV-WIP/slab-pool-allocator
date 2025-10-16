@@ -1,5 +1,5 @@
 GTESTDIR := /opt/homebrew/Cellar/googletest/1.17.0
-CXXFLAGS := -std=c++20 -I./spallocator -I$(GTESTDIR)/include -I/usr/local/include -MMD -MP
+CXXFLAGS := -Og -ggdb -std=c++20 -I./spallocator -I$(GTESTDIR)/include -I/usr/local/include -MMD -MP
 LDFLAGS  := -L$(GTESTDIR)/lib -L/usr/local/lib -lgtest
 
 OBJDIR := ./obj
