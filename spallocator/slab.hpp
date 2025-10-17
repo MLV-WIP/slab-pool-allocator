@@ -31,7 +31,7 @@ namespace spallocator
     class AbstractSlab
     {
     public: // methods
-        virtual std::byte* allocateItem() = 0;
+        virtual std::byte* allocateItem(std::size_t size) = 0;
         virtual void deallocateItem(std::byte* item) = 0;
 
         virtual ~AbstractSlab() = default;
@@ -39,9 +39,9 @@ namespace spallocator
     protected: // methods
         AbstractSlab() = default;
 
-        virtual constexpr std::size_t getElemSize() const = 0;
-        virtual constexpr std::size_t getAllocSize() const = 0;
-        virtual const std::size_t getAllocatedMemory() const = 0;
+        //virtual constexpr std::size_t getElemSize() const = 0;
+        //virtual constexpr std::size_t getAllocSize() const = 0;
+        //virtual const std::size_t getAllocatedMemory() const = 0;
 
     private: // methods
         AbstractSlab(const AbstractSlab&) = delete;
@@ -55,7 +55,7 @@ namespace spallocator
     class Slab: public AbstractSlab
     {
     public: // methods
-        std::byte* allocateItem();
+        std::byte* allocateItem(std::size_t size);
         void deallocateItem(std::byte* item);
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
@@ -98,6 +98,29 @@ namespace spallocator
     };
 
 
+    // SlabProxy does not manage its own memory; it delegates to
+    // standard memory allocation methods for large memory
+    // allocations that aren't suitable for small-memory slab
+    // optimizations
+    class SlabProxy: public AbstractSlab
+    {
+    public: // methods
+        std::byte* allocateItem(std::size_t size);
+        void deallocateItem(std::byte* item);
+
+        SlabProxy() = default;
+        virtual ~SlabProxy() = default;
+
+    private: // methods
+        SlabProxy(const SlabProxy&) = delete;
+        SlabProxy& operator=(const SlabProxy&) = delete;
+        SlabProxy(SlabProxy&&) = delete;
+        SlabProxy& operator=(SlabProxy&&) = delete;
+
+    private: // data members
+    };
+
+
     // Helper for debug output
     template<std::size_t N>
     std::string printHex(const std::bitset<N>& bits)
@@ -132,8 +155,11 @@ namespace spallocator
 
 
     template<const std::size_t ElemSize>
-    std::byte* Slab<ElemSize>::allocateItem()
+    std::byte* Slab<ElemSize>::allocateItem(std::size_t size)
     {
+        runtime_assert(size <= ElemSize,
+            std::format("Requested size {} exceeds slab element size {}", size, ElemSize));
+
         // Find a free item in the slabs
         for (std::size_t slab_index = 0; slab_index <= slab_map.size(); ++slab_index)
         {
@@ -275,6 +301,29 @@ namespace spallocator
         slab_data.push_back(new_slab);
         base_address_map[new_slab] = slab_data.size() - 1;
         slab_map.emplace_back();
+    }
+
+
+    inline std::byte* SlabProxy::allocateItem(std::size_t elem_size)
+    {
+        runtime_assert(elem_size > 1_KB,
+            std::format("SlabProxy should only be used for large allocations, got {}", elem_size));
+        runtime_assert(elem_size <= 1_GB,
+            std::format("Requested size {} exceeds maximum allowed size for SlabProxy", elem_size));
+
+        // allocate memory using standard methods
+        std::byte* item = new std::byte[elem_size];
+        println("Allocated {} bytes via SlabProxy, ptr={}",
+                elem_size, static_cast<void*>(item));
+        return item;
+    }
+
+
+    inline void SlabProxy::deallocateItem(std::byte* item)
+    {
+        // deallocate memory using standard methods
+        println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));
+        delete[] item;
     }
 
 

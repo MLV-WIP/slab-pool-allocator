@@ -64,13 +64,13 @@ TEST(SlabTest, AllocateItems)
     std::vector<std::byte*> items;
     for (int i = 0; i < 32; ++i)
     {
-        auto item = slab.allocateItem();
+        auto item = slab.allocateItem(120);
         EXPECT_NE(item, nullptr);
         items.push_back(item);
     }
 
     // next allocation should cause a new slab to be allocated
-    auto item = slab.allocateItem();
+    auto item = slab.allocateItem(120);
     EXPECT_NE(item, nullptr);
     items.push_back(item);
 
@@ -78,13 +78,13 @@ TEST(SlabTest, AllocateItems)
 
     for (int i = 0; i < 31; ++i)
     {
-        auto item = slab.allocateItem();
+        auto item = slab.allocateItem(120);
         EXPECT_NE(item, nullptr);
         items.push_back(item);
     }
 
     // next allocation should cause a new slab to be allocated
-    item = slab.allocateItem();
+    item = slab.allocateItem(120);
     EXPECT_NE(item, nullptr);
     items.push_back(item);
 
@@ -99,7 +99,7 @@ TEST(SlabTest, AllocateItems)
     // allocate again, should reuse freed items
     for (int i = 0; i < 65; ++i)
     {
-        auto item = slab.allocateItem();
+        auto item = slab.allocateItem(120);
         EXPECT_NE(item, nullptr);
     }
 
