@@ -233,7 +233,7 @@ namespace spallocator
         // Find which slab this item belongs to
         if (auto slab_index_opt = findSlabForItem(item); !slab_index_opt.has_value())
         {
-            throw std::invalid_argument("Invalid item pointer");
+            throw std::invalid_argument("Invalid item pointer; no corresponding slab found");
         }
         else
         {
@@ -261,7 +261,7 @@ namespace spallocator
             }
         }
 
-        throw std::invalid_argument("Invalid item pointer");
+        throw std::invalid_argument("Invalid item pointer; item not found in slab");
     }
 
 

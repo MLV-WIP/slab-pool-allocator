@@ -161,38 +161,46 @@ TEST(PoolTest, AllocateItems)
 {
     spallocator::Pool pool;
 
-    std::vector<std::byte*> items;
+    std::map<std::size_t, std::byte*> items;
 
     // allocate various sizes
-    for (std::size_t size : {16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
-                             1500, 2000, 3000, 4000, 5000, 8000, 16000, 32000})
+    for (std::size_t size : {8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128,
+                             160, 192, 224, 256, 320, 384, 448, 512, 640, 768,
+                             896, 1024, 1280, 1536, 1792, 2048, 2560, 3072,
+                             3584, 4096, 4512, 768, 1024, 1500, 2000, 3000,
+                             4000, 5000, 8000, 16000, 32000})
     {
         auto item = pool.allocate(size);
         EXPECT_NE(item, nullptr);
-        items.push_back(item);
+        items[size] = item;
     }
 
     // free all items
     for (auto it : items)
     {
-        pool.deallocate(it);
+        println("Deallocating item of size {} at ptr={}", it.first, static_cast<void*>(it.second));
+        pool.deallocate(it.second);
     }
 
     items.clear();
 
     // allocate again to ensure reuse of freed items
-    for (std::size_t size : {16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
-                             1500, 2000, 3000, 4000, 5000, 8000, 16000, 32000})
+    for (std::size_t size : {8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128,
+                             160, 192, 224, 256, 320, 384, 448, 512, 640, 768,
+                             896, 1024, 1280, 1536, 1792, 2048, 2560, 3072,
+                             3584, 4096, 4512, 768, 1024, 1500, 2000, 3000,
+                             4000, 5000, 8000, 16000, 32000})
     {
         auto item = pool.allocate(size);
         EXPECT_NE(item, nullptr);
-        items.push_back(item);
+        items[size] = item;
     }
 
     // free all items again
     for (auto it : items)
     {
-        pool.deallocate(it);
+        println("Deallocating item of size {} at ptr={}", it.first, static_cast<void*>(it.second));
+        pool.deallocate(it.second);
     }
 }
 
