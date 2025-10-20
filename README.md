@@ -16,6 +16,7 @@ This project demonstrates a high-performance memory allocation strategy using th
 - **Large Allocation Support**: Seamless fallback to standard allocation for sizes > 1 KB
 - **Memory Reuse**: Efficient tracking and reuse of freed memory slots
 - **Type Safety**: Modern C++ with strong type safety and constexpr support
+- **Lightweight SpinLock**: Custom spinlock implementation with escalating backoff for thread synchronization
 
 ## Architecture
 
@@ -86,7 +87,42 @@ Handles large allocations by delegating to standard allocators.
 - **When NOT to pool**: Large allocations are infrequent and don't benefit from pre-allocation overhead
 - **Interface uniformity**: Same `allocateItem()`/`deallocateItem()` API regardless of backend
 
-#### 4. **Helper Utilities** (`spallocator/helper.hpp`)
+#### 4. **SpinLock** (`spallocator/spinlock.hpp`)
+
+A lightweight spinlock for thread synchronization with advanced contention handling.
+
+**Key Concepts Demonstrated**:
+- **Atomic Operations**: Lock-free synchronization using `std::atomic_flag`
+- **Test-and-Test-and-Set (TTAS)**: Optimized spinning to reduce cache coherency traffic
+- **Escalating Backoff**: Progressively increasing wait times to reduce contention under high load
+- **BasicLockable Concept**: Compatible with `std::scoped_lock` and `std::unique_lock`
+
+```cpp
+class SpinLock {
+    void lock();        // TTAS with escalating backoff
+    bool try_lock();    // Non-blocking acquisition attempt
+    void unlock();      // Release with notification
+};
+```
+
+**Design Insights**:
+- Uses thread-local random number generator to randomize initial backoff times
+- Implements a 10-iteration backoff strategy before blocking with `wait()`
+- Doubles wait time on each failed acquisition (escalating backoff: `wait_time += wait_time`)
+- Uses memory order acquire/release semantics for proper synchronization
+
+**Educational Highlights**:
+- **TTAS optimization**: First checks lock state with relaxed ordering (cheaper) before attempting acquisition
+- **Escalating backoff strategy**: Prevents "thundering herd" when lock becomes available by staggering retry attempts; avoids excessive wait times of true exponential backoff
+- **Memory ordering**: `acquire` on lock ensures subsequent reads see prior writes; `release` on unlock publishes changes
+- **Thread-local RNG**: Efficient per-thread randomization without synchronization overhead
+- **Notification mechanism**: C++20 `atomic_flag::wait()`/`notify_one()` for efficient blocking when contention is high
+
+**When to use SpinLocks vs Mutexes**:
+- **SpinLocks**: Short critical sections, low contention, known bounded wait times
+- **Mutexes**: Longer critical sections, high contention, unpredictable wait times (avoid wasting CPU cycles)
+
+#### 5. **Helper Utilities** (`spallocator/helper.hpp`)
 
 Common utilities and modern C++ conveniences.
 
@@ -312,6 +348,13 @@ The test suite (`tester.cpp`) includes:
   - Deallocate-in-different-order scenarios
   - Large allocation handling
 
+- **SpinLock Tests**: Validate thread synchronization and contention handling
+  - Basic locking and unlocking
+  - Backoff behavior under contention (may occasionally fail due to timing)
+  - `try_lock()` functionality
+  - Multi-threaded stress testing (10 threads, 1000 increments each)
+  - STL compatibility (`std::scoped_lock`, `std::unique_lock`)
+
 ## Learning Objectives
 
 This codebase teaches several important concepts:
@@ -326,6 +369,8 @@ This codebase teaches several important concepts:
 - `std::format` for type-safe formatting
 - `std::source_location` for debugging context
 - `std::optional` for optional return values
+- `std::atomic_flag::wait()`/`notify_one()` for efficient blocking (C++20)
+- Thread-local storage with `thread_local` keyword
 
 ### 3. **Memory Management Patterns**
 - Slab allocation vs. general-purpose allocation
@@ -345,10 +390,17 @@ This codebase teaches several important concepts:
 - Amortized constant-time operations
 - Space-time tradeoffs (e.g., bitsets vs. free lists)
 
-### 6. **Software Engineering Practices**
-- Clear separation of concerns (Slab vs Pool vs Proxy)
+### 6. **Concurrency and Synchronization**
+- Lock-free operations with atomic types
+- Memory ordering semantics (acquire/release)
+- Contention handling strategies (escalating backoff)
+- Test-and-Test-and-Set optimization
+- STL BasicLockable concept compliance
+
+### 7. **Software Engineering Practices**
+- Clear separation of concerns (Slab vs Pool vs Proxy vs SpinLock)
 - Non-copyable/non-moveable resource classes
-- Comprehensive unit testing
+- Comprehensive unit testing including concurrent scenarios
 - Debug output for observability
 
 ## Future Enhancements
@@ -359,9 +411,14 @@ This codebase teaches several important concepts:
   - **Educational Value**: Demonstrates how to integrate custom allocators with STL components
   - **Implementation**: Requires allocator traits and proper rebinding
 
-- [ ] **Thread Safety**: Mutex protection for concurrent allocations
-  - **Educational Value**: Shows thread-safe data structure design patterns
+- [x] **SpinLock Implementation**: Lightweight lock with escalating backoff ✓ **COMPLETED**
+  - **Educational Value**: Lock-free programming, atomic operations, memory ordering
+  - **Features**: TTAS optimization, escalating backoff, STL compatibility
+
+- [ ] **Thread-Safe Pool**: Integrate SpinLock with Pool for concurrent allocations
+  - **Educational Value**: Thread-safe data structure design patterns
   - **Consideration**: Per-slab locking vs. global locking tradeoffs
+  - **Status**: SpinLock implemented, integration with Pool pending
 
 - [ ] **Statistics**: Memory usage tracking and reporting
   - **Metrics**: Allocation count, fragmentation ratio, peak usage
@@ -404,6 +461,10 @@ This codebase teaches several important concepts:
 | Allocation (amortized) | O(1) | Typically finds slot quickly due to availability map |
 | Deallocation | O(log m) | m = number of slabs, due to map lookup |
 | Slab Selection | O(1) | Compile-time constexpr lookup table |
+| SpinLock lock() (no contention) | O(1) | Single atomic test-and-set |
+| SpinLock lock() (contention) | O(k) | k = backoff iterations (max 10), then blocks |
+| SpinLock try_lock() | O(1) | Non-blocking, returns immediately |
+| SpinLock unlock() | O(1) | Single atomic clear + notification |
 
 **Educational Insight**: The "amortized O(1)" claim requires explanation:
 - If slabs are mostly empty, free slots are found immediately → O(1)
@@ -448,6 +509,36 @@ Real-world performance is typically excellent because:
 **Educational Insight**: This is a key advantage of slab allocators - they eliminate external fragmentation at the cost of some internal fragmentation. The size class selection is critical: more classes reduce internal fragmentation but increase metadata overhead.
 
 ## Advanced Topics
+
+### SpinLock Design Decisions
+
+The SpinLock implementation demonstrates several sophisticated techniques:
+
+**1. Test-and-Test-and-Set (TTAS)**
+- First reads lock state with relaxed memory ordering (cheap, no cache coherency traffic)
+- Only attempts expensive test-and-set when lock appears free
+- Reduces cache line bouncing between cores under contention
+
+**2. Escalating Backoff**
+- Initial wait time: random 1-100ns (randomized via thread-local RNG)
+- Each failed attempt: doubles wait time via addition (`wait_time += wait_time`)
+- Prevents "thundering herd" when lock becomes available
+- Avoids excessive delays of true exponential backoff (keeps growth manageable)
+- After 10 iterations: blocks using `wait()` to avoid wasting CPU cycles
+
+**3. Memory Ordering**
+- `test()` uses `memory_order_relaxed`: no synchronization needed, just checking state
+- `test_and_set()` uses `memory_order_acquire`: ensures subsequent reads see prior writes
+- `clear()` uses `memory_order_release`: publishes all prior writes to other threads
+- `notify_one()`: wakes one waiting thread when lock is released
+
+**4. Why Thread-Local RNG?**
+- Each thread needs different backoff times to avoid synchronized retry attempts
+- Thread-local avoids synchronization overhead of shared RNG
+- `std::minstd_rand` is lightweight (single 32-bit state)
+- Seeded from `std::random_device` for true randomness
+
+**Educational Insight**: This spinlock is production-quality and demonstrates that "simple" primitives require deep understanding of hardware (cache coherency), concurrency (memory ordering), and algorithm design (escalating backoff) to achieve good performance.
 
 ### Why Slab Allocation?
 
@@ -517,6 +608,8 @@ The code includes extensive debug output (via `println()`):
 ### C++ Resources
 - [C++23 Features](https://en.cppreference.com/w/cpp/23) - Reference for modern C++ used in this project
 - [Allocator Requirements](https://en.cppreference.com/w/cpp/named_req/Allocator) - Standard allocator interface
+- [Memory Ordering](https://en.cppreference.com/w/cpp/atomic/memory_order) - Understanding acquire/release semantics
+- [BasicLockable](https://en.cppreference.com/w/cpp/named_req/BasicLockable) - Lock interface requirements
 
 ## Contributing
 
@@ -529,7 +622,8 @@ This is an educational project. When contributing:
 ## Requirements
 
 ### C++ Standard
-C++23 or later required for:
+**Minimum: C++20** (for `atomic_flag::wait()`/`notify_one()`)
+**Recommended: C++23** for:
 - `std::format` (string formatting)
 - `std::source_location` (debugging context)
 
@@ -537,9 +631,9 @@ C++23 or later required for:
 
 | Compiler | Minimum Version | Notes |
 |----------|----------------|-------|
-| GCC      | 13.0           | Full C++23 support |
-| Clang    | 17.0           | Full C++23 support |
-| MSVC     | 19.34 (VS 2022 17.4) | Partial C++23 support |
+| GCC      | 11.0 (C++20) / 13.0 (C++23) | Full support for both standards |
+| Clang    | 14.0 (C++20) / 17.0 (C++23) | Full support for both standards |
+| MSVC     | 19.29 (VS 2019 16.11) / 19.34 (VS 2022 17.4) | C++20 / C++23 support |
 
 ### Dependencies
 - **Google Test**: Unit testing framework
@@ -586,7 +680,10 @@ Architecture, design, and overall implementation is human generated.
 
 ## To do
 
+- ✅ SpinLock implementation with TTAS and escalating backoff
+- Integrate SpinLock with Pool allocator for thread-safe allocations
 - Add smart-pointer (shared_ptr, unique_ptr) support
 - Add an observer-pattern proxy for memory objects owned by shared pointers
   where the pointed-to object is only destroyed if the underlying memory
   pool is still valid
+- Consider per-slab locking vs global locking for better concurrency
