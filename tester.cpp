@@ -34,6 +34,7 @@
 #include <gtest/gtest.h>
 
 #include "spallocator/helper.hpp"
+#include "spallocator/spinlock.hpp"
 #include "spallocator/slab.hpp"
 #include "spallocator/pool.hpp"
 
@@ -189,6 +190,7 @@ TEST(PoolTest, Selector)
     EXPECT_EQ(pool.selectSlab(1025), std::numeric_limits<std::size_t>::max());
 }
 
+
 TEST(PoolTest, AllocateItems)
 {
     spallocator::Pool pool;
@@ -233,6 +235,255 @@ TEST(PoolTest, AllocateItems)
     {
         println("Deallocating item of size {} at ptr={}", it.first, static_cast<void*>(it.second));
         pool.deallocate(it.second);
+    }
+}
+
+
+TEST(SpinLockTest, BasicLocking)
+{
+    int counter = 0;
+
+    SpinLock lock;
+
+    ++counter;
+    lock.lock();
+    // critical section
+    EXPECT_EQ(++counter, 2);
+    lock.unlock();
+
+    // try_lock should succeed when not locked
+    EXPECT_EQ(++counter, 3);
+    lock.try_lock();
+    // critical section
+    EXPECT_EQ(++counter, 4);
+    lock.unlock();
+
+    // lock again
+    EXPECT_EQ(++counter, 5);
+    lock.lock();
+    // critical section
+    EXPECT_EQ(++counter, 6);        
+    lock.unlock();
+
+    EXPECT_EQ(++counter, 7);
+}
+
+
+//
+// NOTE: This test may occasionally fail due to timing issues. These are
+// clearly intentional race conditions with highly probabilistic outcomes.
+//
+TEST(SpinLockTest, Backoff)
+{
+    int tested_value = 0x55555555;
+
+    SpinLock lock;
+
+    lock.lock();
+
+    // Start a thread that will attempt to acquire the lock
+    std::thread t([&lock, &tested_value]() {
+        lock.lock();
+        // critical section
+        EXPECT_EQ(tested_value, 0xAAAAAAAA);
+        tested_value ^= 0xFFFFFFFF;
+        EXPECT_EQ(tested_value, 0x55555555);
+        lock.unlock();
+    });
+
+    EXPECT_EQ(tested_value, 0x55555555);
+    tested_value ^= 0xFFFFFFFF;
+    EXPECT_EQ(tested_value, 0xAAAAAAAA);
+
+    // Sleep for a short duration to ensure the other thread attempts to lock
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    EXPECT_EQ(tested_value, 0xAAAAAAAA);
+
+    // Unlock the main thread's lock
+    lock.unlock();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    EXPECT_EQ(tested_value, 0x55555555);
+    tested_value ^= 0xFFFFFFFF;
+    EXPECT_EQ(tested_value, 0xAAAAAAAA);
+
+    // Wait for the other thread to finish
+    t.join();
+}
+
+
+TEST(SpinLockTest, TryLockContention)
+{
+    int tested_value = 0;
+
+    SpinLock lock;
+
+    lock.lock();
+
+    // Start a thread that will attempt to acquire the lock using try_lock
+    std::thread t([&lock, &tested_value]() {
+        while (!lock.try_lock())
+        {
+            // failed to acquire lock, yield and try again
+            std::this_thread::yield();
+        }
+        // critical section
+        tested_value = 42;
+        lock.unlock();
+    });
+
+    // Sleep for a short duration to ensure the other thread attempts to lock
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    EXPECT_EQ(tested_value, 0);
+
+    // Unlock the main thread's lock
+    lock.unlock();
+
+    // Wait for the other thread to finish
+    t.join();
+
+    EXPECT_EQ(tested_value, 42);
+}
+
+
+TEST(SpinLockTest, LockContention)
+{
+    int tested_value = 0;
+
+    SpinLock lock;
+
+    lock.lock();
+
+    // Start a thread that will attempt to acquire the lock
+    std::thread t([&lock, &tested_value]() {
+        lock.lock();
+        // critical section
+        tested_value = 99;
+        lock.unlock();
+    });
+
+    // Sleep for a short duration to ensure the other thread attempts to lock
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    EXPECT_EQ(tested_value, 0);
+
+    // Unlock the main thread's lock
+    lock.unlock();
+
+    // Wait for the other thread to finish
+    t.join();
+
+    EXPECT_EQ(tested_value, 99);
+}
+
+
+TEST(SpinLockTest, MultipleThreads)
+{
+    constexpr int num_threads = 10;
+    constexpr int increments_per_thread = 1000;
+
+    int counter = 0;
+    SpinLock lock;
+
+    auto worker = [&counter, &lock]() {
+        for (int i = 0; i < increments_per_thread; ++i)
+        {
+            lock.lock();
+            ++counter;
+            lock.unlock();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_threads; ++i)
+    {
+        threads.emplace_back(worker);
+    }
+
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+
+    EXPECT_EQ(counter, num_threads * increments_per_thread);
+}
+
+
+//
+// Use RAII locking with std::scoped_lock and std::unique_lock
+//
+TEST(SpinLockTest, stdLock)
+{
+    int counter = 0;
+    SpinLock lock;
+
+    {
+        std::scoped_lock<SpinLock> slock(lock);
+        ++counter;
+        EXPECT_EQ(counter, 1);
+    } // slock goes out of scope and unlocks
+
+    {
+        std::scoped_lock<SpinLock> slock(lock);
+        ++counter;
+        EXPECT_EQ(counter, 2);
+    } // slock goes out of scope and unlocks
+
+    EXPECT_EQ(counter, 2);
+
+    // with thread, starting unlocked
+    {
+        counter = 0;
+        std::thread t([&counter, &lock]() {
+            std::scoped_lock<SpinLock> slock(lock);
+            ++counter;
+            EXPECT_EQ(counter, 1);
+        });
+
+        EXPECT_EQ(counter, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        EXPECT_EQ(counter, 1);
+
+        {
+            std::scoped_lock<SpinLock> slock(lock);
+            ++counter;
+            EXPECT_EQ(counter, 2);
+        } // slock goes out of scope and unlocks
+
+        t.join();
+        EXPECT_EQ(counter, 2);
+    }
+
+    // with thread, starting locked
+    {
+        counter = 0;
+        std::unique_lock<SpinLock> ulock(lock); // main thread locks
+
+        std::thread t([&counter, &lock]() {
+            std::unique_lock<SpinLock> ulock(lock);
+            ++counter;
+            EXPECT_EQ(counter, 1);
+        });
+
+        EXPECT_EQ(counter, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        EXPECT_EQ(counter, 0);
+
+        ulock.unlock(); // main thread unlocks
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        EXPECT_EQ(counter, 1);
+
+        {
+            std::unique_lock<SpinLock> ulock(lock);
+            ++counter;
+            EXPECT_EQ(counter, 2);
+        } // ulock goes out of scope and unlocks
+
+        t.join();
+        EXPECT_EQ(counter, 2);
     }
 }
 
