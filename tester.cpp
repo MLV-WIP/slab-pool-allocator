@@ -537,12 +537,15 @@ TEST(SpinLockTest, Backoff)
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
+    lock.lock();
     EXPECT_EQ(tested_value, 0x55555555);
     tested_value ^= 0xFFFFFFFF;
     EXPECT_EQ(tested_value, 0xAAAAAAAA);
+    lock.unlock();
 
     // Wait for the other thread to finish
     t.join();
+    EXPECT_EQ(tested_value, 0xAAAAAAAA);
 }
 
 
@@ -675,12 +678,11 @@ TEST(SpinLockTest, stdLock)
             EXPECT_EQ(counter, 1);
         });
 
-        EXPECT_EQ(counter, 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        EXPECT_EQ(counter, 1);
 
         {
             std::scoped_lock<SpinLock> slock(lock);
+            EXPECT_EQ(counter, 1);
             ++counter;
             EXPECT_EQ(counter, 2);
         } // slock goes out of scope and unlocks
@@ -706,10 +708,10 @@ TEST(SpinLockTest, stdLock)
 
         ulock.unlock(); // main thread unlocks
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        EXPECT_EQ(counter, 1);
 
         {
             std::unique_lock<SpinLock> ulock(lock);
+            EXPECT_EQ(counter, 1);
             ++counter;
             EXPECT_EQ(counter, 2);
         } // ulock goes out of scope and unlocks
@@ -725,9 +727,9 @@ TEST(SpinLockTest, ManyThreads)
     std::size_t const num_cores = std::thread::hardware_concurrency();
     println("Detected {} hardware threads", num_cores);
     ASSERT_GT(num_cores, 0u);
-    const std::size_t num_threads = num_cores;
+    const std::size_t num_threads = num_cores * 8 / 10;
 
-    constexpr std::size_t increments_per_thread = 1000;
+    constexpr std::size_t increments_per_thread = 10000;
 
     int counter = 0;
     SpinLock lock;

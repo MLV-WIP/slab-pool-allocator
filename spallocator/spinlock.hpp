@@ -39,6 +39,27 @@
 #include <chrono>
 
 
+// ThreadSanitizer annotations for custom synchronization primitives
+// These tell TSan about happens-before relationships in our SpinLock
+#ifdef __has_feature
+  #if __has_feature(thread_sanitizer)
+    #define TSAN_ENABLED 1
+  #endif
+#endif
+
+#ifdef TSAN_ENABLED
+extern "C" {
+    void __tsan_acquire(void *addr);
+    void __tsan_release(void *addr);
+}
+#define TSAN_ANNOTATE_HAPPENS_BEFORE(addr) __tsan_release(addr)
+#define TSAN_ANNOTATE_HAPPENS_AFTER(addr)  __tsan_acquire(addr)
+#else
+#define TSAN_ANNOTATE_HAPPENS_BEFORE(addr)
+#define TSAN_ANNOTATE_HAPPENS_AFTER(addr)
+#endif
+
+
 class SpinLock
 {
 public:
@@ -73,6 +94,7 @@ public:
             // Then, attempt to acquire the lock
             if (!lock_flag.test_and_set(std::memory_order_acquire))
             {
+                TSAN_ANNOTATE_HAPPENS_AFTER(this);
                 return; // Lock acquired
             }
 
@@ -84,6 +106,7 @@ public:
 
         // Still waiting? Just block until we get the lock
         lock_flag.wait(true, std::memory_order_acquire);
+        TSAN_ANNOTATE_HAPPENS_AFTER(this);
     }
 
     bool try_lock()
@@ -96,6 +119,7 @@ public:
         // Attempt to acquire the lock without blocking
         if (!lock_flag.test_and_set(std::memory_order_acquire))
         {
+            TSAN_ANNOTATE_HAPPENS_AFTER(this);
             return true; // Lock acquired
         }
         // Lock not acquired; return immediately
@@ -104,6 +128,7 @@ public:
 
     void unlock()
     {
+        TSAN_ANNOTATE_HAPPENS_BEFORE(this);
         lock_flag.clear(std::memory_order_release);
         lock_flag.notify_one();
     }
