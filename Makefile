@@ -36,21 +36,29 @@ else
 	OBJDIR := ./obj/release
 endif
 
-SRC := tester.cpp
-TARGET := tester
-DEPFILE := $(OBJDIR)/$(TARGET).d
+TESTER_SRC := tester.cpp
+TESTER_TARGET := tester
+TESTER_DEPFILE := $(OBJDIR)/$(TESTER_TARGET).d
 
-all: $(OBJDIR)/$(TARGET)
+DEMO_SRC := demo_shared_ptr.cpp
+DEMO_TARGET := demo_shared_ptr
+DEMO_DEPFILE := $(OBJDIR)/$(DEMO_TARGET).d
+
+all: $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET)
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
-$(OBJDIR)/$(TARGET): $(SRC) | $(OBJDIR)
+$(OBJDIR)/$(TESTER_TARGET): $(TESTER_SRC) | $(OBJDIR)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
-# Include the dependency file if it exists
--include $(DEPFILE)
+$(OBJDIR)/$(DEMO_TARGET): $(DEMO_SRC) | $(OBJDIR)
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+
+# Include the dependency files if they exist
+-include $(TESTER_DEPFILE)
+-include $(DEMO_DEPFILE)
 
 clean:
-	rm -f $(OBJDIR)/$(TARGET) $(OBJDIR)/*.o $(OBJDIR)/*.d
+	rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET) $(OBJDIR)/*.o $(OBJDIR)/*.d
 .PHONY: all clean

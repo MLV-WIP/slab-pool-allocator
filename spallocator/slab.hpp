@@ -220,8 +220,8 @@ namespace spallocator
                         // this slab is now full
                         slab_available_map.reset(slab_index);
                     }
-                    //println("Item allocated ({}/{}), slab_map: {}",
-                    //        slab_index, item_index, printHex(slab_slots));
+                    //println("Item allocated ({}/{}), slab_map<{}>: {}",
+                    //        slab_index, item_index, ElemSize, printHex(slab_slots));
                     return slab_data[slab_index] + item_index * ElemSize;
                 }
             }
