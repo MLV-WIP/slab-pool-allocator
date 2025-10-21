@@ -1,0 +1,431 @@
+#!/bin/bash
+#
+# Configure script for Slab Pool Allocator
+# Detects system capabilities and generates appropriate Makefile
+#
+
+set -e  # Exit on error
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Default values
+PREFIX="/usr/local"
+CXX=""
+CXXFLAGS=""
+BUILD_TYPE="release"
+ENABLE_TESTS="yes"
+ENABLE_DEMO="yes"
+GTEST_DIR=""
+ENABLE_ASAN="auto"
+ENABLE_UBSAN="auto"
+ENABLE_TSAN="no"
+ENABLE_COVERAGE="no"
+VERBOSE="no"
+
+# Detected values
+DETECTED_CXX=""
+DETECTED_GTEST=""
+HAS_CXX20="no"
+HAS_FORMAT="no"
+HAS_RANGES="no"
+HAS_ATOMIC_WAIT="no"
+
+# Functions
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[OK]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+usage() {
+    cat << EOF
+Usage: ./configure [OPTION]...
+
+Configuration:
+  --prefix=PREFIX         installation prefix [$PREFIX]
+  --build-type=TYPE       build type: debug, release, memsan, threadsan [$BUILD_TYPE]
+
+Optional Features:
+  --enable-tests          build test suite [default: yes]
+  --disable-tests         do not build test suite
+  --enable-demo           build demo programs [default: yes]
+  --disable-demo          do not build demo programs
+  --enable-asan           enable AddressSanitizer [default: auto]
+  --disable-asan          disable AddressSanitizer
+  --enable-ubsan          enable UndefinedBehaviorSanitizer [default: auto]
+  --disable-ubsan         disable UndefinedBehaviorSanitizer
+  --enable-tsan           enable ThreadSanitizer [default: no]
+  --enable-coverage       enable code coverage instrumentation [default: no]
+  --enable-verbose        verbose output during build [default: no]
+
+Optional Packages:
+  --with-gtest=DIR        Google Test installation directory
+  --with-cxx=COMPILER     C++ compiler to use (g++, clang++, etc.)
+  --with-cxxflags=FLAGS   additional C++ compiler flags
+
+Examples:
+  ./configure
+  ./configure --build-type=debug --enable-tsan
+  ./configure --with-gtest=/usr/local --disable-tests
+  ./configure --prefix=/opt/spallocator --build-type=release
+
+EOF
+}
+
+# Parse command line arguments
+for arg in "$@"; do
+    case $arg in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --prefix=*)
+            PREFIX="${arg#*=}"
+            ;;
+        --build-type=*)
+            BUILD_TYPE="${arg#*=}"
+            ;;
+        --enable-tests)
+            ENABLE_TESTS="yes"
+            ;;
+        --disable-tests)
+            ENABLE_TESTS="no"
+            ;;
+        --enable-demo)
+            ENABLE_DEMO="yes"
+            ;;
+        --disable-demo)
+            ENABLE_DEMO="no"
+            ;;
+        --enable-asan)
+            ENABLE_ASAN="yes"
+            ;;
+        --disable-asan)
+            ENABLE_ASAN="no"
+            ;;
+        --enable-ubsan)
+            ENABLE_UBSAN="yes"
+            ;;
+        --disable-ubsan)
+            ENABLE_UBSAN="no"
+            ;;
+        --enable-tsan)
+            ENABLE_TSAN="yes"
+            ;;
+        --enable-coverage)
+            ENABLE_COVERAGE="yes"
+            ;;
+        --enable-verbose)
+            VERBOSE="yes"
+            ;;
+        --with-gtest=*)
+            GTEST_DIR="${arg#*=}"
+            ;;
+        --with-cxx=*)
+            CXX="${arg#*=}"
+            ;;
+        --with-cxxflags=*)
+            CXXFLAGS="${arg#*=}"
+            ;;
+        *)
+            print_error "Unknown option: $arg"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Validate build type
+case $BUILD_TYPE in
+    debug|release|memsan|threadsan)
+        ;;
+    *)
+        print_error "Invalid build type: $BUILD_TYPE"
+        print_error "Valid types: debug, release, memsan, threadsan"
+        exit 1
+        ;;
+esac
+
+# Auto-detect sanitizers for build type
+if [ "$BUILD_TYPE" = "memsan" ]; then
+    [ "$ENABLE_ASAN" = "auto" ] && ENABLE_ASAN="yes"
+    [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="yes"
+elif [ "$BUILD_TYPE" = "threadsan" ]; then
+    ENABLE_TSAN="yes"
+    ENABLE_ASAN="no"  # Can't use ASan and TSan together
+    [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="no"
+else
+    [ "$ENABLE_ASAN" = "auto" ] && ENABLE_ASAN="no"
+    [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="no"
+fi
+
+print_info "Configuring Slab Pool Allocator..."
+echo ""
+
+# Detect C++ compiler
+print_info "Detecting C++ compiler..."
+if [ -n "$CXX" ]; then
+    if ! command -v "$CXX" &> /dev/null; then
+        print_error "Specified compiler not found: $CXX"
+        exit 1
+    fi
+    DETECTED_CXX="$CXX"
+    print_success "Using specified compiler: $DETECTED_CXX"
+else
+    for compiler in c++ clang++ g++; do
+        if command -v "$compiler" &> /dev/null; then
+            DETECTED_CXX="$compiler"
+            print_success "Found compiler: $DETECTED_CXX"
+            break
+        fi
+    done
+
+    if [ -z "$DETECTED_CXX" ]; then
+        print_error "No C++ compiler found!"
+        print_error "Please install g++, clang++, or specify with --with-cxx="
+        exit 1
+    fi
+fi
+
+# Get compiler version
+CXX_VERSION=$($DETECTED_CXX --version | head -n1)
+print_info "Compiler version: $CXX_VERSION"
+
+# Check for C++20 support
+print_info "Checking for C++20 support..."
+cat > conftest.cpp << 'EOF'
+#include <version>
+#if __cplusplus < 202002L
+#error "C++20 not supported"
+#endif
+int main() { return 0; }
+EOF
+
+if $DETECTED_CXX -std=c++20 conftest.cpp -o conftest 2>/dev/null; then
+    HAS_CXX20="yes"
+    print_success "C++20 support: yes"
+else
+    print_error "C++20 support: no"
+    print_error "This project requires C++20 support"
+    print_error "Please upgrade your compiler or use --with-cxx= to specify a newer one"
+    rm -f conftest.cpp conftest
+    exit 1
+fi
+rm -f conftest.cpp conftest conftest.o
+
+# Check for std::format
+print_info "Checking for std::format..."
+cat > conftest.cpp << 'EOF'
+#include <format>
+int main() {
+    auto s = std::format("test {}", 42);
+    return 0;
+}
+EOF
+
+if $DETECTED_CXX -std=c++20 conftest.cpp -o conftest 2>/dev/null; then
+    HAS_FORMAT="yes"
+    print_success "std::format: yes"
+else
+    HAS_FORMAT="no"
+    print_warning "std::format: no (will use fallback)"
+fi
+rm -f conftest.cpp conftest conftest.o
+
+# Check for std::ranges
+print_info "Checking for std::ranges..."
+cat > conftest.cpp << 'EOF'
+#include <ranges>
+#include <vector>
+int main() {
+    std::vector<int> v = {1, 2, 3};
+    auto r = v | std::views::reverse;
+    return 0;
+}
+EOF
+
+if $DETECTED_CXX -std=c++20 conftest.cpp -o conftest 2>/dev/null; then
+    HAS_RANGES="yes"
+    print_success "std::ranges: yes"
+else
+    HAS_RANGES="no"
+    print_error "std::ranges: no"
+    print_error "This project requires std::ranges support"
+    rm -f conftest.cpp conftest
+    exit 1
+fi
+rm -f conftest.cpp conftest conftest.o
+
+# Check for atomic_flag::wait
+print_info "Checking for atomic_flag::wait..."
+cat > conftest.cpp << 'EOF'
+#include <atomic>
+int main() {
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+    flag.test_and_set();
+    flag.wait(true);
+    flag.clear();
+    flag.notify_one();
+    return 0;
+}
+EOF
+
+if $DETECTED_CXX -std=c++20 conftest.cpp -o conftest 2>/dev/null; then
+    HAS_ATOMIC_WAIT="yes"
+    print_success "atomic_flag::wait: yes"
+else
+    HAS_ATOMIC_WAIT="no"
+    print_error "atomic_flag::wait: no"
+    print_error "This project requires C++20 atomic wait/notify support"
+    rm -f conftest.cpp conftest
+    exit 1
+fi
+rm -f conftest.cpp conftest conftest.o
+
+# Detect Google Test
+if [ "$ENABLE_TESTS" = "yes" ]; then
+    print_info "Detecting Google Test..."
+
+    if [ -n "$GTEST_DIR" ]; then
+        if [ -d "$GTEST_DIR" ]; then
+            DETECTED_GTEST="$GTEST_DIR"
+            print_success "Using specified Google Test: $DETECTED_GTEST"
+        else
+            print_error "Specified Google Test directory not found: $GTEST_DIR"
+            exit 1
+        fi
+    else
+        # Try common locations
+        for dir in /opt/homebrew/Cellar/googletest/* /usr/local /usr /opt/local; do
+            if [ -f "$dir/include/gtest/gtest.h" ]; then
+                DETECTED_GTEST="$dir"
+                print_success "Found Google Test: $DETECTED_GTEST"
+                break
+            fi
+        done
+
+        if [ -z "$DETECTED_GTEST" ]; then
+            print_warning "Google Test not found"
+            print_warning "Tests will be disabled. Install with:"
+            print_warning "  brew install googletest  (macOS)"
+            print_warning "  apt install libgtest-dev (Ubuntu)"
+            print_warning "Or specify with --with-gtest=DIR"
+            ENABLE_TESTS="no"
+        fi
+    fi
+fi
+
+# Check sanitizer support
+if [ "$ENABLE_ASAN" = "yes" ] || [ "$ENABLE_UBSAN" = "yes" ] || [ "$ENABLE_TSAN" = "yes" ]; then
+    print_info "Checking sanitizer support..."
+
+    if [ "$ENABLE_ASAN" = "yes" ]; then
+        cat > conftest.cpp << 'EOF'
+int main() { return 0; }
+EOF
+        if $DETECTED_CXX -std=c++20 -fsanitize=address conftest.cpp -o conftest 2>/dev/null; then
+            print_success "AddressSanitizer: yes"
+        else
+            print_warning "AddressSanitizer not supported by this compiler"
+            ENABLE_ASAN="no"
+        fi
+        rm -f conftest.cpp conftest conftest.o
+    fi
+
+    if [ "$ENABLE_TSAN" = "yes" ]; then
+        cat > conftest.cpp << 'EOF'
+int main() { return 0; }
+EOF
+        if $DETECTED_CXX -std=c++20 -fsanitize=thread conftest.cpp -o conftest 2>/dev/null; then
+            print_success "ThreadSanitizer: yes"
+        else
+            print_warning "ThreadSanitizer not supported by this compiler"
+            ENABLE_TSAN="no"
+        fi
+        rm -f conftest.cpp conftest conftest.o
+    fi
+fi
+
+echo ""
+print_info "Configuration summary:"
+echo "  Prefix:               $PREFIX"
+echo "  Build type:           $BUILD_TYPE"
+echo "  C++ Compiler:         $DETECTED_CXX"
+echo "  C++20 support:        $HAS_CXX20"
+echo "  std::format:          $HAS_FORMAT"
+echo "  std::ranges:          $HAS_RANGES"
+echo "  atomic wait/notify:   $HAS_ATOMIC_WAIT"
+echo "  Build tests:          $ENABLE_TESTS"
+if [ "$ENABLE_TESTS" = "yes" ]; then
+echo "  Google Test:          $DETECTED_GTEST"
+fi
+echo "  Build demo:           $ENABLE_DEMO"
+echo "  AddressSanitizer:     $ENABLE_ASAN"
+echo "  UBSanitizer:          $ENABLE_UBSAN"
+echo "  ThreadSanitizer:      $ENABLE_TSAN"
+echo "  Code coverage:        $ENABLE_COVERAGE"
+echo ""
+
+# Generate config.mk
+print_info "Generating config.mk..."
+
+cat > config.mk << EOF
+# Generated by configure - do not edit manually
+# To reconfigure, run: ./configure [options]
+
+# Installation
+PREFIX := $PREFIX
+
+# Compiler
+CXX := $DETECTED_CXX
+
+# Build configuration
+BUILD_TYPE := $BUILD_TYPE
+ENABLE_TESTS := $ENABLE_TESTS
+ENABLE_DEMO := $ENABLE_DEMO
+VERBOSE := $VERBOSE
+
+# Google Test
+GTEST_DIR := $DETECTED_GTEST
+
+# Sanitizers
+ENABLE_ASAN := $ENABLE_ASAN
+ENABLE_UBSAN := $ENABLE_UBSAN
+ENABLE_TSAN := $ENABLE_TSAN
+ENABLE_COVERAGE := $ENABLE_COVERAGE
+
+# User-specified flags
+USER_CXXFLAGS := $CXXFLAGS
+
+# Feature detection
+HAS_FORMAT := $HAS_FORMAT
+EOF
+
+print_success "Configuration complete!"
+echo ""
+print_info "You can now run:"
+echo "  make              - Build the project"
+if [ "$ENABLE_TESTS" = "yes" ]; then
+echo "  make test         - Run tests"
+fi
+if [ "$ENABLE_DEMO" = "yes" ]; then
+echo "  make demo         - Run demo program"
+fi
+echo "  make clean        - Clean build artifacts"
+echo "  make install      - Install (to $PREFIX)"
+echo ""
