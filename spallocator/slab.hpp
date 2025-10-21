@@ -71,10 +71,6 @@ namespace spallocator
     protected: // methods
         AbstractSlab() = default;
 
-        //virtual constexpr std::size_t getElemSize() const = 0;
-        //virtual constexpr std::size_t getAllocSize() const = 0;
-        //virtual const std::size_t getAllocatedMemory() const = 0;
-
     private: // methods
         AbstractSlab(const AbstractSlab&) = delete;
         AbstractSlab& operator=(const AbstractSlab&) = delete;
@@ -130,10 +126,12 @@ namespace spallocator
     };
 
 
+    //
     // SlabProxy does not manage its own memory; it delegates to
     // standard memory allocation methods for large memory
     // allocations that aren't suitable for small-memory slab
     // optimizations
+    //
     class SlabProxy: public AbstractSlab
     {
     public: // methods
@@ -205,8 +203,8 @@ namespace spallocator
             {
                 // need to allocate a new slab
                 allocateNewSlab();
-                println("New slab allocated, total slabs: {}/{}",
-                        slab_data.size(), slab_map.size());
+                println("New slab<{}> allocated, total slabs: {}/{}",
+                        ElemSize, slab_data.size(), slab_map.size());
             }
 
             auto& slab_slots = slab_map[slab_index];
@@ -221,8 +219,8 @@ namespace spallocator
                         // this slab is now full
                         slab_available_map.reset(slab_index);
                     }
-                    println("Item allocated ({}/{}), slab_map: {}",
-                            slab_index, item_index, printHex(slab_slots));
+                    //println("Item allocated ({}/{}), slab_map: {}",
+                    //        slab_index, item_index, printHex(slab_slots));
                     return slab_data[slab_index] + item_index * ElemSize;
                 }
             }
@@ -283,8 +281,8 @@ namespace spallocator
                 slab_slots.reset(item_index);
                 // This slab now has free space
                 slab_available_map.set(slab_index);
-                println("Item freed ({}/{}), slab_map: {}",
-                        slab_index, item_index, printHex(slab_slots));
+                //println("Item freed ({}/{}), slab_map: {}",
+                //        slab_index, item_index, printHex(slab_slots));
                 return;
             }
             else
@@ -327,9 +325,14 @@ namespace spallocator
                 std::format("Cannot allocate more than {} slabs of size {} bytes",
                             max_slabs, slab_alloc_size));
         }
+
+        static_assert(ElemSize >= 16,
+            "Element size must be at least 16 bytes");
+        static_assert(ElemSize % 16 == 0,
+            "Element size must be a multiple of 16 bytes");
     
         // allocate a new slab of memory
-        std::byte* new_slab = new std::byte[slab_alloc_size];
+        std::byte* new_slab = new(std::align_val_t{16}) std::byte[slab_alloc_size];
         slab_data.push_back(new_slab);
         base_address_map[new_slab] = slab_data.size() - 1;
         slab_map.emplace_back();
@@ -344,9 +347,9 @@ namespace spallocator
             std::format("Requested size {} exceeds maximum allowed size for SlabProxy", elem_size));
 
         // allocate memory using standard methods
-        std::byte* item = new std::byte[elem_size];
-        println("Allocated {} bytes via SlabProxy, ptr={}",
-                elem_size, static_cast<void*>(item));
+        std::byte* item = new(std::align_val_t{16}) std::byte[elem_size];
+        //println("Allocated {} bytes via SlabProxy, ptr={}",
+        //        elem_size, static_cast<void*>(item));
         return item;
     }
 
@@ -354,7 +357,7 @@ namespace spallocator
     inline void SlabProxy::deallocateItem(std::byte* item)
     {
         // deallocate memory using standard methods
-        println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));
+        //println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));
         delete[] item;
     }
 

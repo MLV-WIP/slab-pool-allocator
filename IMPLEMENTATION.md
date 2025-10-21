@@ -13,6 +13,7 @@ This document provides an in-depth analysis of the slab pool allocator implement
 - [Slab Allocation Strategy](#slab-allocation-strategy)
 - [Bitset Tracking System](#bitset-tracking-system)
 - [Address Lookup for Deallocation](#address-lookup-for-deallocation)
+- [Smart Pointer Integration](#smart-pointer-integration)
 - [SpinLock Design](#spinlock-design)
 - [Performance Analysis](#performance-analysis)
 - [Advanced Topics](#advanced-topics)
@@ -331,6 +332,300 @@ The map is keyed by slab start addresses. For any valid pointer:
 | **Binary search on vector** | O(log n) | O(n) | Better cache locality | Insert/delete expensive |
 
 The map approach balances performance with code clarity, making it ideal for an educational implementation.
+
+---
+
+## Smart Pointer Integration
+
+The allocator provides RAII-based memory management through `make_pool_unique`, a pool-aware analog to `std::make_unique`.
+
+### Design Philosophy
+
+Smart pointers solve a fundamental problem in custom allocators: **matching allocation and deallocation**. Raw pool allocations require manual cleanup, creating opportunities for leaks and use-after-free bugs. By integrating with `std::unique_ptr`, we get:
+
+1. **Automatic cleanup**: Memory returns to pool when pointer goes out of scope
+2. **Exception safety**: Cleanup happens even during stack unwinding
+3. **Move semantics**: Efficient ownership transfer without copying
+4. **Type safety**: Compiler enforces correct usage patterns
+
+### Components
+
+#### 1. PoolDeleter - Custom Deleter
+
+**Key Concepts Demonstrated**:
+- **Custom deleters**: Extending `std::unique_ptr` behavior
+- **Template specialization**: Different behavior for arrays vs. single objects
+- **RAII principles**: Automatic resource management
+- **C++20 ranges**: Efficient iteration with `std::views::counted` and `std::views::reverse`
+
+```cpp
+template<typename T>
+struct PoolDeleter {
+    spallocator::Pool& pool;
+
+    void operator()(T* p) const {
+        if (p) {
+            p->~T();  // Explicit destructor call
+            pool.deallocate(reinterpret_cast<std::byte*>(p));
+        }
+    }
+};
+```
+
+**Design Insights**:
+- Stores a reference to the pool (not a pointer, ensuring it exists)
+- Explicitly invokes destructor before deallocation (placement new counterpart)
+- Checks for null before deallocating (matches standard `delete` behavior)
+
+#### 2. PoolDeleter<T[]> - Array Specialization
+
+Handling arrays requires special care: destructors must run in **reverse order** (LIFO).
+
+```cpp
+template<typename T>
+struct PoolDeleter<T[]> {
+    spallocator::Pool& pool;
+
+    void operator()(T* p) const {
+        if (p) {
+            // Read size from header (stored before array)
+            std::byte* header_ptr = reinterpret_cast<std::byte*>(p) - sizeof(std::size_t);
+            std::size_t size = *reinterpret_cast<std::size_t*>(header_ptr);
+
+            // Call destructors in reverse order using ranges
+            std::ranges::for_each(
+                std::views::counted(p, size) | std::views::reverse,
+                [](T& elem){ elem.~T(); }
+            );
+
+            // Deallocate from header start
+            pool.deallocate(header_ptr);
+        }
+    }
+};
+```
+
+**Educational Highlights**:
+
+**Why reverse order?** This mirrors how stack-allocated arrays work. If objects depend on each other, reverse destruction order prevents use-after-destruction bugs:
+
+```cpp
+struct Node {
+    Node* next;
+    ~Node() { if (next) /* access next... */ }
+};
+```
+
+If `next` is destroyed first, the destructor accesses freed memory.
+
+**Ranges composition**: The expression `std::views::counted(p, size) | std::views::reverse` demonstrates C++20 ranges:
+- `std::views::counted(p, size)`: Creates a range from pointer + size
+- `| std::views::reverse`: Composes with reverse view (lazy, no copying)
+- `std::ranges::for_each`: Applies lambda to each element
+
+This is more elegant than manual indexing:
+```cpp
+// Old way (error-prone)
+for (std::size_t i = size; i-- > 0; ) {
+    p[i].~T();
+}
+
+// Ranges way (intent-revealing, harder to mess up)
+std::ranges::for_each(
+    std::views::counted(p, size) | std::views::reverse,
+    [](T& elem){ elem.~T(); }
+);
+```
+
+**Size header trick**: Arrays store their size in a header immediately before the array data. This enables the deleter to know how many destructors to call without external metadata.
+
+Memory layout for arrays:
+```
+┌─────────────┬────────────────────────────────┐
+│ std::size_t │   Array elements (N × sizeof(T)) │
+│   (count)   │                                │
+└─────────────┴────────────────────────────────┘
+^             ^
+│             └─ User pointer (returned to caller)
+└─ Header pointer (used for deallocation)
+```
+
+**Alignment considerations**: The header size is included in the alignment calculation to ensure the array itself is properly aligned:
+```cpp
+std::size_t alignment = alignof(ElementType) > alignof(std::size_t) ?
+                        alignof(ElementType) : alignof(std::size_t);
+```
+
+This ensures both the header can store `std::size_t` safely AND the array meets its type's alignment requirements.
+
+#### 3. make_pool_unique - Factory Functions
+
+**Single Object Version**:
+```cpp
+template<typename T, typename... Args>
+    requires (!std::is_array_v<T>)
+constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, Args&&... args)
+{
+    void* mem = pool.allocate(sizeof(T), alignof(T));
+    T* obj = new (mem) T(std::forward<Args>(args)...);
+    return unique_pool_ptr<T>(obj, PoolDeleter<T>{pool});
+}
+```
+
+**Educational Highlights**:
+
+**Concepts constraint**: `requires (!std::is_array_v<T>)` ensures this overload only applies to non-array types. This is cleaner than SFINAE and produces better error messages.
+
+**Perfect forwarding**: `std::forward<Args>(args)...` preserves value categories (lvalue vs rvalue) when passing arguments to constructor. This enables:
+```cpp
+auto obj = make_pool_unique<MyClass>(pool, std::move(expensive_arg));
+// expensive_arg is moved, not copied
+```
+
+**Placement new**: `new (mem) T(...)` constructs object at specific memory location. The pool provides raw memory; placement new invokes the constructor.
+
+**Alignment specification**: Passing `alignof(T)` ensures properly aligned memory for the type. Misaligned access can cause crashes on some architectures (e.g., ARM) or performance degradation on others (e.g., x86).
+
+**Array Version**:
+```cpp
+template<typename T>
+    requires std::is_unbounded_array_v<T>
+constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, std::size_t size)
+{
+    using ElementType = std::remove_extent_t<T>;
+
+    // Allocate header + array
+    std::size_t header_size = sizeof(std::size_t);
+    std::size_t array_size = sizeof(ElementType) * size;
+    std::size_t alignment = alignof(ElementType) > alignof(std::size_t) ?
+                            alignof(ElementType) : alignof(std::size_t);
+
+    std::byte* mem = pool.allocate(header_size + array_size, alignment);
+
+    // Store size in header
+    *reinterpret_cast<std::size_t*>(mem) = size;
+
+    // Construct elements
+    ElementType* array_ptr = reinterpret_cast<ElementType*>(mem + header_size);
+    for (std::size_t i = 0; i < size; ++i) {
+        new (&array_ptr[i]) ElementType();
+    }
+
+    return unique_pool_ptr<T>(array_ptr, PoolDeleter<T>{pool});
+}
+```
+
+**Educational Highlights**:
+
+**Type extraction**: `std::remove_extent_t<T>` extracts element type from array type:
+- Input: `int[]` → Output: `int`
+- Input: `MyClass[]` → Output: `MyClass`
+
+**Default initialization**: Each array element is default-constructed with `ElementType()`. For types with non-trivial constructors, this ensures proper initialization. For primitive types (int, float), this zero-initializes.
+
+**Exception safety consideration**: If construction of element N throws, elements 0..N-1 need cleanup. This implementation doesn't handle that (educational simplification). Production code would use a guard:
+```cpp
+std::size_t constructed = 0;
+try {
+    for (std::size_t i = 0; i < size; ++i) {
+        new (&array_ptr[i]) ElementType();
+        ++constructed;
+    }
+} catch (...) {
+    // Destroy already-constructed elements in reverse
+    while (constructed > 0) {
+        array_ptr[--constructed].~ElementType();
+    }
+    pool.deallocate(mem);
+    throw;
+}
+```
+
+**Bounded Array Deletion**:
+```cpp
+template<typename T, typename... Args>
+    requires std::is_bounded_array_v<T>
+void make_pool_unique(spallocator::Pool& pool, Args&&... args) = delete;
+```
+
+This prevents usage like `make_pool_unique<int[10]>(pool)`, which is ambiguous (does caller specify size or not?). Use `std::array<int, 10>` instead for fixed-size arrays.
+
+### Usage Patterns
+
+**Basic object allocation**:
+```cpp
+spallocator::Pool pool;
+auto obj = spallocator::make_pool_unique<MyClass>(pool, arg1, arg2);
+// obj is std::unique_ptr<MyClass, PoolDeleter<MyClass>>
+// Automatically cleaned up when obj goes out of scope
+```
+
+**Array allocation**:
+```cpp
+auto arr = spallocator::make_pool_unique<int[]>(pool, 100);
+arr[0] = 42;  // Works like normal array
+// All 100 elements destroyed in reverse order at end of scope
+```
+
+**Transfer ownership**:
+```cpp
+spallocator::unique_pool_ptr<MyClass> create_object(spallocator::Pool& pool) {
+    return spallocator::make_pool_unique<MyClass>(pool, args...);
+}
+
+auto obj = create_object(pool);  // Move semantics, no copying
+```
+
+**Container storage**:
+```cpp
+std::vector<spallocator::unique_pool_ptr<MyClass>> objects;
+objects.push_back(spallocator::make_pool_unique<MyClass>(pool, args...));
+// Move into vector, no deep copy
+```
+
+### Comparison to Standard Smart Pointers
+
+| Feature | `std::make_unique` | `spallocator::make_pool_unique` |
+|---------|-------------------|--------------------------------|
+| **Allocation source** | System allocator (new) | Custom pool allocator |
+| **Deallocation** | `delete` | `pool.deallocate()` |
+| **Destructor handling** | Automatic | Explicit call (placement new counterpart) |
+| **Array support** | Yes (`T[]`) | Yes, with size header for reverse destruction |
+| **Exception safety** | Full | Partial (educational implementation) |
+| **Alignment** | Standard alignment | Explicit alignment specification |
+| **Performance** | General-purpose | Optimized for specific size classes |
+
+### Why Not std::shared_ptr?
+
+`std::shared_ptr` requires different handling due to reference counting and the control block. Future work may include:
+
+```cpp
+template<typename T, typename... Args>
+std::shared_ptr<T> make_pool_shared(Pool& pool, Args&&... args);
+```
+
+Challenges:
+- Control block allocation (also needs pool allocation)
+- Weak pointer support
+- Thread-safe reference counting
+- Deleter must outlive control block
+
+This is more complex and left for future enhancement.
+
+### Learning Value
+
+This implementation teaches:
+
+1. **Custom deleters**: How to extend standard library smart pointers
+2. **Template specialization**: Providing different behavior for related types
+3. **Concepts and constraints**: Modern C++ type restrictions with clear errors
+4. **Perfect forwarding**: Preserving value categories through forwarding references
+5. **Placement new/explicit destructors**: Manual object lifetime management
+6. **C++20 ranges**: Composable, lazy view transformations
+7. **RAII principles**: Automatic resource management through scope
+8. **Type traits**: Compile-time type introspection and manipulation
+9. **Memory alignment**: Hardware requirements for safe memory access
+10. **Exception safety**: Resource leak prevention during unwinding (concept, if not fully implemented)
 
 ---
 
@@ -709,9 +1004,11 @@ In production, this output can be disabled via compile-time flags or preprocesso
 
 ### Planned Features
 
-**Smart Pointer Support**
-- Custom allocator adapters for `std::shared_ptr` and `std::unique_ptr`
-- Observer-pattern proxy for pool lifetime management
+**Enhanced Smart Pointer Support**
+- ✅ `std::unique_ptr` support via `make_pool_unique` (COMPLETED)
+- ✅ Custom deleter with array specialization (COMPLETED)
+- Custom allocator adapters for `std::shared_ptr` (future)
+- Observer-pattern proxy for pool lifetime management (future)
 - Educational value: Integrating custom allocators with STL
 
 **Thread-Safe Pool**

@@ -37,40 +37,43 @@
 #include "spallocator/spinlock.hpp"
 #include "spallocator/slab.hpp"
 #include "spallocator/pool.hpp"
+#include "spallocator/spallocator.hpp"
+
+using namespace spallocator;
 
 
 TEST(SlabTest, CreateSlabs)
 {
     {
-        spallocator::Slab<64> slab;
+        Slab<64> slab;
         EXPECT_EQ(slab.getElemSize(), 64);
         EXPECT_EQ(slab.getAllocSize(), 4_KB);
         EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
     }
 
     {
-        spallocator::Slab<128> slab;
+        Slab<128> slab;
         EXPECT_EQ(slab.getElemSize(), 128);
         EXPECT_EQ(slab.getAllocSize(), 4_KB);
         EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
     }
 
     {
-        spallocator::Slab<1_KB> slab;
+        Slab<1_KB> slab;
         EXPECT_EQ(slab.getElemSize(), 1_KB);
         EXPECT_EQ(slab.getAllocSize(), 4_KB);
         EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
     }
 
     {
-        spallocator::Slab<2_KB> slab;
+        Slab<2_KB> slab;
         EXPECT_EQ(slab.getElemSize(), 2_KB);
         EXPECT_EQ(slab.getAllocSize(), 8_KB);
         EXPECT_EQ(slab.getAllocatedMemory(), 8_KB);
     }
 
     {
-        spallocator::Slab<16_KB> slab;
+        Slab<16_KB> slab;
         EXPECT_EQ(slab.getElemSize(), 16_KB);
         EXPECT_EQ(slab.getAllocSize(), 64_KB);
         EXPECT_EQ(slab.getAllocatedMemory(), 64_KB);
@@ -78,10 +81,10 @@ TEST(SlabTest, CreateSlabs)
 
     {
         // not an even multiple of 1024
-        spallocator::Slab<12345> slab;
-        EXPECT_EQ(slab.getElemSize(), 12345);
-        EXPECT_EQ(slab.getAllocSize(), 49380);
-        EXPECT_EQ(slab.getAllocatedMemory(), 49380);
+        Slab<12336> slab;
+        EXPECT_EQ(slab.getElemSize(), 12336);
+        EXPECT_EQ(slab.getAllocSize(), 49344);
+        EXPECT_EQ(slab.getAllocatedMemory(), 49344);
     }
 
 }
@@ -89,7 +92,7 @@ TEST(SlabTest, CreateSlabs)
 
 TEST(SlabTest, AllocateItems)
 {
-    spallocator::Slab<128> slab;
+    Slab<128> slab;
 
     // initial allocation should be 4KB
     EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
@@ -141,9 +144,47 @@ TEST(SlabTest, AllocateItems)
 }
 
 
+TEST(SlabTest, DeallocateInvalidItem)
+{
+    Slab<256> slab;
+
+    auto item1 = slab.allocateItem(200);
+    EXPECT_NE(item1, nullptr);
+
+    // invalid pointer (not from this slab)
+    std::byte* invalid_item = reinterpret_cast<std::byte*>(std::malloc(256));
+    EXPECT_THROW(slab.deallocateItem(invalid_item), std::invalid_argument);
+    std::free(invalid_item);
+
+    // double free
+    slab.deallocateItem(item1);
+    EXPECT_THROW(slab.deallocateItem(item1), std::invalid_argument);
+}
+
+
+TEST(SlabTest, Alignment)
+{
+    Slab<64> slab;
+
+    std::vector<std::byte*> items;
+    for (int i = 0; i < 10; ++i)
+    {
+        auto item = slab.allocateItem(60);
+        EXPECT_NE(item, nullptr);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % 16, 0); // 16-byte alignment
+        items.push_back(item);
+    }
+
+    for (auto it : items)
+    {
+        slab.deallocateItem(it);
+    }
+}
+
+
 TEST(PoolTest, Selector)
 {
-    spallocator::Pool pool;
+    Pool pool;
 
     EXPECT_EQ(pool.selectSlab(16), 0);
     EXPECT_EQ(pool.selectSlab(32), 1);
@@ -193,7 +234,7 @@ TEST(PoolTest, Selector)
 
 TEST(PoolTest, AllocateItems)
 {
-    spallocator::Pool pool;
+    Pool pool;
 
     std::map<std::size_t, std::byte*> items;
 
@@ -212,7 +253,6 @@ TEST(PoolTest, AllocateItems)
     // free all items
     for (auto it : items)
     {
-        println("Deallocating item of size {} at ptr={}", it.first, static_cast<void*>(it.second));
         pool.deallocate(it.second);
     }
 
@@ -233,8 +273,107 @@ TEST(PoolTest, AllocateItems)
     // free all items again
     for (auto it : items)
     {
-        println("Deallocating item of size {} at ptr={}", it.first, static_cast<void*>(it.second));
         pool.deallocate(it.second);
+    }
+}
+
+
+TEST(PoolTest, uniqueBytePoolPtr)
+{
+    Pool pool;
+
+    // Create the deleter lambda
+    auto deleter = [&pool](std::byte* p) {
+        pool.deallocate(p);
+    };
+
+    using unique_byte_pool_ptr = std::unique_ptr<std::byte, decltype(deleter)>;
+
+    {
+        unique_byte_pool_ptr item1(pool.allocate(128), deleter);
+        EXPECT_NE(item1.get(), nullptr);
+
+        unique_byte_pool_ptr item2(pool.allocate(2048), deleter);
+        EXPECT_NE(item2.get(), nullptr);
+    } // items go out of scope and are deallocated
+
+    // allocate again to ensure no issues
+    auto item3 = pool.allocate(512);
+    EXPECT_NE(item3, nullptr);
+    pool.deallocate(item3);
+
+    using shared_byte_pool_ptr = std::shared_ptr<std::byte>;
+
+    {
+        shared_byte_pool_ptr item1(pool.allocate(256),
+            [&pool](std::byte* p) { pool.deallocate(p); });
+        EXPECT_NE(item1.get(), nullptr);
+
+        shared_byte_pool_ptr item2(pool.allocate(4096),
+            [&pool](std::byte* p) { pool.deallocate(p); });
+        EXPECT_NE(item2.get(), nullptr);
+    } // items go out of scope and are deallocated
+
+    // allocate again to ensure no issues
+    auto item4 = pool.allocate(1024);
+    EXPECT_NE(item4, nullptr);
+    pool.deallocate(item4);
+}
+
+
+TEST(PoolTest, uniquePoolPtr)
+{
+    Pool pool;
+
+    {
+        auto item1 = make_pool_unique<int>(pool, 128);
+        EXPECT_NE(item1.get(), nullptr);
+        EXPECT_EQ(*item1, 128);
+
+        auto item2 = make_pool_unique<int>(pool);
+        EXPECT_NE(item2.get(), nullptr);
+        EXPECT_EQ(*item2, 0);
+        *item2 = 42;
+        EXPECT_EQ(*item2, 42);
+
+        auto item3 = make_pool_unique<int[]>(pool, 10);
+        EXPECT_NE(item3.get(), nullptr);
+
+        for (int i = 0; i < 10; ++i)
+        {
+            item3[i] = i * 10;
+        }
+
+        for (int i = 0; i < 10; ++i)
+        {
+            EXPECT_EQ(item3[i], i * 10);
+        }
+    } // items go out of scope and are deallocated
+}
+
+
+TEST(PoolTest, Alignment)
+{
+    Pool pool;
+
+    for (size_t align : { 4, 8, 16 })
+    {
+        std::vector<std::byte*> items;
+        for (int i = 0; i <= 64; ++i)
+        {
+            for (size_t size = 1; size <= 128; ++size)
+            {
+                auto item = pool.allocate(size, align);
+                EXPECT_NE(item, nullptr);
+                EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % align, 0); // align-byte alignment
+                items.push_back(item);
+            }
+        }
+
+        for (auto it : items)
+        {
+            pool.deallocate(it);
+        }
     }
 }
 
@@ -485,6 +624,47 @@ TEST(SpinLockTest, stdLock)
         t.join();
         EXPECT_EQ(counter, 2);
     }
+}
+
+
+TEST(SpinLockTest, ManyThreads)
+{
+    std::size_t const num_cores = std::thread::hardware_concurrency();
+    println("Detected {} hardware threads", num_cores);
+    ASSERT_GT(num_cores, 0u);
+    const std::size_t num_threads = num_cores;
+
+    constexpr std::size_t increments_per_thread = 1000;
+
+    int counter = 0;
+    SpinLock lock;
+
+    // lock initially to ensure all threads contend
+    std::unique_lock<SpinLock> ulock(lock); // lock for setup
+
+    auto worker = [&counter, &lock]() {
+        for (int i = 0; i < increments_per_thread; ++i)
+        {
+            std::scoped_lock<SpinLock> slock(lock);
+            ++counter;
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_threads; ++i)
+    {
+        threads.emplace_back(worker);
+    }
+
+    EXPECT_EQ(counter, 0);
+    ulock.unlock(); // unlock to allow threads to proceed
+
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+
+    EXPECT_EQ(counter, num_threads * increments_per_thread);
 }
 
 

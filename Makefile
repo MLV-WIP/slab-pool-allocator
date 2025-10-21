@@ -10,8 +10,10 @@ LDDEBUG := -ggdb
 CXXRELEASE := -O3 -DNDEBUG
 LDRELEASE := -g
 
-CXXMEMSAN := -fsanitize=address -fsanitize-memory -fsanitize-undefined -fno-omit-frame-pointer
-LDMEMSAN := -fsanitize=address -fsanitize-memory -fsanitize-undefined
+#CXXMEMSAN := -fsanitize=address -fsanitize=hwaddress -fsanitize=leak -fsanitize=memory -fsanitize=safe-stack -fsanitize=undefined -fno-omit-frame-pointer
+#LDMEMSAN := -fsanitize=address -fsanitize=hwaddress -fsanitize=leak -fsanitize=memory -fsanitize=safe-stack -fsanitize=undefined -fno-omit-frame-pointer
+CXXMEMSAN := -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
+LDMEMSAN := -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
 
 CXXTHREADSAN := -fsanitize=thread -fno-omit-frame-pointer
 LDTHREADSAN := -fsanitize=thread

@@ -12,8 +12,9 @@ This project demonstrates high-performance memory allocation using the slab allo
 - **O(1) Allocation/Deallocation** - Bitset-based tracking with two-level availability maps
 - **Automatic Slab Growth** - Dynamic allocation of new slabs on demand
 - **Large Allocation Fallback** - Seamless handling of allocations > 1 KB
+- **Smart Pointer Support** - `make_pool_unique` for RAII-based memory management with automatic pool deallocation
 - **Custom SpinLock** - TTAS with escalating backoff and STL compatibility
-- **Modern C++20/23** - Template metaprogramming, user-defined literals, atomic operations
+- **Modern C++20/23** - Template metaprogramming, user-defined literals, atomic operations, ranges
 
 ## Quick Start
 
@@ -32,13 +33,18 @@ make
 int main() {
     spallocator::Pool pool;
 
-    // Allocate memory
+    // Raw allocation
     std::byte* ptr = pool.allocate(128);
-
-    // Use the memory...
-
-    // Deallocate when done
+    // ... use memory ...
     pool.deallocate(ptr);
+
+    // RAII with smart pointers (recommended)
+    auto obj = spallocator::make_pool_unique<MyClass>(pool, arg1, arg2);
+    // Automatically deallocated when obj goes out of scope
+
+    // Array support
+    auto arr = spallocator::make_pool_unique<int[]>(pool, 100);
+    // Array of 100 ints, automatically cleaned up
 
     return 0;
 }
@@ -53,6 +59,7 @@ int main() {
 | **Slab** | `spallocator/slab.hpp` | Template class managing fixed-size allocations with bitset tracking |
 | **Pool** | `spallocator/pool.hpp` | High-level interface routing allocations to appropriate slabs |
 | **SlabProxy** | `spallocator/slab.hpp` | Handles large allocations (>1KB) via standard allocators |
+| **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `PoolDeleter` for RAII memory management |
 | **SpinLock** | `spallocator/spinlock.hpp` | Lightweight lock with TTAS and escalating backoff |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
 
@@ -101,6 +108,8 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation signifi
 Comprehensive test suite covering:
 - Slab creation and allocation/deallocation
 - Pool size class selection
+- Smart pointer lifecycle (single objects and arrays)
+- Proper destructor invocation and memory cleanup
 - SpinLock contention handling and multi-threading
 - STL compatibility
 
@@ -109,8 +118,9 @@ Note: `SpinLockTest.Backoff` may occasionally fail due to intentional race condi
 ## Future Work
 
 - ✅ SpinLock implementation (COMPLETED)
+- ✅ Smart pointer support with `make_pool_unique` (COMPLETED)
 - Integrate SpinLock with Pool for thread-safe allocations
-- Smart pointer support (`std::shared_ptr`, `std::unique_ptr`)
+- `shared_ptr` support with pool-based allocator
 - Memory statistics and profiling
 - STL allocator interface compatibility
 
@@ -118,8 +128,9 @@ Note: `SpinLockTest.Backoff` may occasionally fail due to intentional race condi
 
 This project demonstrates:
 - Template metaprogramming and compile-time optimization
-- Modern C++20/23 features (atomics, literals, formatting)
-- Memory management patterns (slab allocation, bitset tracking)
+- Modern C++20/23 features (atomics, literals, formatting, ranges, concepts)
+- Memory management patterns (slab allocation, bitset tracking, RAII)
+- Custom deleters and smart pointer integration
 - Concurrency primitives (TTAS, memory ordering, backoff strategies)
 - Performance optimization techniques
 

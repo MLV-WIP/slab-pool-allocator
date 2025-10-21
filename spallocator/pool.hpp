@@ -49,7 +49,7 @@ namespace spallocator
     class Pool
     {
     public: // methods
-        std::byte* allocate(std::size_t size);
+        std::byte* allocate(std::size_t size, std::size_t alignment = 8);
         void deallocate(std::byte* item);
 
         Pool();
@@ -69,7 +69,7 @@ namespace spallocator
     };
 
 
-    std::byte* Pool::allocate(std::size_t item_size)
+    std::byte* Pool::allocate(std::size_t item_size, std::size_t alignment /* = 8 */)
     {
         Allocation alloc;
         alloc.size = item_size;
@@ -81,28 +81,46 @@ namespace spallocator
             throw std::out_of_range("Allocation size exceeds maximum limit for pool allocator");
         }
 
-        // store the actual allocated size just before the returned pointer
-        // for quick lookup of allocator during deallocation
-        std::size_t alloc_size = item_size + 4;
+        runtime_assert((alignment >= 4) && ((alignment & (alignment - 1)) == 0),
+            "Alignment must be a power of two and at least 4 bytes");
+        runtime_assert(alignment <= 16,
+            "Alignment greater than 16 bytes is not supported");
+        if (alignment < 4 || alignment > 16)
+        {
+            throw std::invalid_argument("Unsupported alignment requested");
+        }
+        // ... else the slab native buffer alignment is 16, which can cover
+        // all the supported alignment requests
+
+        // Store the actual allocated size and the alignment in bytes directly
+        // before the data returned to the user. We may need to pad for
+        // alignment, but the size will always be in the preceding 4 bytes,
+        // and the alignment in the 1 byte preceding that. This allows us to
+        // use the size for quick lookup during deallocation.
+        std::size_t header_size = 8 < alignment ? alignment : 8;
+        std::size_t alloc_size = item_size + header_size;
         alloc.size = alloc_size;
 
         auto slab_index = selectSlab(alloc_size);
         if (slab_index != std::numeric_limits<std::size_t>::max())
         {
             alloc.ptr = small_slabs[slab_index]->allocateItem(alloc_size);
-            println("Allocated {} ({}) bytes from small slab {}, ptr={}",
-                    alloc_size, item_size, slab_index, static_cast<void*>(alloc.ptr));
+            //println("Allocated {} ({}) bytes from small slab {}, ptr={}",
+            //        alloc_size, item_size, slab_index, static_cast<void*>(alloc.ptr));
         }
         else
         {
             alloc.ptr = large_slab.allocateItem(alloc_size);
-            println("Allocated {} ({}) bytes from large slab, ptr={}",
-                    alloc_size, item_size, static_cast<void*>(alloc.ptr));
+            //println("Allocated {} ({}) bytes from large slab, ptr={}",
+            //        alloc_size, item_size, static_cast<void*>(alloc.ptr));
         }
-        uint32_t* size_ptr = reinterpret_cast<uint32_t*>(alloc.ptr);
-        *size_ptr = uint32_t(alloc_size & 0xFFFF);
+        uint32_t* size_ptr = reinterpret_cast<uint32_t*>(alloc.ptr + header_size - 4);
+        *size_ptr = uint32_t(alloc_size & 0xffffffff);
 
-        return alloc.ptr + 4;
+        uint8_t* header_size_ptr = reinterpret_cast<uint8_t*>(alloc.ptr + header_size - 5);
+        *header_size_ptr = uint8_t(header_size & 0xff);
+
+        return alloc.ptr + header_size;
     }
 
 
@@ -113,13 +131,17 @@ namespace spallocator
             return;
         }
 
-        std::byte* original_ptr = item - 4;
-        uint32_t* size_ptr = reinterpret_cast<uint32_t*>(original_ptr);
+        uint32_t* size_ptr = reinterpret_cast<uint32_t*>(item - 4);
         std::size_t alloc_size = *size_ptr;
 
+        uint8_t* header_size_ptr = reinterpret_cast<uint8_t*>(item - 5);
+        uint8_t header_size = *header_size_ptr;
+
+        std::byte* original_ptr = item - header_size;
+
         auto slab_index = selectSlab(alloc_size);
-        println("Deallocating {} bytes at ptr={}, slab_index={}",
-                alloc_size, static_cast<void*>(original_ptr), slab_index);
+        //println("Deallocating {} bytes at ptr={}, slab_index={}",
+        //        alloc_size, static_cast<void*>(original_ptr), slab_index);
         if (slab_index != std::numeric_limits<std::size_t>::max())
         {
             small_slabs[slab_index]->deallocateItem(original_ptr);
