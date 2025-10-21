@@ -1,5 +1,5 @@
 GTESTDIR := /opt/homebrew/Cellar/googletest/1.17.0
-OBJDIR := ./obj
+BASEOBJDIR := ./obj
 
 CXXFLAGS := -std=c++20 -I./spallocator -I$(GTESTDIR)/include -I/usr/local/include -MMD -MP
 LDFLAGS  := -L$(GTESTDIR)/lib -L/usr/local/lib -lgtest
@@ -21,20 +21,22 @@ LDTHREADSAN := -fsanitize=thread
 ifeq ($(BUILD),debug)
 	CXXFLAGS += $(CXXDEBUG)
 	LDFLAGS += $(LDDEBUG)
-	OBJDIR := ./obj/debug
+	OBJDIRNAME := debug
 else ifeq ($(BUILD),memsan)
 	CXXFLAGS += $(CXXDEBUG) $(CXXMEMSAN)
 	LDFLAGS += $(LDDEBUG) $(LDMEMSAN)
-	OBJDIR := ./obj/memsan
+	OBJDIRNAME := memsan
 else ifeq ($(BUILD),threadsan)
 	CXXFLAGS += $(CXXDEBUG) $(CXXTHREADSAN)
 	LDFLAGS += $(LDDEBUG) $(LDTHREADSAN)
-	OBJDIR := ./obj/threadsan
+	OBJDIRNAME := threadsan
 else
 	CXXFLAGS += $(CXXRELEASE)
 	LDFLAGS += $(LDRELEASE)
-	OBJDIR := ./obj/release
+	OBJDIRNAME := release
 endif
+
+OBJDIR := $(BASEOBJDIR)/$(OBJDIRNAME)
 
 TESTER_SRC := tester.cpp
 TESTER_TARGET := tester
@@ -51,6 +53,8 @@ $(OBJDIR):
 
 $(OBJDIR)/$(TESTER_TARGET): $(TESTER_SRC) | $(OBJDIR)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+	rm -f ./obj/tester
+	ln -s $(OBJDIRNAME)/$(TESTER_TARGET) $(BASEOBJDIR)/$(TESTER_TARGET)
 
 $(OBJDIR)/$(DEMO_TARGET): $(DEMO_SRC) | $(OBJDIR)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
@@ -60,5 +64,6 @@ $(OBJDIR)/$(DEMO_TARGET): $(DEMO_SRC) | $(OBJDIR)
 -include $(DEMO_DEPFILE)
 
 clean:
-	rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET) $(OBJDIR)/*.o $(OBJDIR)/*.d
+	rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET) $(OBJDIR)/*.o $(OBJDIR)/*.d \
+		  $(BASEOBJDIR)/$(TESTER_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET)
 .PHONY: all clean

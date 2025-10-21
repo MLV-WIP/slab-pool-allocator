@@ -66,6 +66,8 @@ namespace spallocator
     private: // data members
         std::vector<std::unique_ptr<AbstractSlab>> small_slabs;
         SlabProxy large_slab;
+
+        SpinLock lock;
     };
 
 
@@ -101,19 +103,24 @@ namespace spallocator
         std::size_t alloc_size = item_size + header_size;
         alloc.size = alloc_size;
 
-        auto slab_index = selectSlab(alloc_size);
-        if (slab_index != std::numeric_limits<std::size_t>::max())
+        AbstractSlab* slab = nullptr;
         {
-            alloc.ptr = small_slabs[slab_index]->allocateItem(alloc_size);
-            //println("Allocated {} ({}) bytes from small slab {}, ptr={}",
-            //        alloc_size, item_size, slab_index, static_cast<void*>(alloc.ptr));
+            std::scoped_lock<SpinLock> guard(lock);
+            auto slab_index = selectSlab(alloc_size);
+            if (slab_index != std::numeric_limits<std::size_t>::max())
+            {
+                slab = small_slabs[slab_index].get();
+            }
+            else
+            {
+                slab = &large_slab;
+            }
         }
-        else
-        {
-            alloc.ptr = large_slab.allocateItem(alloc_size);
-            //println("Allocated {} ({}) bytes from large slab, ptr={}",
-            //        alloc_size, item_size, static_cast<void*>(alloc.ptr));
-        }
+        alloc.ptr = slab->allocateItem(alloc_size);
+        //println("Allocated {} bytes at ptr={}, slab={}",
+        //        alloc_size, static_cast<void*>(alloc.ptr),
+        //        (slab == &large_slab) ? "large_slab" : "small_slab");
+
         uint32_t* size_ptr = reinterpret_cast<uint32_t*>(alloc.ptr + header_size - 4);
         *size_ptr = uint32_t(alloc_size & 0xffffffff);
 
@@ -139,17 +146,22 @@ namespace spallocator
 
         std::byte* original_ptr = item - header_size;
 
-        auto slab_index = selectSlab(alloc_size);
+        AbstractSlab* slab = nullptr;
+        {
+            std::scoped_lock<SpinLock> guard(lock);
+            auto slab_index = selectSlab(alloc_size);
+            if (slab_index != std::numeric_limits<std::size_t>::max())
+            {
+                slab = small_slabs[slab_index].get();
+            }
+            else
+            {
+                slab = &large_slab;
+            }
+        }
         //println("Deallocating {} bytes at ptr={}, slab_index={}",
         //        alloc_size, static_cast<void*>(original_ptr), slab_index);
-        if (slab_index != std::numeric_limits<std::size_t>::max())
-        {
-            small_slabs[slab_index]->deallocateItem(original_ptr);
-        }
-        else
-        {
-            large_slab.deallocateItem(original_ptr);
-        }
+        slab->deallocateItem(original_ptr);
     }
 
 

@@ -471,6 +471,50 @@ TEST(PoolTest, Alignment)
 }
 
 
+TEST(PoolTest, MultiThreadTest)
+{
+    std::size_t const num_cores = std::thread::hardware_concurrency();
+    println("Detected {} hardware threads", num_cores);
+    ASSERT_GT(num_cores, 0u);
+    const std::size_t num_threads = num_cores * 8 / 10;
+
+    Pool pool;
+
+    constexpr int allocations_per_thread = 10000;
+
+    std::random_device rd;
+
+    auto worker = [&pool, &rd]() {
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<int> dist(0, 1000);
+        std::vector<std::byte*> items;
+        for (int i = 0; i < allocations_per_thread; ++i)
+        {
+            size_t size = 16 + dist(gen);
+            auto item = pool.allocate(size);
+            EXPECT_NE(item, nullptr);
+            items.push_back(item);
+        }
+
+        for (auto it : items)
+        {
+            pool.deallocate(it);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_threads; ++i)
+    {
+        threads.emplace_back(worker);
+    }
+
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+}
+
+
 TEST(SpinLockTest, BasicLocking)
 {
     int counter = 0;

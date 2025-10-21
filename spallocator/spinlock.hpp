@@ -82,12 +82,18 @@ public:
         // attempts.
         std::chrono::nanoseconds wait_time{dist(gen)};
 
+        int backoff_count = 0;
+
         // Test-and-Test-and-set (TTAS) spin lock with escalating backoff
-        for (std::size_t i = 0; i < 10; ++i)
+        while (true)
         {
             // First, spin while the lock appears to be held
-            while (lock_flag.test(std::memory_order_relaxed))
+            for (int i = 0; i < 100; ++i)
             {
+                if (!lock_flag.test(std::memory_order_relaxed))
+                {
+                    break; // Lock appears free, try to acquire
+                }
                 std::this_thread::yield();
             }
 
@@ -98,15 +104,20 @@ public:
                 return; // Lock acquired
             }
 
-            // no random recomputation; fast and simple addition for escalating backoff
-            wait_time += wait_time;
-
-            std::this_thread::sleep_for(wait_time);
+            // Failed to acquire - use escalating backoff
+            if (backoff_count < 10)
+            {
+                std::this_thread::sleep_for(wait_time);
+                wait_time += wait_time;
+                ++backoff_count;
+            }
+            else
+            {
+                // After 10 attempts, use efficient blocking
+                lock_flag.wait(true, std::memory_order_relaxed);
+                // Loop back to try acquiring again
+            }
         }
-
-        // Still waiting? Just block until we get the lock
-        lock_flag.wait(true, std::memory_order_acquire);
-        TSAN_ANNOTATE_HAPPENS_AFTER(this);
     }
 
     bool try_lock()

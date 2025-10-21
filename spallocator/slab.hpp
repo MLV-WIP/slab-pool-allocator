@@ -124,6 +124,8 @@ namespace spallocator
         std::bitset<max_slabs> slab_available_map;
 
         std::map<std::byte*, std::size_t> base_address_map;
+
+        SpinLock slab_lock;
     };
 
 
@@ -191,6 +193,8 @@ namespace spallocator
         runtime_assert(size <= ElemSize,
             std::format("Requested size {} exceeds slab element size {}", size, ElemSize));
 
+        std::scoped_lock<SpinLock> guard(slab_lock);
+
         // Find a free item in the slabs
         for (std::size_t slab_index = 0; slab_index <= slab_map.size(); ++slab_index)
         {
@@ -204,8 +208,8 @@ namespace spallocator
             {
                 // need to allocate a new slab
                 allocateNewSlab();
-                println("New slab<{}> allocated, total slabs: {}/{}",
-                        ElemSize, slab_data.size(), slab_map.size());
+                //println("New slab<{}> allocated, total slabs: {}/{}",
+                //        ElemSize, slab_data.size(), slab_map.size());
             }
 
             auto& slab_slots = slab_map[slab_index];
@@ -261,6 +265,13 @@ namespace spallocator
     template<const std::size_t ElemSize>
     void Slab<ElemSize>::deallocateItem(std::byte* item)
     {
+        if (!item)
+        {
+            return;
+        }
+
+        std::scoped_lock<SpinLock> guard(slab_lock);
+
         // Find which slab this item belongs to
         if (auto slab_index_opt = findSlabForItem(item); !slab_index_opt.has_value())
         {
@@ -299,9 +310,9 @@ namespace spallocator
     template<const std::size_t ElemSize>
     Slab<ElemSize>::Slab()
     {
-        println("Slab created with element size: {}, allocation size: {}, and multiplier: {}",
-                getElemSize(), getAllocSize(), alloc_multiplier);
-        
+        //println("Slab created with element size: {}, allocation size: {}, and multiplier: {}",
+        //        getElemSize(), getAllocSize(), alloc_multiplier);
+
         // all slabs are initially available
         slab_available_map.set();
 
@@ -311,7 +322,7 @@ namespace spallocator
     template<const std::size_t ElemSize>
     Slab<ElemSize>::~Slab()
     {
-        println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
+        //println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
         for (auto ptr : slab_data) {
             delete[] ptr;
         }
