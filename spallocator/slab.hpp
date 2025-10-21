@@ -89,7 +89,7 @@ namespace spallocator
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
         constexpr std::size_t getAllocSize() const { return slab_alloc_size; }
-        const std::size_t getAllocatedMemory() const { return slab_data.size() * slab_alloc_size; }
+        std::size_t getAllocatedMemory() const { return slab_data.size() * slab_alloc_size; }
 
         std::optional<std::size_t> findSlabForItem(std::byte* item) const;
 
@@ -282,7 +282,7 @@ namespace spallocator
             auto slab_index = *slab_index_opt;
 
             auto slab_start = slab_data[slab_index];
-            auto slab_end = slab_start + slab_alloc_size;
+            //auto slab_end = slab_start + slab_alloc_size;
 
             // Calculate the item index within the slab
             std::size_t item_index = (item - slab_start) / ElemSize;

@@ -46,14 +46,14 @@ TEST(SlabTest, CreateSlabs)
 {
     {
         Slab<64> slab;
-        EXPECT_EQ(slab.getElemSize(), 64);
+        EXPECT_EQ(slab.getElemSize(), 64u);
         EXPECT_EQ(slab.getAllocSize(), 4_KB);
         EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
     }
 
     {
         Slab<128> slab;
-        EXPECT_EQ(slab.getElemSize(), 128);
+        EXPECT_EQ(slab.getElemSize(), 128u);
         EXPECT_EQ(slab.getAllocSize(), 4_KB);
         EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
     }
@@ -82,9 +82,9 @@ TEST(SlabTest, CreateSlabs)
     {
         // not an even multiple of 1024
         Slab<12336> slab;
-        EXPECT_EQ(slab.getElemSize(), 12336);
-        EXPECT_EQ(slab.getAllocSize(), 49344);
-        EXPECT_EQ(slab.getAllocatedMemory(), 49344);
+        EXPECT_EQ(slab.getElemSize(), 12336u);
+        EXPECT_EQ(slab.getAllocSize(), 49344u);
+        EXPECT_EQ(slab.getAllocatedMemory(), 49344u);
     }
 
 }
@@ -171,7 +171,7 @@ TEST(SlabTest, Alignment)
     {
         auto item = slab.allocateItem(60);
         EXPECT_NE(item, nullptr);
-        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % 16, 0); // 16-byte alignment
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % 16, 0u); // 16-byte alignment
         items.push_back(item);
     }
 
@@ -186,48 +186,48 @@ TEST(PoolTest, Selector)
 {
     Pool pool;
 
-    EXPECT_EQ(pool.selectSlab(16), 0);
-    EXPECT_EQ(pool.selectSlab(32), 1);
-    EXPECT_EQ(pool.selectSlab(48), 2);
-    EXPECT_EQ(pool.selectSlab(64), 3);
-    EXPECT_EQ(pool.selectSlab(96), 4);
-    EXPECT_EQ(pool.selectSlab(128), 5);
-    EXPECT_EQ(pool.selectSlab(192), 6);
-    EXPECT_EQ(pool.selectSlab(256), 7);
-    EXPECT_EQ(pool.selectSlab(384), 8);
-    EXPECT_EQ(pool.selectSlab(512), 9);
-    EXPECT_EQ(pool.selectSlab(768), 10);
-    EXPECT_EQ(pool.selectSlab(1024), 11);
+    EXPECT_EQ(pool.selectSlab(16), 0u);
+    EXPECT_EQ(pool.selectSlab(32), 1u);
+    EXPECT_EQ(pool.selectSlab(48), 2u);
+    EXPECT_EQ(pool.selectSlab(64), 3u);
+    EXPECT_EQ(pool.selectSlab(96), 4u);
+    EXPECT_EQ(pool.selectSlab(128), 5u);
+    EXPECT_EQ(pool.selectSlab(192), 6u);
+    EXPECT_EQ(pool.selectSlab(256), 7u);
+    EXPECT_EQ(pool.selectSlab(384), 8u);
+    EXPECT_EQ(pool.selectSlab(512), 9u);
+    EXPECT_EQ(pool.selectSlab(768), 10u);
+    EXPECT_EQ(pool.selectSlab(1024), 11u);
     EXPECT_EQ(pool.selectSlab(1500), std::numeric_limits<std::size_t>::max());
     EXPECT_EQ(pool.selectSlab(2000), std::numeric_limits<std::size_t>::max());
     EXPECT_EQ(pool.selectSlab(3000), std::numeric_limits<std::size_t>::max());
     EXPECT_EQ(pool.selectSlab(4000), std::numeric_limits<std::size_t>::max());
     EXPECT_EQ(pool.selectSlab(5000), std::numeric_limits<std::size_t>::max());
 
-    EXPECT_EQ(pool.selectSlab(1), 0);
-    EXPECT_EQ(pool.selectSlab(15), 0);
-    EXPECT_EQ(pool.selectSlab(17), 1);
-    EXPECT_EQ(pool.selectSlab(31), 1);
-    EXPECT_EQ(pool.selectSlab(33), 2);
-    EXPECT_EQ(pool.selectSlab(47), 2);
-    EXPECT_EQ(pool.selectSlab(49), 3);
-    EXPECT_EQ(pool.selectSlab(63), 3);
-    EXPECT_EQ(pool.selectSlab(65), 4);
-    EXPECT_EQ(pool.selectSlab(95), 4);
-    EXPECT_EQ(pool.selectSlab(97), 5);
-    EXPECT_EQ(pool.selectSlab(127), 5);
-    EXPECT_EQ(pool.selectSlab(129), 6);
-    EXPECT_EQ(pool.selectSlab(191), 6);
-    EXPECT_EQ(pool.selectSlab(193), 7);
-    EXPECT_EQ(pool.selectSlab(255), 7);
-    EXPECT_EQ(pool.selectSlab(257), 8);
-    EXPECT_EQ(pool.selectSlab(383), 8);
-    EXPECT_EQ(pool.selectSlab(385), 9);
-    EXPECT_EQ(pool.selectSlab(511), 9);
-    EXPECT_EQ(pool.selectSlab(513), 10);
-    EXPECT_EQ(pool.selectSlab(767), 10);
-    EXPECT_EQ(pool.selectSlab(769), 11);
-    EXPECT_EQ(pool.selectSlab(1023), 11);
+    EXPECT_EQ(pool.selectSlab(1), 0u);
+    EXPECT_EQ(pool.selectSlab(15), 0u);
+    EXPECT_EQ(pool.selectSlab(17), 1u);
+    EXPECT_EQ(pool.selectSlab(31), 1u);
+    EXPECT_EQ(pool.selectSlab(33), 2u);
+    EXPECT_EQ(pool.selectSlab(47), 2u);
+    EXPECT_EQ(pool.selectSlab(49), 3u);
+    EXPECT_EQ(pool.selectSlab(63), 3u);
+    EXPECT_EQ(pool.selectSlab(65), 4u);
+    EXPECT_EQ(pool.selectSlab(95), 4u);
+    EXPECT_EQ(pool.selectSlab(97), 5u);
+    EXPECT_EQ(pool.selectSlab(127), 5u);
+    EXPECT_EQ(pool.selectSlab(129), 6u);
+    EXPECT_EQ(pool.selectSlab(191), 6u);
+    EXPECT_EQ(pool.selectSlab(193), 7u);
+    EXPECT_EQ(pool.selectSlab(255), 7u);
+    EXPECT_EQ(pool.selectSlab(257), 8u);
+    EXPECT_EQ(pool.selectSlab(383), 8u);
+    EXPECT_EQ(pool.selectSlab(385), 9u);
+    EXPECT_EQ(pool.selectSlab(511), 9u);
+    EXPECT_EQ(pool.selectSlab(513), 10u);
+    EXPECT_EQ(pool.selectSlab(767), 10u);
+    EXPECT_EQ(pool.selectSlab(769), 11u);
+    EXPECT_EQ(pool.selectSlab(1023), 11u);
     EXPECT_EQ(pool.selectSlab(1025), std::numeric_limits<std::size_t>::max());
 }
 
@@ -458,7 +458,7 @@ TEST(PoolTest, Alignment)
             {
                 auto item = pool.allocate(size, align);
                 EXPECT_NE(item, nullptr);
-                EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % align, 0); // align-byte alignment
+                EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % align, 0u); // align-byte alignment
                 items.push_back(item);
             }
         }
@@ -503,7 +503,7 @@ TEST(PoolTest, MultiThreadTest)
     };
 
     std::vector<std::thread> threads;
-    for (int i = 0; i < num_threads; ++i)
+    for (size_t i = 0; i < num_threads; ++i)
     {
         threads.emplace_back(worker);
     }
@@ -551,7 +551,7 @@ TEST(SpinLockTest, BasicLocking)
 //
 TEST(SpinLockTest, Backoff)
 {
-    int tested_value = 0x55555555;
+    uint32_t tested_value = 0x55555555;
 
     SpinLock lock;
 
@@ -561,20 +561,20 @@ TEST(SpinLockTest, Backoff)
     std::thread t([&lock, &tested_value]() {
         lock.lock();
         // critical section
-        EXPECT_EQ(tested_value, 0xAAAAAAAA);
-        tested_value ^= 0xFFFFFFFF;
-        EXPECT_EQ(tested_value, 0x55555555);
+        EXPECT_EQ(tested_value, 0xAAAAAAAAu);
+        tested_value ^= 0xFFFFFFFFu;
+        EXPECT_EQ(tested_value, 0x55555555u);
         lock.unlock();
     });
 
-    EXPECT_EQ(tested_value, 0x55555555);
-    tested_value ^= 0xFFFFFFFF;
-    EXPECT_EQ(tested_value, 0xAAAAAAAA);
+    EXPECT_EQ(tested_value, 0x55555555u);
+    tested_value ^= 0xFFFFFFFFu;
+    EXPECT_EQ(tested_value, 0xAAAAAAAAu);
 
     // Sleep for a short duration to ensure the other thread attempts to lock
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    EXPECT_EQ(tested_value, 0xAAAAAAAA);
+    EXPECT_EQ(tested_value, 0xAAAAAAAAu);
 
     // Unlock the main thread's lock
     lock.unlock();
@@ -582,14 +582,14 @@ TEST(SpinLockTest, Backoff)
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     lock.lock();
-    EXPECT_EQ(tested_value, 0x55555555);
-    tested_value ^= 0xFFFFFFFF;
-    EXPECT_EQ(tested_value, 0xAAAAAAAA);
+    EXPECT_EQ(tested_value, 0x55555555u);
+    tested_value ^= 0xFFFFFFFFu;
+    EXPECT_EQ(tested_value, 0xAAAAAAAAu);
     lock.unlock();
 
     // Wait for the other thread to finish
     t.join();
-    EXPECT_EQ(tested_value, 0xAAAAAAAA);
+    EXPECT_EQ(tested_value, 0xAAAAAAAAu);
 }
 
 
@@ -775,14 +775,14 @@ TEST(SpinLockTest, ManyThreads)
 
     constexpr std::size_t increments_per_thread = 10000;
 
-    int counter = 0;
+    uint32_t counter = 0;
     SpinLock lock;
 
     // lock initially to ensure all threads contend
     std::unique_lock<SpinLock> ulock(lock); // lock for setup
 
     auto worker = [&counter, &lock]() {
-        for (int i = 0; i < increments_per_thread; ++i)
+        for (size_t i = 0; i < increments_per_thread; ++i)
         {
             std::scoped_lock<SpinLock> slock(lock);
             ++counter;
@@ -790,12 +790,12 @@ TEST(SpinLockTest, ManyThreads)
     };
 
     std::vector<std::thread> threads;
-    for (int i = 0; i < num_threads; ++i)
+    for (size_t i = 0; i < num_threads; ++i)
     {
         threads.emplace_back(worker);
     }
 
-    EXPECT_EQ(counter, 0);
+    EXPECT_EQ(counter, 0u);
     ulock.unlock(); // unlock to allow threads to proceed
 
     for (auto& t : threads)
