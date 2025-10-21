@@ -82,17 +82,18 @@ public:
         // attempts.
         std::chrono::nanoseconds wait_time{dist(gen)};
 
-        int backoff_count = 0;
-
         // Test-and-Test-and-set (TTAS) spin lock with escalating backoff
         while (true)
         {
+            int backoff_count = 0;
+
             // First, spin while the lock appears to be held
             for (int i = 0; i < 100; ++i)
             {
                 if (!lock_flag.test(std::memory_order_relaxed))
                 {
-                    break; // Lock appears free, try to acquire
+                    // Lock appears free, try to acquire
+                    break;
                 }
                 std::this_thread::yield();
             }
