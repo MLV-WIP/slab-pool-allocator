@@ -67,24 +67,16 @@ namespace spallocator
     {
         spallocator::Pool& pool;
 
+        const std::size_t size;
+
         void operator()(T* p) const  // Note: T*, not T*[]
         {
             if (p)
             {
-                // Get the size header stored before the array
-                std::byte* allocation = reinterpret_cast<std::byte*>(p);
-                std::byte* header_ptr = allocation - sizeof(std::size_t);
-                runtime_assert(
-                    reinterpret_cast<std::uintptr_t>(header_ptr) % alignof(std::size_t) == 0,
-                    std::format("Header pointer {} is not properly aligned for size_t", (void*)header_ptr));
-                std::size_t size = *reinterpret_cast<std::size_t*>(header_ptr);
-
                 // Call destructors in reverse order
                 std::ranges::for_each(std::views::counted(p, size) | std::views::reverse,
                                       [](T& elem){ elem.~T(); });
-
-                // Deallocate from the start of the header
-                pool.deallocate(header_ptr);
+                pool.deallocate(reinterpret_cast<std::byte*>(p));
             }
         }
     };
@@ -110,27 +102,13 @@ namespace spallocator
     {
         using ElementType = std::remove_extent_t<T>;
 
-        // Calculate total size: size header + array
-        std::size_t header_size = sizeof(std::size_t);
         std::size_t array_size = sizeof(ElementType) * size;
         std::size_t alignment = alignof(ElementType) > alignof(std::size_t) ?
                                 alignof(ElementType) : alignof(std::size_t);
 
         // Allocate memory for header + array
-        std::byte* mem = pool.allocate(header_size + array_size, alignment);
-
-        // Store the size in the header
-        std::size_t* size_ptr = reinterpret_cast<std::size_t*>(mem);
-        runtime_assert(
-            reinterpret_cast<std::uintptr_t>(size_ptr) % alignof(std::size_t) == 0,
-            std::format("Header pointer {} is not properly aligned for size_t", (void*)size_ptr));
-        *size_ptr = size;
-
-        // Get pointer to array location (after header)
-        ElementType* array_ptr = reinterpret_cast<ElementType*>(mem + header_size);
-        runtime_assert(
-            reinterpret_cast<std::uintptr_t>(array_ptr) % alignment == 0,
-            std::format("Array pointer {} is not properly aligned for {}", (void*)array_ptr, alignment));
+        std::byte* mem = pool.allocate(array_size, alignment);
+        ElementType* array_ptr = reinterpret_cast<ElementType*>(mem);
 
         // Use placement new to construct each element
         for (std::size_t i = 0; i < size; ++i)
@@ -138,7 +116,7 @@ namespace spallocator
             new (&array_ptr[i]) ElementType();
         }
 
-        return unique_pool_ptr<T>(array_ptr, PoolDeleter<T>{pool});
+        return unique_pool_ptr<T>(array_ptr, PoolDeleter<T>{pool, size});
     }
 
     // Known bound array version (deleted - use std::array instead)
