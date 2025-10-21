@@ -321,6 +321,47 @@ TEST(PoolTest, uniqueBytePoolPtr)
 }
 
 
+TEST(PoolTest, sharedBytePoolPtr)
+{
+    Pool pool;
+
+    // Create the deleter lambda
+    auto deleter = [&pool](std::byte* p) {
+        pool.deallocate(p);
+    };
+
+    using shared_byte_pool_ptr = std::shared_ptr<std::byte>;
+
+    {
+        shared_byte_pool_ptr item1(pool.allocate(128), deleter);
+        EXPECT_NE(item1.get(), nullptr);
+
+        shared_byte_pool_ptr item2(pool.allocate(2048), deleter);
+        EXPECT_NE(item2.get(), nullptr);
+    } // items go out of scope and are deallocated
+
+    // allocate again to ensure no issues
+    auto item3 = pool.allocate(512);
+    EXPECT_NE(item3, nullptr);
+    pool.deallocate(item3);
+
+    using shared_byte_pool_ptr = std::shared_ptr<std::byte>;
+
+    {
+        shared_byte_pool_ptr item1(pool.allocate(256), deleter);
+        EXPECT_NE(item1.get(), nullptr);
+
+        shared_byte_pool_ptr item2(pool.allocate(4096), deleter);
+        EXPECT_NE(item2.get(), nullptr);
+    } // items go out of scope and are deallocated
+
+    // allocate again to ensure no issues
+    auto item4 = pool.allocate(1024);
+    EXPECT_NE(item4, nullptr);
+    pool.deallocate(item4);
+}
+
+
 TEST(PoolTest, uniquePoolPtr)
 {
     Pool pool;
@@ -348,6 +389,58 @@ TEST(PoolTest, uniquePoolPtr)
         {
             EXPECT_EQ(item3[i], i * 10);
         }
+    } // items go out of scope and are deallocated
+}
+
+
+TEST(PoolTest, sharedPoolPtr)
+{
+    Pool pool;
+
+    {
+        auto item1 = make_pool_shared<int>(pool, 128);
+        EXPECT_NE(item1.get(), nullptr);
+        EXPECT_EQ(*item1, 128);
+
+        auto item2 = make_pool_shared<int>(pool);
+        EXPECT_NE(item2.get(), nullptr);
+        EXPECT_EQ(*item2, 0);
+        *item2 = 42;
+        EXPECT_EQ(*item2, 42);
+
+        auto item3 = make_pool_shared<int[]>(pool, 10);
+        EXPECT_NE(item3.get(), nullptr);
+
+        for (int i = 0; i < 10; ++i)
+        {
+            item3[i] = i * 10;
+        }
+
+        for (int i = 0; i < 10; ++i)
+        {
+            EXPECT_EQ(item3[i], i * 10);
+        }
+
+        item1 = item2;
+        EXPECT_EQ(*item1, 42);
+        EXPECT_EQ(*item2, 42);
+        *item1 = 84;
+
+        auto item4 = item3;
+        for (int i = 0; i < 10; ++i)
+        {
+            EXPECT_EQ(item4[i], i * 10);
+        }
+
+        auto item5 = item1;
+        EXPECT_EQ(*item5, 84);
+        EXPECT_EQ(*item1, 84);
+        EXPECT_EQ(*item2, 84);
+
+        *item5 = 99;
+        EXPECT_EQ(*item1, 99);
+        EXPECT_EQ(*item2, 99);
+        EXPECT_EQ(*item5, 99);
     } // items go out of scope and are deallocated
 }
 

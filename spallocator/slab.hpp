@@ -33,14 +33,15 @@
 #ifndef SLAP_HPP_
 #define SLAP_HPP_
 
-#include <cstddef>
-#include <type_traits>
-#include <vector>
 #include <bitset>
-#include <stdexcept>
-#include <string>
+#include <cstddef>
 #include <format>
 #include <iostream>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <vector>
 
 #include "helper.hpp"
 

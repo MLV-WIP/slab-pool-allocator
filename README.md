@@ -158,4 +158,7 @@ This is an educational project. Contributions should:
 
 README and documentation generated with AI assistance (Claude Code, GitHub Copilot).
 
-Architecture, design, and core implementation are human-generated.
+Architecture, design, and core implementation are human-generated. Standard library
+adaptations (make_unique and make_shared support, along with standard allocator
+support) also developed with AI assistance, but in all cases, all code has
+been validated, reviewed, and forged by human hands.
