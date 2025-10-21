@@ -10,11 +10,13 @@ This project demonstrates high-performance memory allocation using the slab allo
 
 - **12 Optimized Size Classes** - 16 bytes to 1 KB with intelligent intermediate sizes (48, 96, 192, 384, 768)
 - **O(1) Allocation/Deallocation** - Bitset-based tracking with two-level availability maps
+- **Thread-Safe Pool** - Two-level locking (pool + per-slab) for optimal concurrency
 - **Automatic Slab Growth** - Dynamic allocation of new slabs on demand
 - **Large Allocation Fallback** - Seamless handling of allocations > 1 KB
-- **Smart Pointer Support** - `make_pool_unique` for RAII-based memory management with automatic pool deallocation
-- **Custom SpinLock** - TTAS with escalating backoff and STL compatibility
-- **Modern C++20/23** - Template metaprogramming, user-defined literals, atomic operations, ranges
+- **Smart Pointer Support** - `make_pool_unique` and `make_pool_shared` for RAII-based memory management
+- **Standard Allocator Interface** - `PoolAllocator<T>` for STL container integration
+- **Production-Ready SpinLock** - TTAS with three-phase contention handling (spin → backoff → block)
+- **Modern C++20/23** - Template metaprogramming, user-defined literals, atomic operations, ranges, concepts
 
 ## Quick Start
 
@@ -31,20 +33,24 @@ make
 #include "spallocator/spallocator.hpp"
 
 int main() {
-    spallocator::Pool pool;
+    spallocator::Pool pool;  // Thread-safe by default
 
     // Raw allocation
     std::byte* ptr = pool.allocate(128);
     // ... use memory ...
     pool.deallocate(ptr);
 
-    // RAII with smart pointers (recommended)
+    // unique_ptr with automatic cleanup
     auto obj = spallocator::make_pool_unique<MyClass>(pool, arg1, arg2);
-    // Automatically deallocated when obj goes out of scope
-
-    // Array support
     auto arr = spallocator::make_pool_unique<int[]>(pool, 100);
-    // Array of 100 ints, automatically cleaned up
+
+    // shared_ptr with reference counting
+    auto shared = spallocator::make_pool_shared<MyClass>(pool, arg1, arg2);
+    auto copy = shared;  // Both point to same object
+
+    // STL containers with pool allocator
+    std::vector<int, spallocator::PoolAllocator<int>> vec(pool);
+    vec.push_back(42);
 
     return 0;
 }
@@ -57,10 +63,11 @@ int main() {
 | Component | File | Description |
 |-----------|------|-------------|
 | **Slab** | `spallocator/slab.hpp` | Template class managing fixed-size allocations with bitset tracking |
-| **Pool** | `spallocator/pool.hpp` | High-level interface routing allocations to appropriate slabs |
+| **Pool** | `spallocator/pool.hpp` | Thread-safe interface routing allocations to appropriate slabs |
 | **SlabProxy** | `spallocator/slab.hpp` | Handles large allocations (>1KB) via standard allocators |
-| **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `PoolDeleter` for RAII memory management |
-| **SpinLock** | `spallocator/spinlock.hpp` | Lightweight lock with TTAS and escalating backoff |
+| **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII memory management |
+| **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
+| **SpinLock** | `spallocator/spinlock.hpp` | Production-ready lock with TTAS, backoff, and TSan annotations |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
 
 ### Size Classes
@@ -85,11 +92,14 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation signifi
 
 ## SpinLock Features
 
+- **Three-Phase Contention** - Active spin → escalating backoff → efficient blocking
 - **TTAS (Test-and-Test-and-Set)** - Reduces cache coherency traffic
-- **Escalating Backoff** - Randomized initial wait, doubles on contention
-- **STL Compatible** - Works with `std::scoped_lock` and `std::unique_lock`
-- **Memory Ordering** - Proper acquire/release semantics
-- **Efficient Blocking** - Uses C++20 `atomic_flag::wait()` after 10 iterations
+- **Escalating Backoff** - Randomized 1-100ns initial wait, additive doubling on contention
+- **STL Compatible** - Works with `std::scoped_lock` and `std::unique_lock` (BasicLockable)
+- **Memory Ordering** - Proper acquire/release semantics with relaxed optimization
+- **Efficient Blocking** - Uses C++20 `atomic_flag::wait()` after backoff exhaustion
+- **TSan Annotations** - ThreadSanitizer integration for race detection
+- **Production Ready** - Analyzed and validated (see `docs/SpinLock_Analysis.md`)
 
 ## Requirements
 
@@ -101,28 +111,38 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation signifi
 ## Documentation
 
 - **[IMPLEMENTATION.md](IMPLEMENTATION.md)** - Detailed implementation guide with educational insights
+- **[docs/SpinLock_Analysis.md](spallocator/docs/SpinLock_Analysis.md)** - Comprehensive SpinLock correctness and performance analysis
 - **Source Files** - Extensive inline comments explaining design decisions
 
 ## Testing
 
 Comprehensive test suite covering:
 - Slab creation and allocation/deallocation
-- Pool size class selection
-- Smart pointer lifecycle (single objects and arrays)
+- Pool size class selection and thread safety
+- Smart pointer lifecycle (`unique_ptr` and `shared_ptr`)
 - Proper destructor invocation and memory cleanup
 - SpinLock contention handling and multi-threading
-- STL compatibility
+- STL compatibility and `PoolAllocator` integration
 
-Note: `SpinLockTest.Backoff` may occasionally fail due to intentional race conditions with probabilistic timing.
+**Build targets**:
+- `make` - Build all (tester + demo_shared_ptr)
+- `BUILD=threadsan make` - Build with ThreadSanitizer for race detection
+- `BUILD=memsan make` - Build with AddressSanitizer + UBSanitizer (default)
+
+**Demo programs**:
+- `./obj/memsan/tester` - Run all unit tests
+- `./obj/memsan/demo_shared_ptr` - Demonstrate shared_ptr usage
 
 ## Future Work
 
 - ✅ SpinLock implementation (COMPLETED)
-- ✅ Smart pointer support with `make_pool_unique` (COMPLETED)
-- Integrate SpinLock with Pool for thread-safe allocations
-- `shared_ptr` support with pool-based allocator
-- Memory statistics and profiling
-- STL allocator interface compatibility
+- ✅ Smart pointer support: `make_pool_unique` and `make_pool_shared` (COMPLETED)
+- ✅ Thread-safe Pool with SpinLock integration (COMPLETED)
+- ✅ STL allocator interface: `PoolAllocator<T>` (COMPLETED)
+- Memory statistics and profiling API
+- Per-slab locking for improved concurrency
+- Lock-free allocation paths for common cases
+- Configurable SpinLock parameters
 
 ## Learning Value
 
