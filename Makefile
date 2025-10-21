@@ -145,6 +145,7 @@ all: check-config $(TARGETS)
 	else \
 		echo "Nothing to build (tests and demo disabled)"; \
 	fi
+	$(CXX) --version
 
 # Check if configuration looks reasonable
 check-config:
