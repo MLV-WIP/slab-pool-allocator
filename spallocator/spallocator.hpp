@@ -37,6 +37,7 @@
 #include <limits>
 #include <memory>
 #include <ranges>
+#include <algorithm>
 
 #include "helper.hpp"
 #include "slab.hpp"

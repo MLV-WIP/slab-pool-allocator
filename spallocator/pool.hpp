@@ -115,11 +115,11 @@ namespace spallocator
             {
                 slab = &large_slab;
             }
+            //println("Allocated {} bytes at ptr={}, slab={}",
+            //        alloc_size, static_cast<void*>(alloc.ptr),
+            //        (slab == &large_slab) ? "large_slab" : std::format("small_slab {}", slab_index));
         }
         alloc.ptr = slab->allocateItem(alloc_size);
-        //println("Allocated {} bytes at ptr={}, slab={}",
-        //        alloc_size, static_cast<void*>(alloc.ptr),
-        //        (slab == &large_slab) ? "large_slab" : "small_slab");
 
         uint32_t* size_ptr = reinterpret_cast<uint32_t*>(alloc.ptr + header_size - 4);
         *size_ptr = uint32_t(alloc_size & 0xffffffff);
@@ -158,9 +158,10 @@ namespace spallocator
             {
                 slab = &large_slab;
             }
+            //println("Deallocating {} bytes at ptr={}, slab={}",
+            //        alloc_size, static_cast<void*>(original_ptr),
+            //        (slab == &large_slab) ? "large_slab" : std::format("small_slab {}", slab_index));
         }
-        //println("Deallocating {} bytes at ptr={}, slab_index={}",
-        //        alloc_size, static_cast<void*>(original_ptr), slab_index);
         slab->deallocateItem(original_ptr);
     }
 

@@ -22,6 +22,7 @@ ENABLE_TESTS="yes"
 ENABLE_DEMO="yes"
 GTEST_DIR=""
 ENABLE_ASAN="auto"
+ENABLE_LSAN="auto"
 ENABLE_UBSAN="auto"
 ENABLE_TSAN="no"
 ENABLE_COVERAGE="no"
@@ -67,6 +68,8 @@ Optional Features:
   --disable-demo          do not build demo programs
   --enable-asan           enable AddressSanitizer [default: auto]
   --disable-asan          disable AddressSanitizer
+  --enable-lsan           enable LeakSanitizer [default: auto]
+  --disable-lsan          disable LeakSanitizer
   --enable-ubsan          enable UndefinedBehaviorSanitizer [default: auto]
   --disable-ubsan         disable UndefinedBehaviorSanitizer
   --enable-tsan           enable ThreadSanitizer [default: no]
@@ -118,6 +121,12 @@ for arg in "$@"; do
         --disable-asan)
             ENABLE_ASAN="no"
             ;;
+        --enable-lsan)
+            ENABLE_LSAN="yes"
+            ;;
+        --disable-lsan)
+            ENABLE_LSAN="no"
+            ;;
         --enable-ubsan)
             ENABLE_UBSAN="yes"
             ;;
@@ -164,13 +173,16 @@ esac
 # Auto-detect sanitizers for build type
 if [ "$BUILD_TYPE" = "memsan" ]; then
     [ "$ENABLE_ASAN" = "auto" ] && ENABLE_ASAN="yes"
+    [ "$ENABLE_LSAN" = "auto" ] && ENABLE_LSAN="yes"
     [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="yes"
 elif [ "$BUILD_TYPE" = "threadsan" ]; then
     ENABLE_TSAN="yes"
     ENABLE_ASAN="no"  # Can't use ASan and TSan together
+    ENABLE_LSAN="no"  # Can't use LSan and TSan together
     [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="no"
 else
     [ "$ENABLE_ASAN" = "auto" ] && ENABLE_ASAN="no"
+    [ "$ENABLE_LSAN" = "auto" ] && ENABLE_LSAN="no"
     [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="no"
 fi
 
@@ -331,7 +343,7 @@ if [ "$ENABLE_TESTS" = "yes" ]; then
 fi
 
 # Check sanitizer support
-if [ "$ENABLE_ASAN" = "yes" ] || [ "$ENABLE_UBSAN" = "yes" ] || [ "$ENABLE_TSAN" = "yes" ]; then
+if [ "$ENABLE_ASAN" = "yes" ] || [ "$ENABLE_LSAN" = "yes" ] || [ "$ENABLE_UBSAN" = "yes" ] || [ "$ENABLE_TSAN" = "yes" ]; then
     print_info "Checking sanitizer support..."
 
     if [ "$ENABLE_ASAN" = "yes" ]; then
@@ -343,6 +355,19 @@ EOF
         else
             print_warning "AddressSanitizer not supported by this compiler"
             ENABLE_ASAN="no"
+        fi
+        rm -f conftest.cpp conftest conftest.o
+    fi
+
+    if [ "$ENABLE_LSAN" = "yes" ]; then
+        cat > conftest.cpp << 'EOF'
+int main() { return 0; }
+EOF
+        if $DETECTED_CXX -std=c++20 -fsanitize=leak conftest.cpp -o conftest 2>/dev/null; then
+            print_success "LeakSanitizer: yes"
+        else
+            print_warning "LeakSanitizer not supported by this compiler"
+            ENABLE_LSAN="no"
         fi
         rm -f conftest.cpp conftest conftest.o
     fi
@@ -376,6 +401,7 @@ echo "  Google Test:          $DETECTED_GTEST"
 fi
 echo "  Build demo:           $ENABLE_DEMO"
 echo "  AddressSanitizer:     $ENABLE_ASAN"
+echo "  LeakSanitizer:        $ENABLE_LSAN"
 echo "  UBSanitizer:          $ENABLE_UBSAN"
 echo "  ThreadSanitizer:      $ENABLE_TSAN"
 echo "  Code coverage:        $ENABLE_COVERAGE"
@@ -405,6 +431,7 @@ GTEST_DIR := $DETECTED_GTEST
 
 # Sanitizers
 ENABLE_ASAN := $ENABLE_ASAN
+ENABLE_LSAN := $ENABLE_LSAN
 ENABLE_UBSAN := $ENABLE_UBSAN
 ENABLE_TSAN := $ENABLE_TSAN
 ENABLE_COVERAGE := $ENABLE_COVERAGE
