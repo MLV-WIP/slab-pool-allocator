@@ -15,7 +15,7 @@ jobs:
         sanitizer-config:
           - name: memsan
             enable-flags: "--enable-asan --enable-lsan --enable-ubsan"
-            build-type: "memsan"
+            build-type: "addrsan"
           - name: threadsan
             enable-flags: "--enable-tsan"
             build-type: "threadsan"
