@@ -22,13 +22,10 @@ jobs:
 
   build-with-gcc:
     runs-on: ubuntu-latest
+    container: ghcr.io/mlv-wip/gcc-builder:latest
 
     steps:
     - uses: actions/checkout@v4
-    - name: Install compiler
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y gcc-15
     - name: configure
       run: ./configure
     - name: make
