@@ -32,6 +32,7 @@ VERBOSE="no"
 DETECTED_CXX=""
 DETECTED_GTEST=""
 HAS_CXX20="no"
+HAS_CXX23="no"
 HAS_FORMAT="no"
 HAS_RANGES="no"
 HAS_ATOMIC_WAIT="no"
@@ -240,6 +241,25 @@ else
 fi
 rm -f conftest.cpp conftest conftest.o
 
+# Check for C++23 support
+print_info "Checking for C++23 support..."
+cat > conftest.cpp << 'EOF'
+#include <version>
+#if __cplusplus < 202302L
+#error "C++23 not supported"
+#endif
+int main() { return 0; }
+EOF
+
+if $DETECTED_CXX -std=c++23 conftest.cpp -o conftest 2>/dev/null; then
+    HAS_CXX23="yes"
+    print_success "C++23 support: yes"
+else
+    HAS_CXX23="no"
+    print_warning "C++23 support: no"
+fi
+rm -f conftest.cpp conftest conftest.o
+
 # Check for std::format
 print_info "Checking for std::format..."
 cat > conftest.cpp << 'EOF'
@@ -392,6 +412,7 @@ echo "  Prefix:               $PREFIX"
 echo "  Build type:           $BUILD_TYPE"
 echo "  C++ Compiler:         $DETECTED_CXX"
 echo "  C++20 support:        $HAS_CXX20"
+echo "  C++23 support:        $HAS_CXX23"
 echo "  std::format:          $HAS_FORMAT"
 echo "  std::ranges:          $HAS_RANGES"
 echo "  atomic wait/notify:   $HAS_ATOMIC_WAIT"
@@ -440,6 +461,7 @@ ENABLE_COVERAGE := $ENABLE_COVERAGE
 USER_CXXFLAGS := $CXXFLAGS
 
 # Feature detection
+HAS_CXX23 := $HAS_CXX23
 HAS_FORMAT := $HAS_FORMAT
 EOF
 
