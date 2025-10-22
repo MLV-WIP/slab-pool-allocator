@@ -41,7 +41,7 @@ INCLUDEDIR := ./spallocator
 DOCDIR := ./spallocator/docs
 
 # Compiler flags
-CXXSTD := -std=c++20
+CXXSTD := -std=c++23
 INCLUDES := -I$(INCLUDEDIR)
 WARNINGS := -Wall -Wextra -Wpedantic
 
@@ -145,7 +145,6 @@ all: check-config $(TARGETS)
 	else \
 		echo "Nothing to build (tests and demo disabled)"; \
 	fi
-	$(CXX) --version
 
 # Check if configuration looks reasonable
 check-config:
