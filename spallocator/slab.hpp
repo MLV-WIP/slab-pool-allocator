@@ -209,8 +209,8 @@ namespace spallocator
             {
                 // need to allocate a new slab
                 allocateNewSlab();
-                //println("New slab<{}> allocated, total slabs: {}/{}",
-                //        ElemSize, slab_data.size(), slab_map.size());
+                debug_println("New slab<{}> allocated, total slabs: {}/{}",
+                              ElemSize, slab_data.size(), slab_map.size());
             }
 
             auto& slab_slots = slab_map[slab_index];
@@ -225,8 +225,8 @@ namespace spallocator
                         // this slab is now full
                         slab_available_map.reset(slab_index);
                     }
-                    //println("Item allocated ({}/{}), slab_map<{}>: {}",
-                    //        slab_index, item_index, ElemSize, printHex(slab_slots));
+                    debug_println("Item allocated ({}/{}), slab_map<{}>: {}",
+                                  slab_index, item_index, ElemSize, printHex(slab_slots));
                     return slab_data[slab_index] + item_index * ElemSize;
                 }
             }
@@ -253,10 +253,11 @@ namespace spallocator
             {
                 // given the pointer base ranges, it should be here, but it turns
                 // out not to be within the begin-end range
-                println("Item {} cannot be found in slab range {} - {}",
-                        static_cast<void*>(item),
-                        static_cast<void*>(slab_start),
-                        static_cast<void*>(slab_end));
+                runtime_assert(item >= slab_start && item < slab_end,
+                    std::format("Item {} cannot be found in slab range {} - {}",
+                                static_cast<void*>(item),
+                                static_cast<void*>(slab_start),
+                                static_cast<void*>(slab_end)));
             }
         }
         return std::nullopt;
@@ -294,8 +295,8 @@ namespace spallocator
                 slab_slots.reset(item_index);
                 // This slab now has free space
                 slab_available_map.set(slab_index);
-                //println("Item freed ({}/{}), slab_map: {}",
-                //        slab_index, item_index, printHex(slab_slots));
+                debug_println("Item freed ({}/{}), slab_map: {}",
+                              slab_index, item_index, printHex(slab_slots));
                 return;
             }
             else
@@ -311,8 +312,8 @@ namespace spallocator
     template<const std::size_t ElemSize>
     Slab<ElemSize>::Slab()
     {
-        //println("Slab created with element size: {}, allocation size: {}, and multiplier: {}",
-        //        getElemSize(), getAllocSize(), alloc_multiplier);
+        debug_println("Slab created with element size: {}, allocation size: {}, and multiplier: {}",
+                      getElemSize(), getAllocSize(), alloc_multiplier);
 
         // all slabs are initially available
         slab_available_map.set();
@@ -323,7 +324,7 @@ namespace spallocator
     template<const std::size_t ElemSize>
     Slab<ElemSize>::~Slab()
     {
-        //println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
+        debug_println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
         for (auto ptr : slab_data)
         {
             // C++23 is improved to handle aligned deallocation automatically.
@@ -371,8 +372,8 @@ namespace spallocator
 
         // allocate memory using standard methods
         std::byte* item = new(std::align_val_t{16}) std::byte[elem_size];
-        //println("Allocated {} bytes via SlabProxy, ptr={}",
-        //        elem_size, static_cast<void*>(item));
+        debug_println("Allocated {} bytes via SlabProxy, ptr={}",
+                      elem_size, static_cast<void*>(item));
         return item;
     }
 
@@ -380,7 +381,7 @@ namespace spallocator
     inline void SlabProxy::deallocateItem(std::byte* item)
     {
         // deallocate memory using standard methods
-        //println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));
+        debug_println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));
 
         // C++23 is improved to handle aligned deallocation automatically.
         // For earlier standards, we need to explicitly pass the alignment

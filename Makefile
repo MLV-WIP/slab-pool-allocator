@@ -9,6 +9,7 @@
 # Default values (used if config.mk doesn't exist)
 PREFIX ?= /usr/local
 CXX ?= c++
+IS_CLANG ?= no
 BUILD_TYPE ?= addrsan
 ENABLE_TESTS ?= yes
 ENABLE_DEMO ?= yes
@@ -56,6 +57,7 @@ endif
 # Base flags
 CXXFLAGS := $(CXXSTD) $(INCLUDES) $(WARNINGS) -MMD -MP $(USER_CXXFLAGS)
 LDFLAGS := $(LDLIBS)
+
 
 # Build-type specific flags
 ifeq ($(BUILD_TYPE),debug)

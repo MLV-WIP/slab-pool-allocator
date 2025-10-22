@@ -32,6 +32,7 @@ VERBOSE="no"
 # Detected values
 DETECTED_CXX=""
 DETECTED_GTEST=""
+IS_CLANG="no"
 HAS_CXX20="no"
 HAS_CXX23="no"
 HAS_FORMAT="no"
@@ -239,6 +240,11 @@ fi
 CXX_VERSION=$($DETECTED_CXX --version | head -n1)
 print_info "Compiler version: $CXX_VERSION"
 
+# Check if compiler is clang
+if $DETECTED_CXX --version | grep -q "clang"; then
+    IS_CLANG="yes"
+fi
+
 # Check for C++20 support
 print_info "Checking for C++20 support..."
 cat > conftest.cpp << 'EOF'
@@ -249,7 +255,10 @@ cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
 
-if $DETECTED_CXX -std=c++20 conftest.cpp -o conftest 2>/dev/null; then
+# Build compiler flags for testing
+TEST_CXXFLAGS="-std=c++20"
+
+if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
     HAS_CXX20="yes"
     print_success "C++20 support: yes"
 else
@@ -271,7 +280,10 @@ cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
 
-if $DETECTED_CXX -std=c++23 conftest.cpp -o conftest 2>/dev/null; then
+# Build compiler flags for testing
+TEST_CXXFLAGS="-std=c++23"
+
+if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
     HAS_CXX23="yes"
     print_success "C++23 support: yes"
 else
@@ -290,7 +302,10 @@ int main() {
 }
 EOF
 
-if $DETECTED_CXX -std=c++20 conftest.cpp -o conftest 2>/dev/null; then
+# Build compiler flags for testing
+TEST_CXXFLAGS="-std=c++20"
+
+if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
     HAS_FORMAT="yes"
     print_success "std::format: yes"
 else
@@ -311,7 +326,10 @@ int main() {
 }
 EOF
 
-if $DETECTED_CXX -std=c++20 conftest.cpp -o conftest 2>/dev/null; then
+# Build compiler flags for testing
+TEST_CXXFLAGS="-std=c++20"
+
+if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
     HAS_RANGES="yes"
     print_success "std::ranges: yes"
 else
@@ -337,7 +355,10 @@ int main() {
 }
 EOF
 
-if $DETECTED_CXX -std=c++20 conftest.cpp -o conftest 2>/dev/null; then
+# Build compiler flags for testing
+TEST_CXXFLAGS="-std=c++20"
+
+if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
     HAS_ATOMIC_WAIT="yes"
     print_success "atomic_flag::wait: yes"
 else
@@ -390,7 +411,8 @@ if [ "$ENABLE_ASAN" = "yes" ] || [ "$ENABLE_LSAN" = "yes" ] || [ "$ENABLE_UBSAN"
         cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
-        if $DETECTED_CXX -std=c++20 -fsanitize=address conftest.cpp -o conftest 2>/dev/null; then
+        TEST_CXXFLAGS="-std=c++20 -fsanitize=address"
+        if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
             print_success "AddressSanitizer: yes"
         else
             print_warning "AddressSanitizer not supported by this compiler"
@@ -403,7 +425,8 @@ EOF
         cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
-        if $DETECTED_CXX -std=c++20 -fsanitize=leak conftest.cpp -o conftest 2>/dev/null; then
+        TEST_CXXFLAGS="-std=c++20 -fsanitize=leak"
+        if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
             print_success "LeakSanitizer: yes"
         else
             print_warning "LeakSanitizer not supported by this compiler"
@@ -416,7 +439,8 @@ EOF
         cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
-        if $DETECTED_CXX -std=c++20 -fsanitize=memory conftest.cpp -o conftest 2>/dev/null; then
+        TEST_CXXFLAGS="-std=c++20 -fsanitize=memory"
+        if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
             print_success "MemorySanitizer: yes"
         else
             print_warning "MemorySanitizer not supported by this compiler"
@@ -429,7 +453,8 @@ EOF
         cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
-        if $DETECTED_CXX -std=c++20 -fsanitize=thread conftest.cpp -o conftest 2>/dev/null; then
+        TEST_CXXFLAGS="-std=c++20 -fsanitize=thread"
+        if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
             print_success "ThreadSanitizer: yes"
         else
             print_warning "ThreadSanitizer not supported by this compiler"
@@ -474,6 +499,7 @@ PREFIX := $PREFIX
 
 # Compiler
 CXX := $DETECTED_CXX
+IS_CLANG := $IS_CLANG
 
 # Build configuration
 BUILD_TYPE := $BUILD_TYPE
