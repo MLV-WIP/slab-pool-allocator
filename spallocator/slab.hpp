@@ -324,8 +324,18 @@ namespace spallocator
     Slab<ElemSize>::~Slab()
     {
         //println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
-        for (auto ptr : slab_data) {
-            delete[] ptr;
+        for (auto ptr : slab_data)
+        {
+            // C++23 is improved to handle aligned deallocation automatically.
+            // For earlier standards, we need to explicitly pass the alignment
+            // to the delete operator. Unfortunately, this is incomplete in
+            // gcc-14's implementation of the address sanitizer in spite of
+            // otherwise decent C++23 support, so we need to use the older C++17
+            // style deallocation here for portability
+            ::operator delete[](ptr, std::align_val_t{16});  // Explicitly pass alignment
+
+            // Preferred C++23 form that we are avoiding for now due to above issues:
+            //delete[] ptr;
         }
     }
 
