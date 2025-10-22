@@ -9,11 +9,18 @@ on:
 jobs:
   build:
 
-    # runs-on: ubuntu-latest
-    runs-on: gcc:latest
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        compiler: [gcc-15, clang-20]
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install compiler
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ${{ matrix.compiler }}
     - name: configure
       run: ./configure
     - name: make
