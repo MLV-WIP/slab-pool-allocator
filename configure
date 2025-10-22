@@ -23,6 +23,7 @@ ENABLE_DEMO="yes"
 GTEST_DIR=""
 ENABLE_ASAN="auto"
 ENABLE_LSAN="auto"
+ENABLE_MSAN="auto"
 ENABLE_UBSAN="auto"
 ENABLE_TSAN="no"
 ENABLE_COVERAGE="no"
@@ -71,6 +72,8 @@ Optional Features:
   --disable-asan          disable AddressSanitizer
   --enable-lsan           enable LeakSanitizer [default: auto]
   --disable-lsan          disable LeakSanitizer
+  --enable-msan           enable MemorySanitizer [default: auto]
+  --disable-msan          disable MemorySanitizer
   --enable-ubsan          enable UndefinedBehaviorSanitizer [default: auto]
   --disable-ubsan         disable UndefinedBehaviorSanitizer
   --enable-tsan           enable ThreadSanitizer [default: no]
@@ -128,6 +131,12 @@ for arg in "$@"; do
         --disable-lsan)
             ENABLE_LSAN="no"
             ;;
+        --enable-msan)
+            ENABLE_MSAN="yes"
+            ;;
+        --disable-msan)
+            ENABLE_MSAN="no"
+            ;;
         --enable-ubsan)
             ENABLE_UBSAN="yes"
             ;;
@@ -162,29 +171,40 @@ done
 
 # Validate build type
 case $BUILD_TYPE in
-    debug|release|memsan|threadsan)
+    debug|release|addrsan|memsan|threadsan)
         ;;
     *)
         print_error "Invalid build type: $BUILD_TYPE"
-        print_error "Valid types: debug, release, memsan, threadsan"
+        print_error "Valid types: debug, release, addrsan, memsan, threadsan"
         exit 1
         ;;
 esac
 
 # Auto-detect sanitizers for build type
-if [ "$BUILD_TYPE" = "memsan" ]; then
-    [ "$ENABLE_ASAN" = "auto" ] && ENABLE_ASAN="yes"
+if [ "$BUILD_TYPE" = "addrsan" ]; then
+    ENABLE_ASAN="yes"
     [ "$ENABLE_LSAN" = "auto" ] && ENABLE_LSAN="yes"
     [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="yes"
+    ENABLE_MSAN="no"
+    ENABLE_TSAN="no"
+elif [ "$BUILD_TYPE" = "memsan" ]; then
+    ENABLE_MSAN="yes"
+    [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="yes"
+    ENABLE_ASAN="no"
+    ENABLE_LSAN="no"
+    ENABLE_TSAN="no"
 elif [ "$BUILD_TYPE" = "threadsan" ]; then
     ENABLE_TSAN="yes"
     ENABLE_ASAN="no"  # Can't use ASan and TSan together
     ENABLE_LSAN="no"  # Can't use LSan and TSan together
-    [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="no"
+    ENABLE_MSAN="no"
+    [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="yes"
 else
     [ "$ENABLE_ASAN" = "auto" ] && ENABLE_ASAN="no"
     [ "$ENABLE_LSAN" = "auto" ] && ENABLE_LSAN="no"
     [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="no"
+    [ "$ENABLE_MSAN" = "auto" ] && ENABLE_MSAN="no"
+    [ "$ENABLE_TSAN" = "auto" ] && ENABLE_TSAN="no"
 fi
 
 print_info "Configuring Slab Pool Allocator..."
@@ -392,6 +412,19 @@ EOF
         rm -f conftest.cpp conftest conftest.o
     fi
 
+    if [ "$ENABLE_MSAN" = "yes" ]; then
+        cat > conftest.cpp << 'EOF'
+int main() { return 0; }
+EOF
+        if $DETECTED_CXX -std=c++20 -fsanitize=memory conftest.cpp -o conftest 2>/dev/null; then
+            print_success "MemorySanitizer: yes"
+        else
+            print_warning "MemorySanitizer not supported by this compiler"
+            ENABLE_MSAN="no"
+        fi
+        rm -f conftest.cpp conftest conftest.o
+    fi
+
     if [ "$ENABLE_TSAN" = "yes" ]; then
         cat > conftest.cpp << 'EOF'
 int main() { return 0; }
@@ -423,6 +456,7 @@ fi
 echo "  Build demo:           $ENABLE_DEMO"
 echo "  AddressSanitizer:     $ENABLE_ASAN"
 echo "  LeakSanitizer:        $ENABLE_LSAN"
+echo "  MemorySanitizer:      $ENABLE_MSAN"
 echo "  UBSanitizer:          $ENABLE_UBSAN"
 echo "  ThreadSanitizer:      $ENABLE_TSAN"
 echo "  Code coverage:        $ENABLE_COVERAGE"
@@ -453,6 +487,7 @@ GTEST_DIR := $DETECTED_GTEST
 # Sanitizers
 ENABLE_ASAN := $ENABLE_ASAN
 ENABLE_LSAN := $ENABLE_LSAN
+ENABLE_MSAN := $ENABLE_MSAN
 ENABLE_UBSAN := $ENABLE_UBSAN
 ENABLE_TSAN := $ENABLE_TSAN
 ENABLE_COVERAGE := $ENABLE_COVERAGE

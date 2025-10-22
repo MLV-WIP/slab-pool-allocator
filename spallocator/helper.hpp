@@ -40,6 +40,13 @@
 #include <source_location>
 
 
+#ifndef NDEBUG
+    constexpr bool DEBUG_BUILD = true;
+#else
+    constexpr bool DEBUG_BUILD = false;
+#endif
+
+
 // User-defined literals for binary prefixes (powers of 1024)
 constexpr std::size_t operator""_KB(unsigned long long value) {
     return value * 1024;
@@ -58,29 +65,55 @@ constexpr std::size_t operator""_GB(unsigned long long value) {
 // Adapted from GitHub Jhuighuy /TitSolver/source/tit/core/io_utils.hpp under MIT license
 // --- start Jhuighuy ---
 template<typename... Args>
-void print(std::format_string<Args...> fmt, Args&&... args)
+inline void print(std::format_string<Args...> fmt, Args&&... args)
 {
     std::cout << std::format(fmt, std::forward<Args>(args)...);
 }
 
 template<typename... Args>
-void println(std::format_string<Args...> fmt, Args&&... args)
+inline void println(std::format_string<Args...> fmt, Args&&... args)
 {
     std::cout << std::format(fmt, std::forward<Args>(args)...) << '\n';
 }
 // --- end Jhuighuy ---
+
+// Debug-only print statements (no-op in release builds)
+// Note: this is a modern C++ paradigm for conditional compilation. Because
+// the if constexpr is evaluated at compile time, the code inside the if
+// block is only included in the binary if DEBUG_BUILD is true, much like
+// traditional preprocessor macros, but with the advantage of type safety
+// and readability, being actual C++ code rather than text substitutions.
+template<typename... Args>
+inline void debug_print(std::format_string<Args...> fmt, Args&&... args)
+{
+    if constexpr (DEBUG_BUILD) {
+        print(fmt, std::forward<Args>(args)...);
+    }
+}
+
+template<typename... Args>
+inline void debug_println(std::format_string<Args...> fmt, Args&&... args)
+{
+    if constexpr (DEBUG_BUILD) {
+        println(fmt, std::forward<Args>(args)...);
+    }
+}
+
 
 
 inline void runtime_assert(bool condition,
                            const char* message,
                            const std::source_location& loc = std::source_location::current())
 {
-    if (!condition)
+    if constexpr (DEBUG_BUILD)
     {
-        std::cerr << std::format(
-            "Runtime assertion failed: {}\n  File: {}:{}\n  Function: {}\n",
-            message, loc.file_name(), loc.line(), loc.function_name());
-        std::abort();
+        if (!condition)
+        {
+            std::cerr << std::format(
+                "Runtime assertion failed: {}\n  File: {}:{}\n  Function: {}\n",
+                message, loc.file_name(), loc.line(), loc.function_name());
+            std::abort();
+        }
     }
 }
 

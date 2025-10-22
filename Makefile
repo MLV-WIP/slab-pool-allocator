@@ -9,11 +9,13 @@
 # Default values (used if config.mk doesn't exist)
 PREFIX ?= /usr/local
 CXX ?= c++
-BUILD_TYPE ?= memsan
+BUILD_TYPE ?= addrsan
 ENABLE_TESTS ?= yes
 ENABLE_DEMO ?= yes
 VERBOSE ?= no
 ENABLE_ASAN ?= auto
+ENABLE_LSAN ?= auto
+ENABLE_MSAN ?= auto
 ENABLE_UBSAN ?= auto
 ENABLE_TSAN ?= no
 ENABLE_COVERAGE ?= no
@@ -64,10 +66,10 @@ else ifeq ($(BUILD_TYPE),release)
     CXXFLAGS += -DNDEBUG -O3
     LDFLAGS += -O3
     OBJDIRNAME := release
-else ifeq ($(BUILD_TYPE),memsan)
+else ifeq ($(BUILD_TYPE),addrsan)
     CXXFLAGS += -DDEBUG -O0 -g -fno-omit-frame-pointer
     LDFLAGS += -g
-    OBJDIRNAME := memsan
+    OBJDIRNAME := addrsan
     # AddressSanitizer
     ifeq ($(ENABLE_ASAN),yes)
         CXXFLAGS += -fsanitize=address
@@ -75,6 +77,30 @@ else ifeq ($(BUILD_TYPE),memsan)
     else ifeq ($(ENABLE_ASAN),auto)
         CXXFLAGS += -fsanitize=address
         LDFLAGS += -fsanitize=address
+    endif
+    # LeakSanitizer
+	ifeq ($(ENABLE_LSAN),yes)
+		CXXFLAGS += -fsanitize=leak
+		LDFLAGS += -fsanitize=leak
+	else ifeq ($(ENABLE_LSAN),auto)
+		CXXFLAGS += -fsanitize=leak
+		LDFLAGS += -fsanitize=leak
+    endif
+    # UndefinedBehaviorSanitizer
+    ifeq ($(ENABLE_UBSAN),yes)
+        CXXFLAGS += -fsanitize=undefined
+        LDFLAGS += -fsanitize=undefined
+    else ifeq ($(ENABLE_UBSAN),auto)
+        CXXFLAGS += -fsanitize=undefined
+        LDFLAGS += -fsanitize=undefined
+    endif
+else ifeq ($(BUILD_TYPE),memsan)
+    CXXFLAGS += -DDEBUG -O0 -g -fno-omit-frame-pointer
+    LDFLAGS += -g
+    OBJDIRNAME := memsan
+    ifeq ($(ENABLE_MSAN),yes)
+        CXXFLAGS += -fsanitize=memory
+        LDFLAGS += -fsanitize=memory
     endif
     # UndefinedBehaviorSanitizer
     ifeq ($(ENABLE_UBSAN),yes)
@@ -91,6 +117,14 @@ else ifeq ($(BUILD_TYPE),threadsan)
     ifeq ($(ENABLE_TSAN),yes)
         CXXFLAGS += -fsanitize=thread
         LDFLAGS += -fsanitize=thread
+    endif
+    # UndefinedBehaviorSanitizer
+    ifeq ($(ENABLE_UBSAN),yes)
+        CXXFLAGS += -fsanitize=undefined
+        LDFLAGS += -fsanitize=undefined
+    else ifeq ($(ENABLE_UBSAN),auto)
+        CXXFLAGS += -fsanitize=undefined
+        LDFLAGS += -fsanitize=undefined
     endif
 endif
 
@@ -243,8 +277,9 @@ help:
 	@echo "Build type selection (without configure):"
 	@echo "  make BUILD_TYPE=debug"
 	@echo "  make BUILD_TYPE=release"
-	@echo "  make BUILD_TYPE=memsan     # AddressSanitizer + UBSan (default)"
-	@echo "  make BUILD_TYPE=threadsan  # ThreadSanitizer"
+	@echo "  make BUILD_TYPE=addrsan    # AddressSanitizer + LSan + UBSan (default), implies debug"
+	@echo "  make BUILD_TYPE=memsan     # MemorySanitizer + UBSan, implies debug"
+	@echo "  make BUILD_TYPE=threadsan  # ThreadSanitizer + UBSan, implies debug"
 	@echo ""
 	@echo "Current configuration:"
 	@echo "  Build type:    $(BUILD_TYPE)"
