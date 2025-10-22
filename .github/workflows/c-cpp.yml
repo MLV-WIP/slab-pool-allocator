@@ -7,20 +7,28 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
-
+  build-with-clang:
     runs-on: ubuntu-latest
+    container: ghcr.io/mlv-wip/clang-builder:latest
 
-    strategy:
-      matrix:
-        compiler: [gcc-15, clang-20]
+    steps:
+    - uses: actions/checkout@v4
+    - name: configure
+      run: ./configure
+    - name: make
+      run: make
+    - name: make test
+      run: make test
+
+  build-with-gcc:
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
     - name: Install compiler
       run: |
         sudo apt-get update
-        sudo apt-get install -y ${{ matrix.compiler }}
+        sudo apt-get install -y gcc-15
     - name: configure
       run: ./configure
     - name: make
