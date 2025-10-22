@@ -115,8 +115,7 @@ namespace spallocator
             {
                 slab = &large_slab;
             }
-            debug_println("Allocated {} bytes at ptr={}, slab={}",
-                          alloc_size, static_cast<void*>(alloc.ptr),
+            debug_println("Allocated {} bytes, slab={}", alloc_size,
                           (slab == &large_slab) ? "large_slab" : std::format("small_slab {}", slab_index));
         }
         alloc.ptr = slab->allocateItem(alloc_size);

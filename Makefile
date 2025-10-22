@@ -140,6 +140,7 @@ endif
 ifeq ($(VERBOSE),yes)
     Q :=
     ECHO := @true
+	CXXFLAGS += -DVDEBUG
 else
     Q := @
     ECHO := @echo

@@ -47,7 +47,7 @@
     constexpr bool DEBUG_BUILD = false;
 #endif
 
-#ifdef VERBOSE_DEBUG
+#ifdef VDEBUG
     constexpr bool VERBOSE_DEBUG = DEBUG_BUILD;
 #else
     constexpr bool VERBOSE_DEBUG = false;
