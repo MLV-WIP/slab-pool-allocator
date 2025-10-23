@@ -8,12 +8,13 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm64' || 'ubuntu-latest' }}
     strategy:
       matrix:
+        arch: [amd64, arm64]
         compiler: [clang, gcc]
         sanitizer-config:
-          - name: memsan
+          - name: addrsan
             enable-flags: "--enable-asan --enable-lsan --enable-ubsan"
             build-type: "addrsan"
           - name: threadsan
