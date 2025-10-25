@@ -887,6 +887,273 @@ TEST(LifetimeObserverTest, SimpleObjectOwnership)
     }
 }
 
+/*
+TEST(LifetimeObserverTest, MoveSemantics)
+{
+    class TestObject: public LifetimeObserver<TestObject>
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+    };
+
+    {
+        TestObject obj1;
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 0);
+
+        LifetimeObserver<TestObject> obj2 = std::move(obj1);
+        EXPECT_FALSE(obj1.isAlive());
+        EXPECT_TRUE(obj2.isAlive());
+
+        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::observer) == 0);
+    }
+}
+*/
+
+TEST(LifetimeObserverTest, CopySemantics)
+{
+    class TestObject: public LifetimeObserver<TestObject>
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+    };
+
+    {
+        TestObject obj1;
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 0);
+
+        LifetimeObserver<TestObject> obj2 = obj1; // copy
+        EXPECT_TRUE(obj1.isAlive());
+        EXPECT_TRUE(obj2.isAlive());
+
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::observer) == 1);
+    }
+}
+
+
+TEST(LifetimeObserverTest, AssignmentOperator)
+{
+    class TestObject: public LifetimeObserver<TestObject>
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+    };
+
+    {
+        TestObject obj1;
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 0);
+
+        LifetimeObserver<TestObject> obj2;
+        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::observer) == 0);
+
+        obj2 = obj1; // assignment
+        EXPECT_TRUE(obj1.isAlive());
+        EXPECT_TRUE(obj2.isAlive());
+
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::observer) == 1);
+    }
+}
+
+/*
+TEST(LifetimeObserverTest, SelfAssignment)
+{
+    class TestObject: public LifetimeObserver<TestObject>
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+    };
+
+    {
+        TestObject obj1;
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 0);
+
+        obj1 = obj1; // self-assignment
+        EXPECT_TRUE(obj1.isAlive());
+    }
+}
+*/
+
+TEST(LifetimeObserverTest, TestSimpleCallback)
+{
+    class TestObject: public LifetimeObserver<TestObject>
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+    };
+
+    struct TestObjHolder
+    {
+        TestObjHolder(TestObject* p): obj(p), obj_lifetime(*p) { }
+        TestObjHolder() = delete;
+        ~TestObjHolder() = default;
+
+        bool testAlive(bool assumeAlive)
+        {
+            bool objIsAlive = false;
+
+            // We're holding a weak reference to the object via obj_lifetime.
+            // Check if the object is still alive before using it.
+            if (obj_lifetime.isAlive())
+            {
+                // Object is still alive and valid. We can safely use it.
+                objIsAlive = obj->isAlive();
+            }
+
+            EXPECT_EQ(objIsAlive, assumeAlive);
+            return objIsAlive;
+        }
+
+    private:
+        TestObject* obj;
+        LifetimeObserver<TestObject> obj_lifetime;
+    };
+
+    {
+        TestObject* obj = new TestObject();
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+
+        TestObjHolder holder(obj);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
+
+        EXPECT_TRUE(holder.testAlive(true));
+
+        {
+            LifetimeObserver<TestObject> observer = *obj; // weak reference
+            EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
+            EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 2);
+            EXPECT_TRUE(observer.isAlive());
+            EXPECT_TRUE(holder.testAlive(true));
+        }
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
+
+        EXPECT_TRUE(holder.testAlive(true));
+
+        delete obj;
+
+        // Emulate a callback on an interface that is holding a weak reference
+        // to our object after the object has been deleted.
+        EXPECT_FALSE(holder.testAlive(false));
+    }
+}
+
+
+TEST(LifetimeObserverTest, TestDeferredCallback)
+{
+    class TestObject: public LifetimeObserver<TestObject>
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+
+        int incValue() { return ++i; }
+
+    private:
+        int i = 0;
+    };
+
+    class EventEngine
+    {
+    public:
+        EventEngine() = default;
+        ~EventEngine() = default;
+
+        int event()
+        {
+            if (callback)
+                return callback();
+            return -2;
+        }
+
+        void registerCallback(std::function<int()> cb)
+        {
+            callback = cb;
+        }
+
+    private:
+        std::function<int()> callback;
+    };
+
+    {
+        TestObject* obj = new TestObject();
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+
+        // Create some long-running event engine
+        EventEngine engine;
+
+        // Register a callback that uses a weak reference to the object
+        engine.registerCallback([&obj, alive = LifetimeObserver<TestObject>(*obj)]() {
+            if (alive)
+                return obj->incValue();
+            return -1;
+        });
+
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
+
+        // Invoke the event callback at some future point in time, while the object is alive
+        int result = engine.event();
+        EXPECT_EQ(result, 1);
+        result = engine.event();
+        EXPECT_EQ(result, 2);
+
+        delete obj;
+
+        // Invoke the event callback after the object has been deleted
+        result = engine.event();
+        EXPECT_EQ(result, -1);
+    }
+}
+
+
+TEST(LifetimeObserverTest, TestCallbackWithMultipleObservers)
+{
+    class TestObject: public LifetimeObserver<TestObject>
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+    };
+    {
+        TestObject* obj = new TestObject();
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+
+        LifetimeObserver<TestObject> observer1 = *obj; // weak reference
+        LifetimeObserver<TestObject> observer2 = *obj; // weak reference
+
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 2);
+
+        EXPECT_TRUE(observer1.isAlive());
+        EXPECT_TRUE(observer2.isAlive());
+
+        delete obj;
+
+        EXPECT_FALSE(observer1.isAlive());
+        EXPECT_FALSE(observer2.isAlive());
+    }
+}
+
 
 void pre_test()
 {

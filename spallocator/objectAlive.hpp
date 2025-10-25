@@ -53,7 +53,7 @@ namespace spallocator
         ~LifetimeObserver();
 
     private:
-        e_refType my_ref = e_refType::owner;
+        e_refType my_ownership = e_refType::owner;
     };
 
 
@@ -114,16 +114,16 @@ namespace spallocator
     template<typename T>
     inline LifetimeObserver<T>::LifetimeObserver(e_refType ref_type /* = e_refType::owner */):
         control_block(new ControlBlock(ref_type)),
-        my_ref(ref_type)
+        my_ownership(ref_type)
     {
     }
 
     template<typename T>
     inline LifetimeObserver<T>::LifetimeObserver(const LifetimeObserver& other):
         control_block(other.control_block),
-        my_ref(e_refType::observer)
+        my_ownership(e_refType::observer)
     {
-        control_block->addRef(my_ref);
+        control_block->addRef(my_ownership);
     }
 
     template<typename T>
@@ -133,8 +133,8 @@ namespace spallocator
         {
             delete control_block;
             control_block = other.control_block;
-            my_ref = e_refType::observer;
-            control_block->addRef(my_ref);
+            my_ownership = e_refType::observer;
+            control_block->addRef(my_ownership);
         }
         return *this;
     }
@@ -142,10 +142,10 @@ namespace spallocator
     template<typename T>
     inline LifetimeObserver<T>::LifetimeObserver(LifetimeObserver&& other) noexcept:
         control_block(other.control_block),
-        my_ref(other.my_ref)
+        my_ownership(other.my_ownership)
     {
-        other.my_ref = e_refType::owner;
-        other.control_block = new ControlBlock(other.my_ref);
+        other.my_ownership = e_refType::owner;
+        other.control_block = new ControlBlock(other.my_ownership);
     }
 
     template<typename T>
@@ -153,11 +153,11 @@ namespace spallocator
     {
         if (this != &other)
         {
-            my_ref = other.my_ref;
+            my_ownership = other.my_ownership;
             delete control_block;
             control_block = other.control_block;
-            other.my_ref = e_refType::owner;
-            other.control_block = new ControlBlock(other.my_ref);
+            other.my_ownership = e_refType::owner;
+            other.control_block = new ControlBlock(other.my_ownership);
         }
         return *this;
     }
@@ -168,9 +168,9 @@ namespace spallocator
     {
         if (control_block)
         {
-            control_block->releaseRef(my_ref);
+            control_block->releaseRef(my_ownership);
 
-            runtime_assert(control_block->getCount(my_ref) >= 0,
+            runtime_assert(control_block->getCount(my_ownership) >= 0,
                 "Reference count went negative in LifetimeObserver destructor");
 
             if (getCount(e_refType::owner) == 0 &&
