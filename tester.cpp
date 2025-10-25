@@ -37,6 +37,7 @@
 #include "spallocator/spinlock.hpp"
 #include "spallocator/slab.hpp"
 #include "spallocator/pool.hpp"
+#include "spallocator/objectAlive.hpp"
 #include "spallocator/spallocator.hpp"
 
 using namespace spallocator;
@@ -804,6 +805,86 @@ TEST(SpinLockTest, ManyThreads)
     }
 
     EXPECT_EQ(counter, num_threads * increments_per_thread);
+}
+
+
+TEST(ObjectAliveTest, ReferenceCounting)
+{
+    // To be implemented
+}
+
+
+TEST(LifetimeObserverTest, SimpleObjectOwnership)
+{
+    class TestObject: public LifetimeObserver<TestObject>
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+    };
+
+    {
+        TestObject obj;
+        EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 0);
+        {
+            LifetimeObserver observer = obj; // weak reference
+            EXPECT_TRUE(observer.isAlive());
+            EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
+            EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 1);
+            EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
+            EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
+        }
+        EXPECT_TRUE(obj.isAlive());
+        EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 0);
+    }
+
+    {
+        LifetimeObserver<TestObject> observer;
+        EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 0);
+
+        {
+            TestObject obj;
+            EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
+            EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 0);
+
+            observer = obj; // weak reference
+            EXPECT_TRUE(obj.isAlive());
+            EXPECT_TRUE(observer.isAlive());
+            EXPECT_TRUE(observer);
+
+            EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
+            EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 1);
+            EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
+            EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
+        }
+        EXPECT_FALSE(observer.isAlive());
+        EXPECT_FALSE(observer);
+        EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 0);
+        EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
+    }
+
+    {
+        TestObject* obj = new TestObject();
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+
+        LifetimeObserver<TestObject> observer = *obj; // weak reference
+        EXPECT_TRUE(obj->isAlive());
+        EXPECT_TRUE(observer.isAlive());
+
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
+
+        delete obj;
+        EXPECT_FALSE(observer.isAlive());
+        EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 0);
+        EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
+    }
 }
 
 
