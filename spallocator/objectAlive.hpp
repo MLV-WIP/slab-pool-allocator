@@ -36,6 +36,8 @@ namespace spallocator
         ControlBlock* control_block = nullptr;
 
     public: // methods
+        LifetimeObserver getObserver() const;
+
         // Check if the object is still alive
         bool isAlive() const;
         operator bool() const { return isAlive(); }
@@ -55,6 +57,14 @@ namespace spallocator
     private:
         e_refType my_ownership = e_refType::owner;
     };
+
+
+    template<typename T>
+    inline LifetimeObserver<T> LifetimeObserver<T>::getObserver() const
+    {
+        // make a weak reference copy and return it
+        return LifetimeObserver<T>(*this);
+    }
 
 
     template<typename T>

@@ -40,6 +40,7 @@
 #include "spallocator/objectAlive.hpp"
 #include "spallocator/spallocator.hpp"
 
+using namespace std::literals;
 using namespace spallocator;
 
 
@@ -1070,6 +1071,8 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
         int i = 0;
     };
 
+    // a simple simulated event engine: registers a callback, and that
+    // callback is invoked when an event happens
     class EventEngine
     {
     public:
@@ -1083,9 +1086,24 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
             return -2;
         }
 
-        void registerCallback(std::function<int()> cb)
+        void registerEventCallback(std::function<int()> cb)
         {
             callback = cb;
+        }
+
+        // loop until an end condition is met, triggering a callback every 10ms
+        void startEventLoop(int endWhen)
+        {
+            int count = 0;
+            while (count >= 0 && count < endWhen)
+            {
+                std::this_thread::sleep_for(10ms);
+
+                if (callback)
+                    count = callback();
+                else
+                    return;
+            }
         }
 
     private:
@@ -1101,7 +1119,7 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
         EventEngine engine;
 
         // Register a callback that uses a weak reference to the object
-        engine.registerCallback([&obj, alive = LifetimeObserver<TestObject>(*obj)]() {
+        engine.registerEventCallback([&obj, alive = obj->getObserver()]() {
             if (alive)
                 return obj->incValue();
             return -1;
@@ -1118,8 +1136,45 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
 
         delete obj;
 
-        // Invoke the event callback after the object has been deleted
+        // Invoke the event callback after the object has been deleted.
+        // Because of the aliveness check, we will never call and object that
+        // has been deleted asynchronously.
         result = engine.event();
+        EXPECT_EQ(result, -1);
+    }
+
+    {
+        TestObject* obj = new TestObject();
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+
+        // Create some long-running event engine
+        EventEngine engine;
+
+        // Register a callback that uses a weak reference to the object
+        engine.registerEventCallback([&obj, alive = obj->getObserver()]() {
+            if (alive)
+                return obj->incValue();
+            return -1;
+        });
+
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
+        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
+
+        engine.startEventLoop(5);
+        EXPECT_EQ(obj->incValue(), 6);
+
+        delete obj;
+
+        // Invoke the event callback after the object has been deleted.
+        // Because of the aliveness check, we will never call and object that
+        // has been deleted asynchronously.
+
+        // nothing should happen and should return with no work done;
+        // no live object to call
+        engine.startEventLoop(10);
+
+        int result = engine.event();
         EXPECT_EQ(result, -1);
     }
 }
