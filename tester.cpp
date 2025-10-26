@@ -817,7 +817,7 @@ TEST(ObjectAliveTest, ReferenceCounting)
 
 TEST(LifetimeObserverTest, SimpleObjectOwnership)
 {
-    class TestObject: public LifetimeObserver<TestObject>
+    class TestObject: public LifetimeObserver
     {
     public:
         TestObject() = default;
@@ -826,72 +826,48 @@ TEST(LifetimeObserverTest, SimpleObjectOwnership)
 
     {
         TestObject obj;
-        EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj.getCount(TestObject::e_refType::observer), 0);
         {
-            LifetimeObserver observer = obj; // weak reference
+            LifetimeObserver observer = obj.getObserver(); // weak reference
             EXPECT_TRUE(observer.isAlive());
-            EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
-            EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 1);
-            EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
-            EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
+            EXPECT_EQ(obj.getCount(TestObject::e_refType::owner), 1);
+            EXPECT_EQ(obj.getCount(TestObject::e_refType::observer), 1);
+            EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
+            EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
         }
         EXPECT_TRUE(obj.isAlive());
-        EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 0);
-    }
-
-    {
-        LifetimeObserver<TestObject> observer;
-        EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 0);
-
-        {
-            TestObject obj;
-            EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
-            EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 0);
-
-            observer = obj; // weak reference
-            EXPECT_TRUE(obj.isAlive());
-            EXPECT_TRUE(observer.isAlive());
-            EXPECT_TRUE(observer);
-
-            EXPECT_TRUE(obj.getCount(TestObject::e_refType::owner) == 1);
-            EXPECT_TRUE(obj.getCount(TestObject::e_refType::observer) == 1);
-            EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
-            EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
-        }
-        EXPECT_FALSE(observer.isAlive());
-        EXPECT_FALSE(observer);
-        EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 0);
-        EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_EQ(obj.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj.getCount(TestObject::e_refType::observer), 0);
     }
 
     {
         TestObject* obj = new TestObject();
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 0);
 
-        LifetimeObserver<TestObject> observer = *obj; // weak reference
+        LifetimeObserver observer = obj->getObserver(); // weak reference
         EXPECT_TRUE(obj->isAlive());
         EXPECT_TRUE(observer.isAlive());
+        EXPECT_TRUE(observer);
 
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
-        EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
 
         delete obj;
         EXPECT_FALSE(observer.isAlive());
-        EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 0);
-        EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_FALSE(observer);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 0);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
     }
 }
 
 /*
 TEST(LifetimeObserverTest, MoveSemantics)
 {
-    class TestObject: public LifetimeObserver<TestObject>
+    class TestObject: public LifetimeObserver
     {
     public:
         TestObject() = default;
@@ -900,22 +876,22 @@ TEST(LifetimeObserverTest, MoveSemantics)
 
     {
         TestObject obj1;
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::observer), 0);
 
-        LifetimeObserver<TestObject> obj2 = std::move(obj1);
+        LifetimeObserver obj2 = std::move(obj1);
         EXPECT_FALSE(obj1.isAlive());
         EXPECT_TRUE(obj2.isAlive());
 
-        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj2.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj2.getCount(TestObject::e_refType::observer), 0);
     }
 }
 */
 
 TEST(LifetimeObserverTest, CopySemantics)
 {
-    class TestObject: public LifetimeObserver<TestObject>
+    class TestObject: public LifetimeObserver
     {
     public:
         TestObject() = default;
@@ -923,25 +899,81 @@ TEST(LifetimeObserverTest, CopySemantics)
     };
 
     {
-        TestObject obj1;
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 0);
+        TestObject* obj1 = new TestObject();
+        EXPECT_TRUE(obj1->isAlive());
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 0);
 
-        LifetimeObserver<TestObject> obj2 = obj1; // copy
-        EXPECT_TRUE(obj1.isAlive());
-        EXPECT_TRUE(obj2.isAlive());
+        TestObject* obj2 = new TestObject();
+        EXPECT_TRUE(obj2->isAlive());
+        EXPECT_EQ(obj2->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj2->getCount(TestObject::e_refType::observer), 0);
 
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 1);
-        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::observer) == 1);
+        LifetimeObserver observer(obj1->getObserver());
+        EXPECT_TRUE(obj1->isAlive());
+        EXPECT_TRUE(observer.isAlive());
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(obj2->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj2->getCount(TestObject::e_refType::observer), 0);
+
+        {
+            LifetimeObserver observer2(obj2->getObserver());
+            EXPECT_TRUE(obj2->isAlive());
+            EXPECT_TRUE(observer2.isAlive());
+            EXPECT_TRUE(observer.isAlive());
+
+            EXPECT_EQ(obj2->getCount(TestObject::e_refType::owner), 1);
+            EXPECT_EQ(obj2->getCount(TestObject::e_refType::observer), 1);
+            EXPECT_EQ(observer2.getCount(TestObject::e_refType::owner), 1);
+            EXPECT_EQ(observer2.getCount(TestObject::e_refType::observer), 1);
+            EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
+            EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 1);
+            EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
+            EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
+        }
+        // observer2 goes out of scope
+
+        EXPECT_TRUE(obj1->isAlive());
+        EXPECT_TRUE(observer.isAlive());
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(obj2->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj2->getCount(TestObject::e_refType::observer), 0);
+
+        // obj2 becomes a fully unique, owned copy of obj1. Unique meaning
+        // they do not share ownership of the same underlying object; they
+        // uniquely own separate objects.
+        *obj2 = *obj1; // copy assignment
+        EXPECT_TRUE(obj1->isAlive());
+        EXPECT_TRUE(obj2->isAlive());
+        EXPECT_TRUE(observer.isAlive());
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 2);
+        EXPECT_EQ(obj2->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj2->getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 2);
+
+        delete obj2;
+        EXPECT_TRUE(obj1->isAlive());
+        EXPECT_TRUE(observer.isAlive());
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
+
+        delete obj1;
+        EXPECT_FALSE(observer.isAlive());
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 0);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
     }
 }
 
 
 TEST(LifetimeObserverTest, AssignmentOperator)
 {
-    class TestObject: public LifetimeObserver<TestObject>
+    class TestObject: public LifetimeObserver
     {
     public:
         TestObject() = default;
@@ -950,28 +982,30 @@ TEST(LifetimeObserverTest, AssignmentOperator)
 
     {
         TestObject obj1;
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::observer), 0);
 
-        LifetimeObserver<TestObject> obj2;
-        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::observer) == 0);
+        TestObject obj2;
+        EXPECT_EQ(obj2.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj2.getCount(TestObject::e_refType::observer), 0);
 
+        // both still alive, but obj2 has discarded its own contents
+        // and created a new unique copy of obj1
         obj2 = obj1; // assignment
         EXPECT_TRUE(obj1.isAlive());
         EXPECT_TRUE(obj2.isAlive());
 
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 1);
-        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj2.getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(obj2.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj2.getCount(TestObject::e_refType::observer), 1);
     }
 }
 
 /*
 TEST(LifetimeObserverTest, SelfAssignment)
 {
-    class TestObject: public LifetimeObserver<TestObject>
+    class TestObject: public LifetimeObserver
     {
     public:
         TestObject() = default;
@@ -980,8 +1014,8 @@ TEST(LifetimeObserverTest, SelfAssignment)
 
     {
         TestObject obj1;
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj1.getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::observer), 0);
 
         obj1 = obj1; // self-assignment
         EXPECT_TRUE(obj1.isAlive());
@@ -991,7 +1025,7 @@ TEST(LifetimeObserverTest, SelfAssignment)
 
 TEST(LifetimeObserverTest, TestSimpleCallback)
 {
-    class TestObject: public LifetimeObserver<TestObject>
+    class TestObject: public LifetimeObserver
     {
     public:
         TestObject() = default;
@@ -1000,7 +1034,7 @@ TEST(LifetimeObserverTest, TestSimpleCallback)
 
     struct TestObjHolder
     {
-        TestObjHolder(TestObject* p): obj(p), obj_lifetime(*p) { }
+        TestObjHolder(TestObject* p): obj(p), obj_lifetime(p->getObserver()) { }
         TestObjHolder() = delete;
         ~TestObjHolder() = default;
 
@@ -1022,29 +1056,29 @@ TEST(LifetimeObserverTest, TestSimpleCallback)
 
     private:
         TestObject* obj;
-        LifetimeObserver<TestObject> obj_lifetime;
+        LifetimeObserver obj_lifetime;
     };
 
     {
         TestObject* obj = new TestObject();
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 0);
 
         TestObjHolder holder(obj);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 1);
 
         EXPECT_TRUE(holder.testAlive(true));
 
         {
-            LifetimeObserver<TestObject> observer = *obj; // weak reference
-            EXPECT_TRUE(observer.getCount(TestObject::e_refType::owner) == 1);
-            EXPECT_TRUE(observer.getCount(TestObject::e_refType::observer) == 2);
+            LifetimeObserver observer = obj->getObserver(); // weak reference
+            EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
+            EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 2);
             EXPECT_TRUE(observer.isAlive());
             EXPECT_TRUE(holder.testAlive(true));
         }
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 1);
 
         EXPECT_TRUE(holder.testAlive(true));
 
@@ -1059,7 +1093,7 @@ TEST(LifetimeObserverTest, TestSimpleCallback)
 
 TEST(LifetimeObserverTest, TestDeferredCallback)
 {
-    class TestObject: public LifetimeObserver<TestObject>
+    class TestObject: public LifetimeObserver
     {
     public:
         TestObject() = default;
@@ -1112,8 +1146,8 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
 
     {
         TestObject* obj = new TestObject();
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 0);
 
         // Create some long-running event engine
         EventEngine engine;
@@ -1125,8 +1159,8 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
             return -1;
         });
 
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 1);
 
         // Invoke the event callback at some future point in time, while the object is alive
         int result = engine.event();
@@ -1145,8 +1179,8 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
 
     {
         TestObject* obj = new TestObject();
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 0);
 
         // Create some long-running event engine
         EventEngine engine;
@@ -1158,8 +1192,8 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
             return -1;
         });
 
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 1);
 
         engine.startEventLoop(5);
         EXPECT_EQ(obj->incValue(), 6);
@@ -1182,7 +1216,7 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
 
 TEST(LifetimeObserverTest, TestCallbackWithMultipleObservers)
 {
-    class TestObject: public LifetimeObserver<TestObject>
+    class TestObject: public LifetimeObserver
     {
     public:
         TestObject() = default;
@@ -1190,14 +1224,14 @@ TEST(LifetimeObserverTest, TestCallbackWithMultipleObservers)
     };
     {
         TestObject* obj = new TestObject();
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 0);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 0);
 
-        LifetimeObserver<TestObject> observer1 = *obj; // weak reference
-        LifetimeObserver<TestObject> observer2 = *obj; // weak reference
+        LifetimeObserver observer1 = obj->getObserver(); // weak reference
+        LifetimeObserver observer2 = obj->getObserver(); // weak reference
 
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::owner) == 1);
-        EXPECT_TRUE(obj->getCount(TestObject::e_refType::observer) == 2);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 2);
 
         EXPECT_TRUE(observer1.isAlive());
         EXPECT_TRUE(observer2.isAlive());

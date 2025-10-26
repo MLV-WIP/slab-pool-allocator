@@ -6,17 +6,19 @@ namespace spallocator
 {
 
     // Helper class to track if an object is alive (not yet destroyed)
-    template<typename T>
+    // Abstractly based on the Observer Pattern and Mediator Pattern
+    // Explicitly inspired by std::shared_ptr and std::weak_ptr implementation
     class LifetimeObserver 
     {
     public: // types
         enum class e_refType
         {
-            owner,
+            owner, // "subject" in observer pattern
             observer
         };
 
     private: // encapsulated types
+        // ControlBlock is the "mediator" in the mediator pattern
         struct ControlBlock
         {
             int64_t addRef(e_refType ref_type);
@@ -28,6 +30,12 @@ namespace spallocator
             ControlBlock(e_refType ref_type) { addRef(ref_type); }
             ~ControlBlock() = default;
 ;
+        private: // methods
+            ControlBlock(const ControlBlock&) = delete;
+            ControlBlock& operator=(const ControlBlock&) = delete;
+            ControlBlock(ControlBlock&&) = delete;
+            ControlBlock& operator=(ControlBlock&&) = delete;
+
         private: // data members
             int64_t owner_count = 0;
             int64_t observer_count = 0;
@@ -36,39 +44,67 @@ namespace spallocator
         ControlBlock* control_block = nullptr;
 
     public: // methods
-        LifetimeObserver getObserver() const;
-
-        // Check if the object is still alive
+        // Check if the observed object is still alive
         bool isAlive() const;
         operator bool() const { return isAlive(); }
 
+        // Use getObserver to obtain an observer object distinct from the
+        // object for which liveness is being observed.
+        // Example: Object A is an object, derived from LifetimeObserver,
+        // which has an indeterminate lifetime. getObserver() returns a
+        // separate and unique LifetimeObserver object (B) that tracks the
+        // liveness of object A, even after its destruction. B has a separate
+        // lifetime from A, and can be safely used to check if A is still
+        // alive.
+        LifetimeObserver getObserver() const;
+
+        // Useful for diagnostics
         int64_t getCount(e_refType ref_type) const;
 
-        LifetimeObserver(e_refType ref_type = e_refType::owner);
-
-        LifetimeObserver(const LifetimeObserver& other);
-        LifetimeObserver& operator=(const LifetimeObserver& other);
-
-        LifetimeObserver(LifetimeObserver&& other) noexcept;
-        LifetimeObserver& operator=(LifetimeObserver&& other) noexcept;
+        // Discard old state and copy in new state from other object
+        LifetimeObserver& reset(const LifetimeObserver& other,
+                                e_refType ref_type);
 
         ~LifetimeObserver();
+
+    protected: // methods
+        // Default constructor - creates an owner reference
+        // Used by inheriting class to create initial owner reference.
+        // Optionally used to create a standalone object that will later be
+        // assigned as an observer.
+        LifetimeObserver();
+
+        // Copy constructor and copy operator
+        // Primary use case is when the inheriting object is copied, where
+        // each copy get a separate ownership reference.
+        // Secondary use case is to create an observer object by copy
+        // assignment from an existing owner object; in this case, explicit
+        // care must be taken to ensure the copy is a weak observer reference.
+        // For this use case, the requirement is to use the getObserver()
+        // method to obtain the observer.
+        LifetimeObserver(const LifetimeObserver& other,
+                         e_refType ref_type = e_refType::owner);
+        LifetimeObserver& operator=(const LifetimeObserver& other);
+
+        // Move constructor and move operator
+        // Used to transfer ownership of the inheriting object along with
+        // ownership state.
+        LifetimeObserver(LifetimeObserver&& other) noexcept;
+        LifetimeObserver& operator=(LifetimeObserver&& other) noexcept;
 
     private:
         e_refType my_ownership = e_refType::owner;
     };
 
 
-    template<typename T>
-    inline LifetimeObserver<T> LifetimeObserver<T>::getObserver() const
+    inline LifetimeObserver LifetimeObserver::getObserver() const
     {
         // make a weak reference copy and return it
-        return LifetimeObserver<T>(*this);
+        return LifetimeObserver(*this, e_refType::observer);
     }
 
 
-    template<typename T>
-    inline int64_t LifetimeObserver<T>::ControlBlock::addRef(e_refType ref_type)
+    inline int64_t LifetimeObserver::ControlBlock::addRef(e_refType ref_type)
     {
         if (ref_type == e_refType::owner)
         {
@@ -80,8 +116,7 @@ namespace spallocator
         }
     }
 
-    template<typename T>
-    inline int64_t LifetimeObserver<T>::ControlBlock::releaseRef(e_refType ref_type)
+    inline int64_t LifetimeObserver::ControlBlock::releaseRef(e_refType ref_type)
     {
         if (ref_type == e_refType::owner)
         {
@@ -93,8 +128,7 @@ namespace spallocator
         }
     }
 
-    template<typename T>
-    inline int64_t LifetimeObserver<T>::ControlBlock::getCount(e_refType ref_type) const
+    inline int64_t LifetimeObserver::ControlBlock::getCount(e_refType ref_type) const
     {
         if (ref_type == e_refType::owner)
         {
@@ -105,52 +139,92 @@ namespace spallocator
             return observer_count;
         }
     }
+    
 
-
-    template<typename T>
-    inline bool LifetimeObserver<T>::isAlive() const
+    inline bool LifetimeObserver::isAlive() const
     {
         return control_block->getCount(e_refType::owner) > 0;
     }
 
 
-    template<typename T>
-    inline int64_t LifetimeObserver<T>::getCount(e_refType ref_type) const
+    inline int64_t LifetimeObserver::getCount(e_refType ref_type) const
     {
         return control_block->getCount(ref_type);
     }
 
 
-    template<typename T>
-    inline LifetimeObserver<T>::LifetimeObserver(e_refType ref_type /* = e_refType::owner */):
-        control_block(new ControlBlock(ref_type)),
+    // default constructor - creates an owner reference
+    inline LifetimeObserver::LifetimeObserver():
+        control_block(new ControlBlock(e_refType::owner)),
+        my_ownership(e_refType::owner)
+    {
+    }
+
+    // copy constructor
+    inline LifetimeObserver::LifetimeObserver(const LifetimeObserver& other,
+        e_refType ref_type /* = e_refType::owner */):
         my_ownership(ref_type)
     {
+        if (my_ownership == e_refType::owner)
+        {
+            // We own a separate copy. Make a new control block separate from
+            // the original object.
+            control_block = new ControlBlock(my_ownership);
+        }
+        else
+        {
+            // We are an observer copy
+            control_block = other.control_block;
+            control_block->addRef(e_refType::observer);
+        }
     }
 
-    template<typename T>
-    inline LifetimeObserver<T>::LifetimeObserver(const LifetimeObserver& other):
-        control_block(other.control_block),
-        my_ownership(e_refType::observer)
+    // copy assignment operator
+    inline LifetimeObserver& LifetimeObserver::operator=(const LifetimeObserver& other)
     {
-        control_block->addRef(my_ownership);
+        // Assumed use-case: creating a new owned copy of an inherited object.
+        // If creating an obeserver copy, use getObserver() method instead.
+        return reset(other, e_refType::owner);
     }
 
-    template<typename T>
-    inline LifetimeObserver<T>& LifetimeObserver<T>::operator=(const LifetimeObserver& other)
+    inline LifetimeObserver& LifetimeObserver::reset(
+        const LifetimeObserver& other,
+        e_refType ref_type)
     {
         if (this != &other)
         {
-            delete control_block;
-            control_block = other.control_block;
-            my_ownership = e_refType::observer;
-            control_block->addRef(my_ownership);
+            // are we changing which object we are observing?
+            if (control_block != other.control_block)
+            {
+                control_block->releaseRef(my_ownership);
+                runtime_assert(getCount(my_ownership) >= 0,
+                    "Reference count went negative in LifetimeObserver copy assignment");
+                if (getCount(e_refType::owner) == 0 &&
+                    getCount(e_refType::observer) == 0)
+                {
+                    delete control_block;
+                }
+
+                my_ownership = ref_type;
+                if (my_ownership == e_refType::owner)
+                {
+                    // We own a separate copy. Make a new control block separate from
+                    // the original object.
+                    control_block = new ControlBlock(my_ownership);
+                }
+                else
+                {
+                    // We are an observer copy
+                    control_block = other.control_block;
+                    control_block->addRef(e_refType::observer);
+                }
+            }
         }
         return *this;
     }
 
-    template<typename T>
-    inline LifetimeObserver<T>::LifetimeObserver(LifetimeObserver&& other) noexcept:
+    // move constructor
+    inline LifetimeObserver::LifetimeObserver(LifetimeObserver&& other) noexcept:
         control_block(other.control_block),
         my_ownership(other.my_ownership)
     {
@@ -158,8 +232,8 @@ namespace spallocator
         other.control_block = new ControlBlock(other.my_ownership);
     }
 
-    template<typename T>
-    inline LifetimeObserver<T>& LifetimeObserver<T>::operator=(LifetimeObserver&& other) noexcept
+    // move assignment operator
+    inline LifetimeObserver& LifetimeObserver::operator=(LifetimeObserver&& other) noexcept
     {
         if (this != &other)
         {
@@ -173,8 +247,7 @@ namespace spallocator
     }
 
 
-    template<typename T>
-    inline LifetimeObserver<T>::~LifetimeObserver()
+    inline LifetimeObserver::~LifetimeObserver()
     {
         if (control_block)
         {
