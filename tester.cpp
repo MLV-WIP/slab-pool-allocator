@@ -37,7 +37,7 @@
 #include "spallocator/spinlock.hpp"
 #include "spallocator/slab.hpp"
 #include "spallocator/pool.hpp"
-#include "spallocator/objectAlive.hpp"
+#include "spallocator/lifetimeobserver.hpp"
 #include "spallocator/spallocator.hpp"
 
 using namespace std::literals;
