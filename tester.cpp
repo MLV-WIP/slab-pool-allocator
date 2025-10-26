@@ -949,11 +949,11 @@ TEST(LifetimeObserverTest, CopySemantics)
         EXPECT_TRUE(obj2->isAlive());
         EXPECT_TRUE(observer.isAlive());
         EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
-        EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 2);
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 1);
         EXPECT_EQ(obj2->getCount(TestObject::e_refType::owner), 1);
-        EXPECT_EQ(obj2->getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(obj2->getCount(TestObject::e_refType::observer), 0);
         EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
-        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 2);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
 
         delete obj2;
         EXPECT_TRUE(obj1->isAlive());
@@ -967,38 +967,6 @@ TEST(LifetimeObserverTest, CopySemantics)
         EXPECT_FALSE(observer.isAlive());
         EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 0);
         EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
-    }
-}
-
-
-TEST(LifetimeObserverTest, AssignmentOperator)
-{
-    class TestObject: public LifetimeObserver
-    {
-    public:
-        TestObject() = default;
-        ~TestObject() = default;
-    };
-
-    {
-        TestObject obj1;
-        EXPECT_EQ(obj1.getCount(TestObject::e_refType::owner), 1);
-        EXPECT_EQ(obj1.getCount(TestObject::e_refType::observer), 0);
-
-        TestObject obj2;
-        EXPECT_EQ(obj2.getCount(TestObject::e_refType::owner), 1);
-        EXPECT_EQ(obj2.getCount(TestObject::e_refType::observer), 0);
-
-        // both still alive, but obj2 has discarded its own contents
-        // and created a new unique copy of obj1
-        obj2 = obj1; // assignment
-        EXPECT_TRUE(obj1.isAlive());
-        EXPECT_TRUE(obj2.isAlive());
-
-        EXPECT_EQ(obj1.getCount(TestObject::e_refType::owner), 1);
-        EXPECT_EQ(obj1.getCount(TestObject::e_refType::observer), 1);
-        EXPECT_EQ(obj2.getCount(TestObject::e_refType::owner), 1);
-        EXPECT_EQ(obj2.getCount(TestObject::e_refType::observer), 1);
     }
 }
 

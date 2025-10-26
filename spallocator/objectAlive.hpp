@@ -8,7 +8,7 @@ namespace spallocator
     // Helper class to track if an object is alive (not yet destroyed)
     // Abstractly based on the Observer Pattern and Mediator Pattern
     // Explicitly inspired by std::shared_ptr and std::weak_ptr implementation
-    class LifetimeObserver 
+    class LifetimeObserver
     {
     public: // types
         enum class e_refType
@@ -65,6 +65,11 @@ namespace spallocator
         LifetimeObserver& reset(const LifetimeObserver& other,
                                 e_refType ref_type);
 
+        // Copy constructor
+        // note about only use for copying observer and inherited
+        // class explicitly using reset with ownership or some such
+        LifetimeObserver(const LifetimeObserver& other);
+
         ~LifetimeObserver();
 
     protected: // methods
@@ -82,8 +87,7 @@ namespace spallocator
         // care must be taken to ensure the copy is a weak observer reference.
         // For this use case, the requirement is to use the getObserver()
         // method to obtain the observer.
-        LifetimeObserver(const LifetimeObserver& other,
-                         e_refType ref_type = e_refType::owner);
+        LifetimeObserver(const LifetimeObserver& other, e_refType ref_type);
         LifetimeObserver& operator=(const LifetimeObserver& other);
 
         // Move constructor and move operator
@@ -139,7 +143,7 @@ namespace spallocator
             return observer_count;
         }
     }
-    
+
 
     inline bool LifetimeObserver::isAlive() const
     {
@@ -161,8 +165,15 @@ namespace spallocator
     }
 
     // copy constructor
-    inline LifetimeObserver::LifetimeObserver(const LifetimeObserver& other,
-        e_refType ref_type /* = e_refType::owner */):
+    inline LifetimeObserver::LifetimeObserver(const LifetimeObserver& other):
+        control_block(other.control_block),
+        my_ownership(e_refType::observer)
+    {
+        // We are an observer copy
+        control_block->addRef(e_refType::observer);
+    }
+
+    inline LifetimeObserver::LifetimeObserver(const LifetimeObserver& other, e_refType ref_type):
         my_ownership(ref_type)
     {
         if (my_ownership == e_refType::owner)
