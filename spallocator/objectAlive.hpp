@@ -1,3 +1,35 @@
+/*
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Copyright (c) 2025, Michael VanLoon
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #ifndef OBJECT_ALIVE_HPP_
 #define OBJECT_ALIVE_HPP_
 
@@ -5,9 +37,33 @@
 namespace spallocator
 {
 
-    // Helper class to track if an object is alive (not yet destroyed)
-    // Abstractly based on the Observer Pattern and Mediator Pattern
-    // Explicitly inspired by std::shared_ptr and std::weak_ptr implementation
+    //
+    // LifetimeObserver is a helper class to track whether an object is alive
+    // (not yet destroyed). This is useful for asynchronous callbacks or event
+    // handlers that may be invoked after the object they reference has been
+    // destroyed.
+    //
+    // A common use case goes something like this:
+    // - An object A derives from LifetimeObserver.
+    // - Object A registers a callback or event handler with some external
+    //   system (e.g., an event loop, a timer, a network handler).
+    // - The callback captures a weak reference to A's LifetimeObserver via
+    //   getObserver().
+    // - The callback is used while the object A is alive.
+    // - When the callback is invoked, it first checks if the object
+    //   is still alive by calling isAlive() on the captured LifetimeObserver.
+    // - If isAlive() returns true, the callback proceeds to use object A.
+    // - At some point, A is destroyed but the callback handler still exists.
+    // - If isAlive() returns false, the callback safely exits without
+    //   accessing the destroyed object.
+    //
+    // This implementation is abstractly based on the Observer Pattern, with
+    // a specialization based on the Mediator Pattern to manage both strong
+    // (owner aka "subject") and weak (observer) references to the object's
+    // lifetime.
+    // More explicitly, it is inspired by the implementation of
+    // std::shared_ptr and std::weak_ptr in the C++ Standard Library.
+    //
     class LifetimeObserver
     {
     public: // types
@@ -41,6 +97,7 @@ namespace spallocator
             int64_t observer_count = 0;
         };
 
+        // control blocks are explicitly sharable between owner and observer references
         ControlBlock* control_block = nullptr;
 
     public: // methods
@@ -48,7 +105,7 @@ namespace spallocator
         bool isAlive() const;
         operator bool() const { return isAlive(); }
 
-        // Use getObserver to obtain an observer object distinct from the
+        // Use getObserver() to obtain an observer object distinct from the
         // object for which liveness is being observed.
         // Example: Object A is an object, derived from LifetimeObserver,
         // which has an indeterminate lifetime. getObserver() returns a
@@ -66,8 +123,9 @@ namespace spallocator
                                 e_refType ref_type);
 
         // Copy constructor
-        // note about only use for copying observer and inherited
-        // class explicitly using reset with ownership or some such
+        // Note: This constructor is only for copying observer; the inheriting
+        // class should not use this constructor directly to create owner
+        // copies, but use the ref_type version or reset() method instead.
         LifetimeObserver(const LifetimeObserver& other);
 
         ~LifetimeObserver();

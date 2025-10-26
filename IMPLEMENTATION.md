@@ -14,6 +14,7 @@ This document provides an in-depth analysis of the slab pool allocator implement
 - [Bitset Tracking System](#bitset-tracking-system)
 - [Address Lookup for Deallocation](#address-lookup-for-deallocation)
 - [Smart Pointer Integration](#smart-pointer-integration)
+- [LifetimeObserver - Asynchronous Object Lifetime Tracking](#lifetimeobserver---asynchronous-object-lifetime-tracking)
 - [Thread Safety and Concurrent Access](#thread-safety-and-concurrent-access)
 - [SpinLock Design](#spinlock-design)
 - [Performance Analysis](#performance-analysis)
@@ -676,6 +677,336 @@ This implementation teaches:
 
 ---
 
+## LifetimeObserver - Asynchronous Object Lifetime Tracking
+
+### The Problem: Use-After-Free in Async Callbacks
+
+A common challenge in asynchronous programming is ensuring an object is still alive before accessing it in a callback:
+
+```cpp
+class EventHandler {
+public:
+    void registerCallback(std::function<void()> cb) {
+        // Callback will be invoked later, possibly after object destruction
+        event_system.on_event([this, cb](){
+            // But 'this' might be invalid by now!
+            process(cb);
+        });
+    }
+};
+
+EventHandler handler;
+handler.registerCallback([](){ /* ... */ });
+// handler destroyed, but callback still pending...
+```
+
+This creates a use-after-free vulnerability: the callback invokes a method on a destroyed object.
+
+### The Solution: LifetimeObserver
+
+`LifetimeObserver` is a helper class that tracks whether an object is still alive. The pattern allows:
+
+1. Objects to be observed (tracked for liveness)
+2. Callbacks to safely check if the object still exists before using it
+3. Weak references that don't prevent object destruction
+
+**Key Concepts Demonstrated**:
+- **Observer Pattern**: Separation of concerns between object lifetime and observers
+- **Mediator Pattern**: Control block mediates between strong and weak references
+- **Reference Counting**: Lightweight reference counting for lifetime management
+- **Async-Safe Operations**: Checking liveness without locks in many cases
+
+### Design Architecture
+
+```cpp
+class LifetimeObserver
+{
+    struct ControlBlock {
+        int64_t owner_count;      // Strong references
+        int64_t observer_count;   // Weak references
+    };
+
+    ControlBlock* control_block;  // Shared between strong and weak references
+    e_refType my_ownership;       // owner = strong, observer = weak
+};
+```
+
+The `ControlBlock` is the mediator pattern implementation:
+- **Owner References** (`e_refType::owner`): Owned by the original object
+- **Observer References** (`e_refType::observer`): Held by callbacks/handlers
+- **Control Block**: Mediates all reference operations, survives object destruction
+
+### Usage Pattern
+
+```cpp
+class AsyncService: public LifetimeObserver
+{
+public:
+    AsyncService() {  // Create owner reference
+        // Register callback that captures observer
+        event_loop.on_data([alive = getObserver()](const Data& d)
+        {
+            // Safe to check liveness without locks
+            if (alive)
+            {
+                // Object still exists, safe to access
+                process_data(d);
+            }
+        });
+    }
+
+    ~AsyncService()
+    {
+        // Control block survives destruction
+        // Callbacks can still safely check observer.isAlive() → false
+    }
+};
+```
+
+### Key Components
+
+#### 1. ControlBlock - Reference Count Mediator
+
+```cpp
+struct ControlBlock {
+    int64_t addRef(e_refType ref_type);
+    int64_t releaseRef(e_refType ref_type);
+    int64_t getCount(e_refType ref_type) const;
+};
+```
+
+**Design Insights**:
+- Maintains separate counts for owners and observers
+- Non-copyable/non-moveable (proper resource semantics)
+- Deleted copy/move operations prevent accidental duplication
+- Survives as long as any references exist
+
+#### 2. getObserver() - Creating Observer References
+
+```cpp
+LifetimeObserver observer = obj.getObserver();
+```
+
+**Educational Highlights**:
+
+**Why separate method?** Creates a new `LifetimeObserver` with weak reference semantics:
+```cpp
+LifetimeObserver(const LifetimeObserver& other, e_refType::observer)
+// Creates weak reference copy, not owned by this object
+```
+
+This explicitly communicates intent - the observer doesn't prevent object destruction.
+
+In addition, requiring an observer to request a unique observer object via method
+rather than creation via assignment or copy constructor avoids making confusing
+overloaded use cases for copying. Internally, assignment is reserved for the case
+where the owning inheriting object is copied.
+
+#### 3. isAlive() - Liveness Check
+
+```cpp
+if (observer.isAlive()) {
+    // Object still exists
+}
+```
+
+**Implementation**:
+```cpp
+bool isAlive() const {
+    return control_block->getCount(e_refType::owner) > 0;
+}
+```
+
+**Why this is safe**:
+- Lock-free check: No synchronization needed (atomic-like semantics expected)
+- Observer can outlive object: Control block never destroyed while references exist
+- Simple: Just checks owner count > 0
+
+**Usage in Callbacks**:
+```cpp
+auto callback = [observer = obj.getObserver()]() {
+    if (observer) {  // operator bool() = isAlive()
+        // Safe to proceed
+    }
+};
+```
+
+### Copy and Move Semantics
+
+#### Copy Constructor
+
+```cpp
+LifetimeObserver(const LifetimeObserver& other)
+    : control_block(other.control_block),
+      my_ownership(e_refType::observer)
+{
+    control_block->addRef(e_refType::observer);
+}
+```
+
+**Design insight**: Default copy always creates observer (weak) reference.
+
+For owner copies, which are intended to occur only in the case where the
+inheriting object is being copied, explicitly use the constructor that
+expects a reference type:
+```cpp
+LifetimeObserver(original, e_refType::owner);
+// Creates separate control block, independent lifetime
+```
+
+#### Move Constructor
+
+```cpp
+LifetimeObserver(LifetimeObserver&& other) noexcept
+    : control_block(other.control_block),
+      my_ownership(other.my_ownership)
+{
+    other.my_ownership = e_refType::owner;
+    other.control_block = new ControlBlock(other.my_ownership);
+}
+```
+
+**Educational highlights**:
+
+**Why new control block?** Moved-from object must still be valid:
+- Old `control_block` transfers to new object
+- Moved-from object gets fresh owner reference
+- Both can independently release when destroyed
+- Prevents double-deletion
+
+**RAII on move**: The moved-from object can be safely destroyed:
+```cpp
+LifetimeObserver obj1;
+LifetimeObserver obj2 = std::move(obj1);  // obj1 gets new control block
+// Both obj1 and obj2 destructible
+```
+
+### Reference Counting Mechanics
+
+#### Adding References
+
+```cpp
+int64_t count = control_block->addRef(e_refType::owner);
+```
+
+Returns the new count after increment. Used to verify reference was created.
+
+#### Releasing References
+
+```cpp
+control_block->releaseRef(e_refType::owner);
+
+// Cleanup: if last reference, delete control block
+if (owner_count == 0 && observer_count == 0) {
+    delete control_block;
+}
+```
+
+**Lifetime guarantee**:
+- Control block exists as long as any reference exists
+- Safe to call `isAlive()` on observer even after original destroyed
+- Automatic cleanup when last reference released
+
+### Exception Safety
+
+**Copy assignment with exception safety** (simplified):
+
+```cpp
+LifetimeObserver& operator=(const LifetimeObserver& other) {
+    if (this != &other) {
+        if (control_block != other.control_block) {
+            // Old cleanup (may throw, but recoverable)
+            control_block->releaseRef(my_ownership);
+            // ... if counts = 0, delete control_block
+
+            // New assignment (noexcept)
+            control_block = other.control_block;
+            control_block->addRef(e_refType::observer);
+        }
+    }
+    return *this;
+}
+```
+
+**Safety guarantee**: If cleanup throws, object still points to valid control block. Exception propagates.
+
+### Comparison to std::shared_ptr/std::weak_ptr
+
+| Feature | `std::shared_ptr`/`std::weak_ptr` | `LifetimeObserver` |
+|---------|-----------------------------------|-------------------|
+| **Purpose** | General-purpose shared ownership | Lightweight object lifetime tracking |
+| **Space overhead** | 16+ bytes (pointer + control block ref) | 16 bytes (pointer + ownership type) |
+| **Thread safety** | Full atomic reference counting | Application-dependent |
+| **Flexibility** | Works with any object | Object must derive from LifetimeObserver |
+| **Liveness check** | `use_count() > 0` | `isAlive()` |
+| **Complexity** | More sophisticated (deleter, allocator) | Simpler, educational |
+| **Use case** | Production shared ownership | Async callback safety, teaching |
+
+### Learning Value
+
+This implementation teaches:
+
+1. **Observer Pattern**: Loose coupling between object and lifetime observers
+2. **Mediator Pattern**: Control block mediates strong/weak reference operations
+3. **Reference Counting**: Manual lifetime management without garbage collection
+4. **Move Semantics**: Efficient ownership transfer and moved-from object validity
+5. **Copy Assignment**: Exception-safe assignment with reference swapping
+6. **RAII**: Automatic cleanup through scope (destructor calls release)
+7. **Async Safety**: Safe callback patterns without locks
+8. **Control Flow**: Checking preconditions before accessing objects
+
+### Common Pitfalls
+
+#### 1. Holding Reference to Original, Not Observer
+
+```cpp
+// ❌ WRONG - callback holds reference to owner
+LifetimeObserver obj;
+event_loop.on_event([obs = obj]() {  // Wrong: makes owner copy
+    // This prevents obj from being destroyed!
+});
+
+// ✅ RIGHT - callback holds weak reference
+LifetimeObserver obj;
+event_loop.on_event([obs = obj.getObserver()]() {  // Correct: weak reference
+    if (obs.isAlive()) {
+        // Safe to proceed
+    }
+});
+```
+
+#### 2. Forgetting to Check isAlive()
+
+```cpp
+// ❌ WRONG - object might be destroyed
+auto observer = obj.getObserver();
+// ... later ...
+obj_method();  // CRASH if obj was destroyed
+
+// ✅ RIGHT - always check before accessing
+if (observer.isAlive()) {
+    obj_method();  // Safe
+}
+```
+
+#### 3. Race Conditions (Multi-threaded)
+
+```cpp
+// ❌ Potential race: object destroyed between check and use
+if (observer.isAlive()) {
+    // Object might be destroyed here by another thread
+    use_object();  // RACE CONDITION
+}
+
+// ✅ Use synchronization if accessing from multiple threads
+std::lock_guard lock(mutex);
+if (observer.isAlive()) {
+    use_object();  // Protected
+}
+```
+
+---
+
 ## Thread Safety and Concurrent Access
 
 ### Two-Level Lock Design
@@ -1127,7 +1458,16 @@ This computes the slab size at compile time, with zero runtime overhead.
 - **Backoff strategies**: Avoiding thundering herd
 - **STL compatibility**: BasicLockable concept
 
-### 7. Software Engineering Practices
+### 7. Asynchronous Patterns and Lifetime Management
+
+- **Observer pattern**: Decoupling object lifetime from observers
+- **Mediator pattern**: Control blocks coordinating strong/weak references
+- **Reference counting**: Manual lifetime without garbage collection
+- **Move semantics**: Efficient ownership transfer with valid moved-from state
+- **Exception safety**: Assignment and cleanup under error conditions
+- **Async callback patterns**: Safe invocation of callbacks on possibly-destroyed objects
+
+### 8. Software Engineering Practices
 
 - **Separation of concerns**: Clear module boundaries
 - **Resource management**: Non-copyable/non-moveable semantics
@@ -1212,8 +1552,8 @@ In production, this output can be disabled via compile-time flags or preprocesso
 - ✅ Custom deleter with array specialization (COMPLETED)
 - ✅ `std::shared_ptr` support via `make_pool_shared` (COMPLETED)
 - ✅ `PoolAllocator<T>` for STL integration (COMPLETED)
-- Observer-pattern proxy for pool lifetime management (future)
-- Educational value: Integrating custom allocators with STL
+- ✅ Object lifetime observer for async callbacks (COMPLETED)
+- Educational value: Integrating custom allocators with STL, safe async patterns
 
 **Thread-Safe Pool**
 - ✅ SpinLock integration with Pool for concurrent allocations (COMPLETED)

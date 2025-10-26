@@ -15,6 +15,7 @@ This project demonstrates high-performance memory allocation using the slab allo
 - **Large Allocation Fallback** - Seamless handling of allocations > 1 KB
 - **Smart Pointer Support** - `make_pool_unique` and `make_pool_shared` for RAII-based memory management
 - **Standard Allocator Interface** - `PoolAllocator<T>` for STL container integration
+- **Lifetime Observer** - `LifetimeObserver` for safe asynchronous callbacks and event handlers
 - **Production-Ready SpinLock** - TTAS with three-phase contention handling (spin → backoff → block)
 - **Modern C++20/23** - Template metaprogramming, user-defined literals, atomic operations, ranges, concepts
 
@@ -67,6 +68,7 @@ int main() {
 | **SlabProxy** | `spallocator/slab.hpp` | Handles large allocations (>1KB) via standard allocators |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII memory management |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
+| **LifetimeObserver** | `spallocator/objectAlive.hpp` | Observer pattern for safe object lifetime tracking in async contexts |
 | **SpinLock** | `spallocator/spinlock.hpp` | Production-ready lock with TTAS, backoff, and TSan annotations |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
 
@@ -133,15 +135,17 @@ Comprehensive test suite covering:
 - `./obj/memsan/tester` - Run all unit tests
 - `./obj/memsan/demo_shared_ptr` - Demonstrate shared_ptr usage
 
+## Completed Features
+
+- ✅ SpinLock implementation with TTAS and escalating backoff
+- ✅ Smart pointer support: `make_pool_unique` and `make_pool_shared`
+- ✅ Thread-safe Pool with two-level locking strategy
+- ✅ STL allocator interface: `PoolAllocator<T>`
+- ✅ Object lifetime observer for asynchronous callbacks
+
 ## Future Work
 
-- ✅ SpinLock implementation (COMPLETED)
-- ✅ Smart pointer support: `make_pool_unique` and `make_pool_shared` (COMPLETED)
-- ✅ Thread-safe Pool with SpinLock integration (COMPLETED)
-- ✅ STL allocator interface: `PoolAllocator<T>` (COMPLETED)
 - Memory statistics and profiling API
-- Per-slab locking for improved concurrency
-- Lock-free allocation paths for common cases
 - Configurable SpinLock parameters
 
 ## Learning Value
