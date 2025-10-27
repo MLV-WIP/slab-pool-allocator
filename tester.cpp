@@ -809,12 +809,6 @@ TEST(SpinLockTest, ManyThreads)
 }
 
 
-TEST(ObjectAliveTest, ReferenceCounting)
-{
-    // To be implemented
-}
-
-
 TEST(LifetimeObserverTest, SimpleObjectOwnership)
 {
     class TestObject: public LifetimeObserver
@@ -891,20 +885,24 @@ TEST(LifetimeObserverTest, MoveSemantics)
 
 TEST(LifetimeObserverTest, CopySemantics)
 {
-    class TestObject: public LifetimeObserver
+    struct TestObject: public LifetimeObserver
     {
-    public:
         TestObject() = default;
+        TestObject(int value) : i(value) {}
         ~TestObject() = default;
+
+        int i = 0;
     };
 
     {
-        TestObject* obj1 = new TestObject();
+        TestObject* obj1 = new TestObject{1};
+        EXPECT_EQ(obj1->i, 1);
         EXPECT_TRUE(obj1->isAlive());
         EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
         EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 0);
 
-        TestObject* obj2 = new TestObject();
+        TestObject* obj2 = new TestObject{2};
+        EXPECT_EQ(obj2->i, 2);
         EXPECT_TRUE(obj2->isAlive());
         EXPECT_EQ(obj2->getCount(TestObject::e_refType::owner), 1);
         EXPECT_EQ(obj2->getCount(TestObject::e_refType::observer), 0);
@@ -945,6 +943,8 @@ TEST(LifetimeObserverTest, CopySemantics)
         // they do not share ownership of the same underlying object; they
         // uniquely own separate objects.
         *obj2 = *obj1; // copy assignment
+        EXPECT_EQ(obj1->i, 1);
+        EXPECT_EQ(obj2->i, 1);
         EXPECT_TRUE(obj1->isAlive());
         EXPECT_TRUE(obj2->isAlive());
         EXPECT_TRUE(observer.isAlive());
@@ -955,18 +955,70 @@ TEST(LifetimeObserverTest, CopySemantics)
         EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
         EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
 
-        delete obj2;
+        TestObject* obj3 = new TestObject{3};
+        EXPECT_EQ(obj3->i, 3);
+        EXPECT_TRUE(obj3->isAlive());
+        EXPECT_EQ(obj3->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj3->getCount(TestObject::e_refType::observer), 0);
+
+        *obj3 = *obj1; // copy assignment
+        EXPECT_EQ(obj1->i, 1);
+        EXPECT_EQ(obj3->i, 1);
         EXPECT_TRUE(obj1->isAlive());
+        EXPECT_TRUE(obj3->isAlive());
         EXPECT_TRUE(observer.isAlive());
         EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
         EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(obj3->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj3->getCount(TestObject::e_refType::observer), 0);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
+
+        delete obj2;
+        EXPECT_TRUE(obj1->isAlive());
+        EXPECT_TRUE(observer.isAlive());
+        EXPECT_TRUE(obj3->isAlive());
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1->getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(obj3->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj3->getCount(TestObject::e_refType::observer), 0);
         EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
         EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
 
         delete obj1;
         EXPECT_FALSE(observer.isAlive());
+        EXPECT_TRUE(obj3->isAlive());
         EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 0);
         EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
+        EXPECT_EQ(obj3->getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj3->getCount(TestObject::e_refType::observer), 0);
+
+        delete obj3;
+        EXPECT_FALSE(observer.isAlive());
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 0);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
+    }
+
+    {
+        TestObject obj1;
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(obj1.getCount(TestObject::e_refType::observer), 0);
+
+        LifetimeObserver observer(obj1.getObserver()); // weak reference
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(observer.getCount(TestObject::e_refType::observer), 1);
+
+        LifetimeObserver observer2(obj1); // weak reference
+        EXPECT_EQ(observer2.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(observer2.getCount(TestObject::e_refType::observer), 2);
+
+        LifetimeObserver observer3 = obj1.getObserver(); // weak reference
+        EXPECT_EQ(observer3.getCount(TestObject::e_refType::owner), 1);
+        EXPECT_EQ(observer3.getCount(TestObject::e_refType::observer), 3);
+
+        //LifetimeObserver observer4 = obj1; // weak reference
+        //EXPECT_EQ(observer4.getCount(TestObject::e_refType::owner), 1);
+        //EXPECT_EQ(observer4.getCount(TestObject::e_refType::observer), 4);
     }
 }
 

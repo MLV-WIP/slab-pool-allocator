@@ -84,7 +84,7 @@ private: // encapsulated types
         int64_t getCount(e_refType ref_type) const;
 
         ControlBlock() = default;
-        ControlBlock(e_refType ref_type) { addRef(ref_type); }
+        ControlBlock(e_refType ref_type);
         ~ControlBlock() = default;
 ;
     private: // methods
@@ -126,8 +126,8 @@ public: // methods
     // Copy constructor
     // Note: This constructor is only for copying observer; the inheriting
     // class should not use this constructor directly to create owner
-    // copies, but use the ref_type version or reset() method instead.
-    LifetimeObserver(const LifetimeObserver& other);
+    // copies, but use the ref_type constructor or reset() method instead.
+    explicit LifetimeObserver(const LifetimeObserver& other);
 
     ~LifetimeObserver();
 
@@ -139,13 +139,13 @@ protected: // methods
     LifetimeObserver();
 
     // Copy constructor and copy operator
-    // Primary use case is when the inheriting object is copied, where
-    // each copy get a separate ownership reference.
-    // Secondary use case is to create an observer object by copy
-    // assignment from an existing owner object; in this case, explicit
-    // care must be taken to ensure the copy is a weak observer reference.
-    // For this use case, the requirement is to use the getObserver()
-    // method to obtain the observer.
+    // - Primary use case is when the inheriting object is copied, where
+    //   each copy gets a separate ownership reference.
+    // - Secondary use case (explicit LifetimeObserver parameter) is to create
+    //   an observer object by copy assignment from an existing owner object;
+    //   in this case, explicit care must be taken to ensure the copy is a
+    //   weak observer reference. For this use case, the requirement is to use
+    //   the getObserver() method to obtain the observer.
     LifetimeObserver(const LifetimeObserver& other, e_refType ref_type);
     LifetimeObserver& operator=(const LifetimeObserver& other);
 
@@ -160,10 +160,9 @@ private:
 };
 
 
-inline LifetimeObserver LifetimeObserver::getObserver() const
+inline LifetimeObserver::ControlBlock::ControlBlock(e_refType ref_type)
 {
-    // make a weak reference copy and return it
-    return LifetimeObserver(*this, e_refType::observer);
+    addRef(ref_type);
 }
 
 
@@ -207,6 +206,13 @@ inline int64_t LifetimeObserver::ControlBlock::getCount(e_refType ref_type) cons
 inline bool LifetimeObserver::isAlive() const
 {
     return control_block->getCount(e_refType::owner) > 0;
+}
+
+
+inline LifetimeObserver LifetimeObserver::getObserver() const
+{
+    // make a weak reference copy and return it
+    return LifetimeObserver(*this, e_refType::observer);
 }
 
 
