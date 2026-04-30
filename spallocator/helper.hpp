@@ -122,19 +122,23 @@ namespace spallocator
     //
     // Runtime assertions are valuable because they are self-diagnosing code.
     //
-    // What they are: checks that validate assumptions made by the program at
-    // runtime. If an assumption is violated, the program can immediately halt
-    // and report the error, rather than continuing in an invalid state which
-    // could lead to more obscure bugs later on.
+    // What they are:
+    // Checks that validate assumptions made by the program at runtime. If an
+    // assumption is violated, the program can immediately halt and report
+    // the error, rather than continuing in an invalid state which could lead
+    // to more obscure bugs later on.
     //
-    // What they are not: they are not a substitute for proper error handling
-    // in production code. They are primarily a debugging aid to catch
-    // programming errors during development. They should only be used in
-    // places where assumptions are being validated that should reasonably
-    // never be violated if the code is correct. They should never replace
-    // runtime checks for invalid states that could occur due to external
-    // factors (e.g., invalid API parameters, invalid user input, resource
-    // exhaustion, etc.)
+    // What they are not:
+    // They are not a substitute for proper error handling in production code.
+    // They are primarily a debugging aid to catch programming errors during
+    // development.
+    // They should only be used in places where assumptions are being
+    // validated that should reasonably never be violated if the code is
+    // correct. They should never replace runtime checks for invalid states
+    // that could occur due to external factors (e.g., invalid API
+    // parameters, invalid user input, resource exhaustion, etc.)
+    // They should never be used for operations with side-effects, as that
+    // side-effect will evaporate in release builds.
     //
     // See also: std::static_assert for compile-time assertions.
     //

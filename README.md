@@ -68,7 +68,7 @@ int main() {
 | **SlabProxy** | `spallocator/slab.hpp` | Handles large allocations (>1KB) via standard allocators |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII memory management |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
-| **LifetimeObserver** | `spallocator/objectAlive.hpp` | Observer pattern for safe object lifetime tracking in async contexts |
+| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Observer pattern for safe object lifetime tracking in async contexts |
 | **SpinLock** | `spallocator/spinlock.hpp` | Production-ready lock with TTAS, backoff, and TSan annotations |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
 
@@ -127,13 +127,14 @@ Comprehensive test suite covering:
 - STL compatibility and `PoolAllocator` integration
 
 **Build targets**:
-- `make` - Build all (tester + demo_shared_ptr)
+- `make` - Build all (tester + demo_shared_ptr + demo_lifetime_observer)
 - `BUILD=threadsan make` - Build with ThreadSanitizer for race detection
 - `BUILD=memsan make` - Build with AddressSanitizer + UBSanitizer (default)
 
 **Demo programs**:
 - `./obj/memsan/tester` - Run all unit tests
-- `./obj/memsan/demo_shared_ptr` - Demonstrate shared_ptr usage
+- `./obj/memsan/demo_spalloc_shared_ptr` - Demonstrate `make_pool_shared` and `PoolAllocator<T>` usage
+- `./obj/memsan/demo_lifetime_observer` - Demonstrate `LifetimeObserver` for async callback safety
 
 ## Completed Features
 

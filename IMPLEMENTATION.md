@@ -20,6 +20,7 @@ This document provides an in-depth analysis of the slab pool allocator implement
 - [Performance Analysis](#performance-analysis)
 - [Advanced Topics](#advanced-topics)
 - [Learning Objectives](#learning-objectives)
+- [Demo Programs](#demo-programs)
 
 ---
 
@@ -1601,6 +1602,124 @@ In production, this output can be disabled via compile-time flags or preprocesso
 - Allocate from local memory node when possible
 - Platform-specific optimizations
 - Learning: Hardware architecture impact on software design
+
+---
+
+## Demo Programs
+
+The project includes three demonstration programs showcasing different aspects of the allocator:
+
+### 1. `tester.cpp` - Comprehensive Unit Tests
+
+The main test suite covering:
+- **Core Slab Operations**: Allocation, deallocation, growth
+- **Pool Size Class Selection**: Correct slab assignment for various sizes
+- **Thread Safety**: Concurrent allocations from multiple threads
+- **Smart Pointers**: `unique_ptr` and `shared_ptr` lifecycle management
+- **Array Support**: Proper reverse-order destruction for arrays
+- **Destructor Invocation**: Ensuring user-defined destructors are called
+- **PoolAllocator Integration**: STL container compatibility
+- **SpinLock Contention**: High-contention scenarios with backoff testing
+
+**Build and run:**
+```bash
+make
+./obj/memsan/tester
+```
+
+**Sanitizer builds:**
+```bash
+# AddressSanitizer + LeakSanitizer (default)
+BUILD=memsan make && ./obj/memsan/tester
+
+# ThreadSanitizer (for race condition detection)
+BUILD=threadsan make && ./obj/threadsan/tester
+```
+
+### 2. `demo_spalloc_shared_ptr.cpp` - Shared Pointer Usage
+
+Demonstrates `make_pool_shared` and `PoolAllocator<T>`:
+
+```cpp
+// Create shared objects from pool
+auto obj = spallocator::make_pool_shared<MyClass>(pool, arg1, arg2);
+auto copy = obj;  // Reference counting
+
+// Use with STL containers
+std::vector<MyClass, spallocator::PoolAllocator<MyClass>> vec(pool);
+vec.push_back(MyClass());
+
+// Array support
+auto arr = spallocator::make_pool_shared<int[]>(pool, 100);
+```
+
+**Highlights:**
+- Single allocation for both object and control block
+- Automatic reference counting
+- Works seamlessly with `weak_ptr`
+- STL container integration
+
+**Build and run:**
+```bash
+make && ./obj/memsan/demo_spalloc_shared_ptr
+```
+
+### 3. `demo_lifetime_observer.cpp` - Object Lifetime Tracking
+
+Demonstrates `LifetimeObserver` for safe asynchronous callbacks:
+
+```cpp
+class EventHandler : public LifetimeObserver {
+public:
+    void registerCallback(std::function<void()> cb) {
+        // Capture weak reference to avoid preventing destruction
+        event_loop.on_event([alive = getObserver(), cb]() {
+            if (alive) {  // Safe to check without locks (in most cases)
+                cb();
+            }
+        });
+    }
+};
+```
+
+**Key Examples:**
+1. **Basic Ownership Tracking** - Creating and destroying owner references
+2. **Weak References** - Observers that don't prevent object destruction
+3. **Async Callbacks** - Safe callback patterns without race conditions
+4. **Multiple Observers** - Many observers tracking a single object
+5. **Stack-Based Objects** - RAII with automatic lifetime management
+
+**Features Demonstrated:**
+- Creating weak observer references via `getObserver()`
+- Safe liveness checking via `isAlive()` and `operator bool()`
+- Reference counting mechanics (owner vs. observer counts)
+- Move semantics and moved-from object validity
+- Control block survival after original object destruction
+
+**Build and run:**
+```bash
+make && ./obj/memsan/demo_lifetime_observer
+```
+
+### Running All Demos
+
+Quick verification that everything works:
+```bash
+make clean
+make
+./obj/memsan/tester
+./obj/memsan/demo_spalloc_shared_ptr
+./obj/memsan/demo_lifetime_observer
+```
+
+### Educational Value
+
+These demo programs teach:
+- **Integration**: How components work together
+- **Patterns**: Real-world usage patterns and idioms
+- **Safety**: Correct usage of smart pointers and lifetime tracking
+- **Performance**: When and how to use each feature
+- **Debugging**: Output traces showing internal behavior
 
 ---
 
