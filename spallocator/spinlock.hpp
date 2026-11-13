@@ -81,6 +81,7 @@ public:
         // times between different threads to encourage ordered acquisition
         // attempts.
         std::chrono::nanoseconds wait_time{dist(gen)};
+
         // Must live across loop iterations; resetting inside the loop
         // would make the wait() fallback unreachable.
         int backoff_count = 0;
