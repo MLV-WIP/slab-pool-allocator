@@ -242,20 +242,19 @@ namespace spallocator
             --it;
             auto slab_start = it->first;
             auto slab_end = slab_start + slab_alloc_size;
+            // Predecessor start is only a candidate. Invalid pointers (or
+            // addresses in gaps between slabs) can upper_bound into this path
+            // without falling inside [slab_start, slab_end).
             if (item >= slab_start && item < slab_end)
             {
                 return it->second;
             }
-            else
-            {
-                // given the pointer base ranges, it should be here, but it turns
-                // out not to be within the begin-end range
-                runtime_assert(item >= slab_start && item < slab_end,
-                    std::format("Item {} cannot be found in slab range {} - {}",
-                                static_cast<void*>(item),
-                                static_cast<void*>(slab_start),
-                                static_cast<void*>(slab_end)));
-            }
+
+            debug_println(
+                "Item {} is not within candidate slab range {} - {}; treating as unknown pointer",
+                static_cast<void*>(item),
+                static_cast<void*>(slab_start),
+                static_cast<void*>(slab_end));
         }
         return std::nullopt;
     }
