@@ -38,13 +38,15 @@
 #include <format>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
-#include <mutex>
 
 #include "helper.hpp"
+#include "spinlock.hpp"
 
 
 namespace spallocator
