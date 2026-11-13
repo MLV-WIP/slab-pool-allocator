@@ -114,11 +114,6 @@ namespace spallocator
             (ElemSize > 2_KB) || (slab_alloc_size % 1_KB == 0),
             "Allocation size must be a multiple of 1024 when ElemSize <= 2KB");
 
-        // subsequent allocations are a multiple of...
-        static constexpr std::size_t alloc_multiplier{2};
-        static_assert(alloc_multiplier >= 2, "Allocation multiplier must be at least 2");
-        static_assert(alloc_multiplier % 2 == 0, "Allocation multiplier must be a multiple of 2");
-
         std::vector<std::byte*> slab_data;
         // bitsets could be optimized more by creating custom bitset class
         // with 64-bit chunks that can be compared atomically
@@ -314,8 +309,8 @@ namespace spallocator
     template<const std::size_t ElemSize>
     Slab<ElemSize>::Slab()
     {
-        debug_println("Slab created with element size: {}, allocation size: {}, and multiplier: {}",
-                      getElemSize(), getAllocSize(), alloc_multiplier);
+        debug_println("Slab created with element size: {}, allocation size: {}",
+                      getElemSize(), getAllocSize());
 
         // all slabs are initially available
         slab_available_map.set();
