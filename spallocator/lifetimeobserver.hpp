@@ -313,9 +313,22 @@ inline LifetimeObserver& LifetimeObserver::operator=(LifetimeObserver&& other) n
 {
     if (this != &other)
     {
-        my_ownership = other.my_ownership;
-        delete control_block;
+        // Release our current reference; delete only if nothing else holds the block
+        if (control_block)
+        {
+            control_block->releaseRef(my_ownership);
+            if (control_block->getCount(e_refType::owner) == 0 &&
+                control_block->getCount(e_refType::observer) == 0)
+            {
+                delete control_block;
+            }
+        }
+
+        // Steal other's control block and ownership role (do not release other's ref)
         control_block = other.control_block;
+        my_ownership = other.my_ownership;
+
+        // Leave other in a valid moved-from state with a fresh owner block
         other.my_ownership = e_refType::owner;
         other.control_block = new ControlBlock(other.my_ownership);
     }
