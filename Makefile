@@ -40,12 +40,15 @@ endif
 # Base directories
 BASEOBJDIR := ./obj
 SRCDIR := .
+TESTDIR := ./test
+DEMODIR := ./demos
 INCLUDEDIR := ./spallocator
 DOCDIR := ./spallocator/docs
 
 # Compiler flags
 CXXSTD := -std=c++23
-INCLUDES := -I$(INCLUDEDIR)
+# -I. so sources in test/ and demos/ can #include "spallocator/..."
+INCLUDES := -I. -I$(INCLUDEDIR)
 WARNINGS := -Wall -Wextra -Wpedantic
 
 # Add Google Test includes if tests are enabled
@@ -150,15 +153,15 @@ endif
 OBJDIR := $(BASEOBJDIR)/$(OBJDIRNAME)
 
 # Source files
-TESTER_SRC := tester.cpp
+TESTER_SRC := $(TESTDIR)/tester.cpp
 TESTER_TARGET := tester
 TESTER_DEPFILE := $(OBJDIR)/$(TESTER_TARGET).d
 
-DEMO_SRC := demo_spalloc_shared_ptr.cpp
+DEMO_SRC := $(DEMODIR)/demo_spalloc_shared_ptr.cpp
 DEMO_TARGET := demo_spalloc_shared_ptr
 DEMO_DEPFILE := $(OBJDIR)/$(DEMO_TARGET).d
 
-DEMO_LIFETIME_SRC := demo_lifetime_observer.cpp
+DEMO_LIFETIME_SRC := $(DEMODIR)/demo_lifetime_observer.cpp
 DEMO_LIFETIME_TARGET := demo_lifetime_observer
 DEMO_LIFETIME_DEPFILE := $(OBJDIR)/$(DEMO_LIFETIME_TARGET).d
 
