@@ -164,6 +164,28 @@ TEST(SlabTest, DeallocateInvalidItem)
 }
 
 
+// Size limits must throw in all build types (not only DEBUG via runtime_assert).
+TEST(SlabTest, AllocateOversizedThrows)
+{
+    Slab<128> slab;
+    EXPECT_THROW(slab.allocateItem(129), std::invalid_argument);
+    EXPECT_NO_THROW(slab.allocateItem(128));
+}
+
+
+TEST(SlabProxyTest, SizeLimitsThrow)
+{
+    SlabProxy proxy;
+    // Must be strictly greater than 1_KB; 1_KB itself is not a large allocation.
+    EXPECT_THROW(proxy.allocateItem(1_KB), std::invalid_argument);
+    EXPECT_NO_THROW({
+        auto* p = proxy.allocateItem(1_KB + 1);
+        proxy.deallocateItem(p);
+    });
+    EXPECT_THROW(proxy.allocateItem(1_GB + 1), std::out_of_range);
+}
+
+
 TEST(SlabTest, Alignment)
 {
     Slab<64> slab;

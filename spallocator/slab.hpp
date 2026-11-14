@@ -188,8 +188,13 @@ namespace spallocator
     template<const std::size_t ElemSize>
     std::byte* Slab<ElemSize>::allocateItem(std::size_t size)
     {
-        runtime_assert(size <= ElemSize,
-            std::format("Requested size {} exceeds slab element size {}", size, ElemSize));
+        // Must remain active in release builds: an oversized request would
+        // otherwise be placed in a too-small slot (silent overrun).
+        if (size > ElemSize)
+        {
+            throw std::invalid_argument(
+                std::format("Requested size {} exceeds slab element size {}", size, ElemSize));
+        }
 
         std::scoped_lock<SpinLock> guard(slab_lock);
 
@@ -361,10 +366,19 @@ namespace spallocator
 
     inline std::byte* SlabProxy::allocateItem(std::size_t elem_size)
     {
-        runtime_assert(elem_size > 1_KB,
-            std::format("SlabProxy should only be used for large allocations, got {}", elem_size));
-        runtime_assert(elem_size <= 1_GB,
-            std::format("Requested size {} exceeds maximum allowed size for SlabProxy", elem_size));
+        // Active in all build types (not runtime_assert): mis-sized large
+        // allocations must fail loudly rather than allocate or be rejected
+        // only under DEBUG_BUILD.
+        if (elem_size <= 1_KB)
+        {
+            throw std::invalid_argument(
+                std::format("SlabProxy should only be used for large allocations, got {}", elem_size));
+        }
+        if (elem_size > 1_GB)
+        {
+            throw std::out_of_range(
+                std::format("Requested size {} exceeds maximum allowed size for SlabProxy", elem_size));
+        }
 
         // allocate memory using standard methods
         std::byte* item = new(std::align_val_t{16}) std::byte[elem_size];
