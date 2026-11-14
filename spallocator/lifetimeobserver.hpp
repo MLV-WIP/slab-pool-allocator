@@ -33,7 +33,9 @@
 #ifndef LIFETIME_OBSERVER_HPP_
 #define LIFETIME_OBSERVER_HPP_
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 
 #include "helper.hpp"
 
@@ -44,6 +46,16 @@
 // handlers that may be invoked after the object they reference has been
 // destroyed.
 //
+// Thread safety:
+// - Control-block owner/observer counts are std::atomic. Concurrent
+//   isAlive() / getCount() / addRef / releaseRef do not data-race on the
+//   counters. isAlive() uses an acquire load so a false result synchronizes
+//   with the release that dropped the last owner.
+// - isAlive() == true does NOT grant safe access to the observed object on
+//   another thread (check-then-use / TOCTOU). Synchronize object use the same
+//   way you would with weak_ptr::lock() failure modes, or hold an external
+//   mutex that also covers destruction.
+//
 // A common use case goes something like this:
 // - An object A derives from LifetimeObserver.
 // - Object A registers a callback or event handler with some external
@@ -53,7 +65,8 @@
 // - The callback is used while the object A is alive.
 // - When the callback is invoked, it first checks if the object
 //   is still alive by calling isAlive() on the captured LifetimeObserver.
-// - If isAlive() returns true, the callback proceeds to use object A.
+// - If isAlive() returns true, the callback proceeds to use object A only
+//   under an appropriate synchronization protocol for that object.
 // - At some point, A is destroyed but the callback handler still exists.
 // - If isAlive() returns false, the callback safely exits without
 //   accessing the destroyed object.
@@ -78,15 +91,20 @@ private: // encapsulated types
     // ControlBlock is the "mediator" in the mediator pattern
     struct ControlBlock
     {
+        // Returns the new count for ref_type after the increment.
         int64_t addRef(e_refType ref_type);
-        int64_t releaseRef(e_refType ref_type);
+
+        // Decrements ref_type. Returns true if this call retires the block
+        // (both counts are zero and this thread won the retire CAS); the
+        // caller must then delete the ControlBlock.
+        bool releaseRef(e_refType ref_type);
 
         int64_t getCount(e_refType ref_type) const;
 
         ControlBlock() = default;
         ControlBlock(e_refType ref_type);
         ~ControlBlock() = default;
-;
+
     private: // methods
         ControlBlock(const ControlBlock&) = delete;
         ControlBlock& operator=(const ControlBlock&) = delete;
@@ -94,8 +112,10 @@ private: // encapsulated types
         ControlBlock& operator=(ControlBlock&&) = delete;
 
     private: // data members
-        int64_t owner_count = 0;
-        int64_t observer_count = 0;
+        std::atomic<int64_t> owner_count{0};
+        std::atomic<int64_t> observer_count{0};
+        // Ensures only one releaser deletes the block when both counts hit 0.
+        std::atomic<bool> retired{false};
     };
 
     // control blocks are explicitly sharable between owner and observer references
@@ -157,6 +177,8 @@ protected: // methods
 
 private:
     e_refType my_ownership = e_refType::owner;
+
+    void releaseAndMaybeDelete();
 };
 
 
@@ -170,36 +192,53 @@ inline int64_t LifetimeObserver::ControlBlock::addRef(e_refType ref_type)
 {
     if (ref_type == e_refType::owner)
     {
-        return ++owner_count;
+        return owner_count.fetch_add(1, std::memory_order_relaxed) + 1;
     }
-    else
-    {
-        return ++observer_count;
-    }
+    return observer_count.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-inline int64_t LifetimeObserver::ControlBlock::releaseRef(e_refType ref_type)
+inline bool LifetimeObserver::ControlBlock::releaseRef(e_refType ref_type)
 {
-    if (ref_type == e_refType::owner)
+    std::atomic<int64_t>& counter =
+        (ref_type == e_refType::owner) ? owner_count : observer_count;
+    std::atomic<int64_t>& other =
+        (ref_type == e_refType::owner) ? observer_count : owner_count;
+
+    // fetch_sub returns the previous value; previous == 1 means we hit zero.
+    const int64_t previous = counter.fetch_sub(1, std::memory_order_acq_rel);
+    spallocator::runtime_assert(previous > 0,
+        "LifetimeObserver reference count went non-positive on release");
+
+    if (previous == 1 && other.load(std::memory_order_acquire) == 0)
     {
-        return --owner_count;
+        bool expected = false;
+        return retired.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
     }
-    else
-    {
-        return --observer_count;
-    }
+    return false;
 }
 
 inline int64_t LifetimeObserver::ControlBlock::getCount(e_refType ref_type) const
 {
     if (ref_type == e_refType::owner)
     {
-        return owner_count;
+        return owner_count.load(std::memory_order_acquire);
     }
-    else
+    return observer_count.load(std::memory_order_acquire);
+}
+
+
+inline void LifetimeObserver::releaseAndMaybeDelete()
+{
+    if (!control_block)
     {
-        return observer_count;
+        return;
     }
+    if (control_block->releaseRef(my_ownership))
+    {
+        delete control_block;
+    }
+    control_block = nullptr;
 }
 
 
@@ -272,14 +311,7 @@ inline LifetimeObserver& LifetimeObserver::reset(
         // are we changing which object we are observing?
         if (control_block != other.control_block)
         {
-            control_block->releaseRef(my_ownership);
-            spallocator::runtime_assert(getCount(my_ownership) >= 0,
-                "Reference count went negative in LifetimeObserver copy assignment");
-            if (getCount(e_refType::owner) == 0 &&
-                getCount(e_refType::observer) == 0)
-            {
-                delete control_block;
-            }
+            releaseAndMaybeDelete();
 
             my_ownership = ref_type;
             if (my_ownership == e_refType::owner)
@@ -313,16 +345,7 @@ inline LifetimeObserver& LifetimeObserver::operator=(LifetimeObserver&& other) n
 {
     if (this != &other)
     {
-        // Release our current reference; delete only if nothing else holds the block
-        if (control_block)
-        {
-            control_block->releaseRef(my_ownership);
-            if (control_block->getCount(e_refType::owner) == 0 &&
-                control_block->getCount(e_refType::observer) == 0)
-            {
-                delete control_block;
-            }
-        }
+        releaseAndMaybeDelete();
 
         // Steal other's control block and ownership role (do not release other's ref)
         control_block = other.control_block;
@@ -338,19 +361,7 @@ inline LifetimeObserver& LifetimeObserver::operator=(LifetimeObserver&& other) n
 
 inline LifetimeObserver::~LifetimeObserver()
 {
-    if (control_block)
-    {
-        control_block->releaseRef(my_ownership);
-
-        spallocator::runtime_assert(control_block->getCount(my_ownership) >= 0,
-            "Reference count went negative in LifetimeObserver destructor");
-
-        if (getCount(e_refType::owner) == 0 &&
-            getCount(e_refType::observer) == 0)
-        {
-            delete control_block;
-        }
-    }
+    releaseAndMaybeDelete();
 }
 
 

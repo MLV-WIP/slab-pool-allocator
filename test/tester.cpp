@@ -30,8 +30,12 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 #include <gtest/gtest.h>
 
 #include "spallocator/helper.hpp"
@@ -1348,6 +1352,61 @@ TEST(LifetimeObserverTest, TestCallbackWithMultipleObservers)
         EXPECT_FALSE(observer1.isAlive());
         EXPECT_FALSE(observer2.isAlive());
     }
+}
+
+
+// Concurrent isAlive() while the owner is destroyed must not data-race on counts.
+TEST(LifetimeObserverTest, ConcurrentIsAliveDuringDestroy)
+{
+    class TestObject: public LifetimeObserver
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+    };
+
+    auto* obj = new TestObject();
+    LifetimeObserver observer = obj->getObserver();
+    std::atomic<bool> start{false};
+    std::atomic<int> true_hits{0};
+    std::atomic<int> false_hits{0};
+
+    constexpr int kReaders = 4;
+    std::vector<std::thread> readers;
+    readers.reserve(kReaders);
+    for (int i = 0; i < kReaders; ++i)
+    {
+        readers.emplace_back([&]() {
+            while (!start.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+            for (int n = 0; n < 100000; ++n)
+            {
+                if (observer.isAlive())
+                {
+                    true_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+                else
+                {
+                    false_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    delete obj;
+
+    for (auto& t : readers)
+    {
+        t.join();
+    }
+
+    EXPECT_GT(true_hits.load(), 0);
+    EXPECT_GT(false_hits.load(), 0);
+    EXPECT_FALSE(observer.isAlive());
 }
 
 

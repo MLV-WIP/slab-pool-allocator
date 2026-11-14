@@ -888,16 +888,16 @@ This creates a use-after-free vulnerability: the callback invokes a method on a 
 
 ### Thread model (read this first)
 
-`ControlBlock` stores **plain `int64_t` counts**, not `std::atomic`. The type is **not** internally synchronized.
+`ControlBlock` stores **`std::atomic<int64_t>`** owner/observer counts. Concurrent `isAlive()` / `getCount()` / ref adjust do **not** data-race on the counters. `isAlive()` loads with **acquire**; the last owner `releaseRef` uses **acq_rel**, so a false `isAlive()` synchronizes with owner teardown of the control-block state.
 
 | Situation | Safe? |
 |-----------|--------|
-| Single-threaded event loop: register observer, destroy owner, later check `isAlive()` | Yes — the intended educational use |
-| All `addRef` / `releaseRef` / `isAlive` on one thread, or under an external mutex you hold | Yes |
-| Concurrent `isAlive()` vs destroy/release from another thread without external sync | **No** — data race on the counts |
-| Check `isAlive()` then use the object without holding a lock that also covers destruction | **No** — TOCTOU even if counts were atomic |
+| Concurrent `isAlive()` while another thread destroys the owner / releases refs | **Yes** for the liveness bit (no data race on counts) |
+| Single-threaded or mutex-protected use of the observed object after `isAlive()` | Yes |
+| Check `isAlive()` then use the object on another thread with no lock / ownership handoff | **No** — classic TOCTOU; atomics do not fix this |
+| Prefer `shared_ptr` / `weak_ptr` when you need lock-style upgrade to a strong ref | Often yes — `weak_ptr::lock()` is the closer production pattern for “use if still alive” |
 
-Treat `LifetimeObserver` like an intrusive weak-ref teaching tool: **single-threaded or externally synchronized only**. For lock-free cross-thread lifetime, use `std::shared_ptr` / `std::weak_ptr` (or add atomics yourself). The [pitfalls](#common-pitfalls) section expands on the check-then-use race.
+Liveness is race-free; **object access** after a true `isAlive()` still needs an external protocol (mutex, strand, or upgrade to shared ownership). See [pitfalls](#common-pitfalls).
 
 ### Design Architecture
 
@@ -905,8 +905,9 @@ Treat `LifetimeObserver` like an intrusive weak-ref teaching tool: **single-thre
 class LifetimeObserver
 {
     struct ControlBlock {
-        int64_t owner_count;      // Strong references
-        int64_t observer_count;   // Weak references
+        std::atomic<int64_t> owner_count;      // Strong references
+        std::atomic<int64_t> observer_count;   // Weak references
+        std::atomic<bool> retired;             // One-winner delete of the block
     };
 
     ControlBlock* control_block;  // Shared between strong and weak references
@@ -929,11 +930,10 @@ public:
         // Register callback that captures observer
         event_loop.on_data([alive = getObserver()](const Data& d)
         {
-            // Check liveness (single-threaded / externally synced — see Thread model)
+            // Liveness check is race-free; synchronize before using *this
             if (alive)
             {
-                // Object still exists, safe to access
-                process_data(d);
+                process_data(d);  // still needs your object-access protocol
             }
         });
     }
@@ -1001,16 +1001,16 @@ bool isAlive() const {
 ```
 
 **What this means**:
-- Reads `owner_count` from the shared control block — a normal `int64_t` load, **not** an atomic or lock-free primitive
-- Safe when the observer and owner lifetimes are sequenced on one thread (or under your mutex)
+- Acquire-loads `owner_count` from the shared control block (`std::atomic`)
+- Concurrent liveness checks vs owner destruction are free of data races on the counters
 - Observer can outlive the object: the control block remains while any owner or observer refs exist
 - Does **not** by itself make a following member call race-free on another thread (see [Thread model](#thread-model-read-this-first))
 
-**Usage in Callbacks** (single-threaded / externally synchronized):
+**Usage in Callbacks**:
 ```cpp
 auto callback = [observer = obj.getObserver()]() {
     if (observer) {  // operator bool() = isAlive()
-        // Safe to proceed only under the thread model above
+        // Liveness is race-free; synchronize before using the observed object
     }
 };
 ```
@@ -1119,12 +1119,12 @@ LifetimeObserver& operator=(const LifetimeObserver& other) {
 | Feature | `shared_ptr` / `weak_ptr` | `enable_shared_from_this` | `LifetimeObserver` |
 |---------|---------------------------|---------------------------|------------------|
 | **Purpose** | Shared ownership | Intrusive weak-from-`this` | Lightweight liveness tracking |
-| **Thread safety** | Atomic refcounts | Same as `shared_ptr` | Plain `int64_t` — external sync only |
+| **Thread safety** | Atomic refcounts | Same as `shared_ptr` | Atomic refcounts; object use after `isAlive` still needs sync |
 | **Weak view** | `weak_ptr(shared)` | `weak_from_this()` | `getObserver()` |
 | **Requires** | External `shared_ptr` | Object already owned by `shared_ptr` | Derive from `LifetimeObserver` |
 | **Use case** | Production sharing | Callbacks needing weak `this` with `shared_ptr` | Teaching async checks without full sharing |
 
-`enable_shared_from_this` is the closer cousin: both are intrusive “object exposes a weak self.” Prefer it (or plain `weak_ptr`) when you already use `shared_ptr`; use `LifetimeObserver` for the educational owner/observer split without shared ownership.
+`enable_shared_from_this` is the closer cousin: both are intrusive “object exposes a weak self.” Prefer it (or plain `weak_ptr`) when you already use `shared_ptr` and need `lock()`-style upgrade; use `LifetimeObserver` for an intrusive owner/observer split without full shared ownership.
 
 ### Learning Value
 

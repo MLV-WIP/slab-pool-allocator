@@ -20,7 +20,7 @@ README.md             # this overview + build/run
 - **12 size classes** (16B–1KB) with intermediate sizes to cut fragmentation
 - **Thread-safe pool** with two-level locking and large-allocation fallback (>1KB)
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>`
-- **LifetimeObserver** for async callback safety; **SpinLock** (TTAS → backoff → block)
+- **LifetimeObserver** with atomic liveness checks for async callbacks (object use still needs sync); **SpinLock** (TTAS → backoff → block)
 - **Modern C++20/23** — templates, atomics, ranges, concepts
 
 Deep design notes live in [IMPLEMENTATION.md](IMPLEMENTATION.md), not here.
