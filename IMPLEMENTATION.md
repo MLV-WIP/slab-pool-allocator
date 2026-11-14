@@ -10,6 +10,7 @@ This document provides an in-depth analysis of the slab pool allocator implement
 
 - [Architecture Deep Dive](#architecture-deep-dive)
 - [Memory Layout](#memory-layout)
+- [Request Lifecycle](#request-lifecycle)
 - [Slab Allocation Strategy](#slab-allocation-strategy)
 - [Bitset Tracking System](#bitset-tracking-system)
 - [Address Lookup for Deallocation](#address-lookup-for-deallocation)
@@ -64,8 +65,8 @@ class Slab: public AbstractSlab
 High-level interface that manages multiple slabs and routes allocations.
 
 **Key Concepts Demonstrated**:
-- **Strategy Pattern**: Selects appropriate slab based on allocation size
-- **Memory Metadata**: Stores allocation size in 4-byte header for transparent deallocation
+- **Strategy Pattern**: Selects appropriate slab based on total allocation footprint
+- **Memory Metadata**: Prefixed header stores total alloc size and header length for transparent deallocation
 - **Size Class Optimization**: Pre-defined size classes reduce fragmentation
 
 ```cpp
@@ -74,16 +75,15 @@ constexpr std::size_t Pool::selectSlab(std::size_t size) const
 
 **Design Insights**:
 - Size classes chosen based on common allocation patterns (powers of 2, with intermediate steps)
-- Allocation header stores size for O(1) slab lookup during deallocation
+- `selectSlab()` sees `item_size + header_size`, not the bare user request
+- Allocation header stores size for O(1) slab routing during deallocation (no size argument)
 - Non-copyable and non-moveable (proper resource management semantics)
 
 **Educational Highlights**:
 
-**Allocation metadata trick**: The 4-byte prefix stores allocation size, allowing `deallocate()` to work without a size parameter. This matches the standard `delete` interface and simplifies the API.
+**Allocation metadata trick**: A small prefix before the user pointer stores the total footprint and header length, so `deallocate()` needs no size argument. This matches the standard `delete` interface and prevents size-mismatch bugs. See [Memory Layout](#memory-layout).
 
-**Size class selection**: The ladder of sizes (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024) balances fragmentation vs. number of slabs. Intermediate sizes (48, 96, 192, 384, 768) significantly reduce waste. For example:
-- 100-byte allocation in 128-byte slot: 28 bytes wasted (22%)
-- 100-byte allocation in 256-byte slot: 156 bytes wasted (61%)
+**Size class selection**: The ladder of sizes (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024) balances fragmentation vs. number of slabs. Intermediate sizes (48, 96, 192, 384, 768) significantly reduce waste. With the default 8-byte header, a 100-byte user request becomes a 108-byte footprint and lands in the 128B class (20 bytes of slot waste, ~16%). Without intermediate classes, that same 108-byte footprint would still fit 128B; the win shows up at boundaries such as 90 → 98 → 128 vs a coarser 256B ladder.
 
 **Constexpr function**: `selectSlab()` can be evaluated at compile-time when possible, enabling zero-overhead abstraction for constant-size allocations.
 
@@ -184,22 +184,50 @@ constexpr std::size_t operator""_KB(unsigned long long value) {
 
 ## Memory Layout
 
-Each allocation includes a 4-byte header storing the allocation size, enabling the pool to determine which slab to use during deallocation:
+Every `Pool::allocate(N, alignment)` reserves a **header** in front of the user payload. The returned pointer is past the header; deallocation reads metadata from fixed offsets behind that pointer.
 
 ```
-Memory Layout:
-┌─────────────────┬────────────────────────────────┐
-│  4-byte header  │   Requested memory (N bytes)   │
-│  (alloc size)   │                                │
-└─────────────────┴────────────────────────────────┘
-^                 ^
-│                 └─ User pointer (returned)
-└─ Internal pointer (stored in slab)
+Default layout (alignment ≤ 8 → header_size = 8):
+
+  slab slot base                                                user pointer
+  │                                                             │
+  ▼                                                             ▼
+┌─────────────┬────────────────┬────────────────┬──────────────────────────┐
+│ pad (3 B)   │ header_size    │ alloc_size     │ requested payload (N B)  │
+│             │ (1 byte)       │ (uint32 / 4 B) │                          │
+└─────────────┴────────────────┴────────────────┴──────────────────────────┘
+                ▲                ▲
+                │                └─ readable at user_ptr − 4
+                └─ readable at user_ptr − 5
 ```
+
+**Fields** (from the user pointer backward):
+
+| Offset from user ptr | Type | Meaning |
+|----------------------|------|---------|
+| `−4 … −1` | `uint32_t` | Total footprint `alloc_size = N + header_size` (used by `selectSlab` on free) |
+| `−5` | `uint8_t` | `header_size` itself (so free can recover the slab slot base) |
+| `−header_size … −6` | padding | Zero or more pad bytes so the user pointer meets `alignment` |
+
+**Rules implemented in `Pool::allocate`:**
+
+- `alignment` must be a power of two in `[4, 16]` (default `8`)
+- `header_size = max(8, alignment)` — at least 8 bytes so size + header_size byte always fit; larger alignments widen the prefix so the user pointer stays aligned
+- Slab selection uses **`alloc_size`**, not bare `N`
+
+**Overhead examples** (header only, before bitset amortization):
+
+| User request N | Alignment | header_size | alloc_size | Size class | Header / N |
+|----------------|-----------|-------------|------------|------------|------------|
+| 128 | 8 (default) | 8 | 136 | 192B | 6.25% |
+| 100 | 8 | 8 | 108 | 128B | 8% |
+| 16 | 8 | 8 | 24 | 32B | 50% |
+| 8 | 8 | 8 | 16 | 16B | 100% of footprint is half header |
+| 64 | 16 | 16 | 80 | 96B | 25% |
 
 **Why this design?**
 
-The 4-byte overhead is minimal (~3% for 128-byte allocation), and eliminates the need to pass size to `deallocate()`. This matches the standard `delete` interface and prevents errors from size mismatches.
+Storing size next to the object eliminates the need to pass size to `deallocate()`, matching `delete` and preventing size-mismatch bugs. Recording `header_size` separately supports variable alignment without encoding tricks in the pointer value.
 
 Alternative approaches:
 1. **Require size in deallocate()**: Error-prone, easy to pass wrong size
@@ -207,6 +235,49 @@ Alternative approaches:
 3. **Separate size table**: Extra indirection, more memory overhead for large numbers of allocations
 
 The header approach is simple, efficient, and robust.
+
+---
+
+## Request Lifecycle
+
+End-to-end path for a typical call `pool.allocate(100)` (default alignment 8):
+
+1. **Validate** — reject `N > 1_GB`; require power-of-two alignment in `[4, 16]`
+2. **Compute header** — `header_size = max(8, 8) = 8`
+3. **Compute footprint** — `alloc_size = 100 + 8 = 108`
+4. **Select slab** — under the pool lock, `selectSlab(108)` → index for the **128B** class (not 96B: 108 > 96)
+5. **Allocate slot** — release pool lock conceptually after choosing the slab pointer; the slab’s own lock guards bitset updates; return a slot base pointer
+6. **Write header** — at `base + header_size − 4` store `108`; at `base + header_size − 5` store `8`
+7. **Return** — `base + header_size` to the caller
+
+Deallocate reverses the path:
+
+1. Read `alloc_size` from `item − 4` and `header_size` from `item − 5`
+2. Recover `original = item − header_size`
+3. `selectSlab(alloc_size)` under the pool lock → same slab
+4. `slab->deallocateItem(original)` clears the bit and updates availability maps
+
+### User size → size class (default alignment 8)
+
+`selectSlab` thresholds are on **footprint** `N + 8`:
+
+| User N (bytes) | Footprint | Size class |
+|----------------|-----------|------------|
+| 1–8 | 9–16 | 16B |
+| 9–24 | 17–32 | 32B |
+| 25–40 | 33–48 | 48B |
+| 41–56 | 49–64 | 64B |
+| 57–88 | 65–96 | 96B |
+| 89–120 | 97–128 | 128B |
+| 121–184 | 129–192 | 192B |
+| 185–248 | 193–256 | 256B |
+| 249–376 | 257–384 | 384B |
+| 377–504 | 385–512 | 512B |
+| 505–760 | 513–768 | 768B |
+| 761–1016 | 769–1024 | 1024B |
+| ≥ 1017 | ≥ 1025 | `SlabProxy` (large path) |
+
+With `alignment = 16`, use `N + 16` against the same thresholds.
 
 ---
 
@@ -382,27 +453,24 @@ struct PoolDeleter {
 
 #### 2. PoolDeleter<T[]> - Array Specialization
 
-Handling arrays requires special care: destructors must run in **reverse order** (LIFO).
+Handling arrays requires special care: destructors must run in **reverse order** (LIFO), and the deleter must know the element count. This implementation stores the count in the **deleter object** (not in a second size prefix in front of the array). `Pool::allocate` still writes its own allocation header in front of the user pointer for slab routing.
 
 ```cpp
 template<typename T>
 struct PoolDeleter<T[]> {
     spallocator::Pool& pool;
+    const std::size_t size;  // element count captured at construction
 
-    void operator()(T* p) const {
+    void operator()(T* p) const {  // Note: T*, not T*[]
         if (p) {
-            // Read size from header (stored before array)
-            std::byte* header_ptr = reinterpret_cast<std::byte*>(p) - sizeof(std::size_t);
-            std::size_t size = *reinterpret_cast<std::size_t*>(header_ptr);
-
             // Call destructors in reverse order using ranges
             std::ranges::for_each(
                 std::views::counted(p, size) | std::views::reverse,
                 [](T& elem){ elem.~T(); }
             );
 
-            // Deallocate from header start
-            pool.deallocate(header_ptr);
+            // Deallocate the user pointer; Pool reads its own header behind p
+            pool.deallocate(reinterpret_cast<std::byte*>(p));
         }
     }
 };
@@ -440,26 +508,28 @@ std::ranges::for_each(
 );
 ```
 
-**Size header trick**: Arrays store their size in a header immediately before the array data. This enables the deleter to know how many destructors to call without external metadata.
+**Count in the deleter (not a second in-memory size header):** `std::unique_ptr` type-erases the deleter by value, so `PoolDeleter<T[]>{pool, size}` can carry the element count. That avoids a second `std::size_t` prefix in front of the array. The only bytes before the array elements are `Pool`'s normal allocation header (see [Memory Layout](#memory-layout)).
 
-Memory layout for arrays:
 ```
-┌─────────────┬────────────────────────────────┐
-│ std::size_t │   Array elements (N × sizeof(T)) │
-│   (count)   │                                │
-└─────────────┴────────────────────────────────┘
-^             ^
-│             └─ User pointer (returned to caller)
-└─ Header pointer (used for deallocation)
+┌──────────────────────┬──────────────────────────────────┐
+│ Pool allocation hdr  │   Array elements (count × sizeof(T)) │
+│ (max(8, align) bytes)│                                      │
+└──────────────────────┴──────────────────────────────────────┘
+^                      ^
+│                      └─ User pointer held by unique_ptr
+└─ Slab slot base (Pool recovers via header_size)
+
+Element count lives in PoolDeleter::size, not in a second prefix.
 ```
 
-**Alignment considerations**: The header size is included in the alignment calculation to ensure the array itself is properly aligned:
+**Alignment considerations**: Array allocation requests alignment of at least `alignof(std::size_t)` so the payload meets the stricter of the element type and that floor (matching how `Pool` sizes its header):
 ```cpp
 std::size_t alignment = alignof(ElementType) > alignof(std::size_t) ?
                         alignof(ElementType) : alignof(std::size_t);
+std::byte* mem = pool.allocate(sizeof(ElementType) * size, alignment);
 ```
 
-This ensures both the header can store `std::size_t` safely AND the array meets its type's alignment requirements.
+`pool.allocate` returns an already-aligned user pointer; the factory constructs elements at that address with placement new.
 
 #### 3. make_pool_unique - Factory Functions
 
@@ -497,24 +567,20 @@ constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, std::size
 {
     using ElementType = std::remove_extent_t<T>;
 
-    // Allocate header + array
-    std::size_t header_size = sizeof(std::size_t);
     std::size_t array_size = sizeof(ElementType) * size;
     std::size_t alignment = alignof(ElementType) > alignof(std::size_t) ?
                             alignof(ElementType) : alignof(std::size_t);
 
-    std::byte* mem = pool.allocate(header_size + array_size, alignment);
+    // Pool writes its own allocation header; mem is the user pointer
+    std::byte* mem = pool.allocate(array_size, alignment);
+    ElementType* array_ptr = reinterpret_cast<ElementType*>(mem);
 
-    // Store size in header
-    *reinterpret_cast<std::size_t*>(mem) = size;
-
-    // Construct elements
-    ElementType* array_ptr = reinterpret_cast<ElementType*>(mem + header_size);
     for (std::size_t i = 0; i < size; ++i) {
         new (&array_ptr[i]) ElementType();
     }
 
-    return unique_pool_ptr<T>(array_ptr, PoolDeleter<T>{pool});
+    // Element count travels with the deleter, not a second in-memory prefix
+    return unique_pool_ptr<T>(array_ptr, PoolDeleter<T>{pool, size});
 }
 ```
 
@@ -526,6 +592,8 @@ constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, std::size
 
 **Default initialization**: Each array element is default-constructed with `ElementType()`. For types with non-trivial constructors, this ensures proper initialization. For primitive types (int, float), this zero-initializes.
 
+**Deleter-held size vs pool header**: Two different “sizes” are in play — `PoolDeleter::size` is the **element count** for destructor loops; `Pool`’s header stores the **byte footprint** for slab routing. Do not confuse them.
+
 **Exception safety consideration**: If construction of element N throws, elements 0..N-1 need cleanup. This implementation doesn't handle that (educational simplification). Production code would use a guard:
 ```cpp
 std::size_t constructed = 0;
@@ -535,7 +603,6 @@ try {
         ++constructed;
     }
 } catch (...) {
-    // Destroy already-constructed elements in reverse
     while (constructed > 0) {
         array_ptr[--constructed].~ElementType();
     }
@@ -593,7 +660,7 @@ objects.push_back(spallocator::make_pool_unique<MyClass>(pool, args...));
 | **Allocation source** | System allocator (new) | Custom pool allocator |
 | **Deallocation** | `delete` | `pool.deallocate()` |
 | **Destructor handling** | Automatic | Explicit call (placement new counterpart) |
-| **Array support** | Yes (`T[]`) | Yes, with size header for reverse destruction |
+| **Array support** | Yes (`T[]`) | Yes; element count in `PoolDeleter`, reverse destruction |
 | **Exception safety** | Full | Partial (educational implementation) |
 | **Alignment** | Standard alignment | Explicit alignment specification |
 | **Performance** | General-purpose | Optimized for specific size classes |
@@ -656,7 +723,7 @@ auto arr = make_pool_shared<int[]>(pool, 100);        // Default init
 auto arr2 = make_pool_shared<int[]>(pool, 100, 42);   // Value init
 ```
 
-Unlike `make_pool_unique` which needs size tracking in a header, `shared_ptr` tracks array size internally in the control block.
+Unlike `make_pool_unique` (which stores the element count in `PoolDeleter`), `shared_ptr` tracks array size internally in the control block.
 
 ### Learning Value
 
@@ -1151,8 +1218,8 @@ With SpinLock integration:
 
 **ThreadSanitizer validation**:
 ```bash
-BUILD=threadsan make
-./obj/threadsan/tester
+make BUILD_TYPE=threadsan test
+# or: ./obj/threadsan/tester
 ```
 
 ThreadSanitizer confirms:
@@ -1160,7 +1227,7 @@ ThreadSanitizer confirms:
 - Proper synchronization through SpinLock
 - Correct happens-before relationships
 
-See `docs/SpinLock_Analysis.md` for detailed correctness analysis.
+See `spallocator/docs/SpinLock_Analysis.md` for detailed correctness analysis.
 
 ---
 
@@ -1316,30 +1383,30 @@ The claim requires careful explanation:
 
 | Component | Overhead | Per-Allocation Impact |
 |-----------|----------|----------------------|
-| Allocation header | 4 bytes | Fixed per allocation |
+| Allocation header | `max(8, alignment)` bytes (default 8) | Fixed per allocation |
 | Slab map bitset | 1 bit per slot | Amortized across all slots in slab |
 | Availability map | 1 bit per slab | Amortized across all slabs |
 | Address map | ~24 bytes per slab | Amortized across all slots in slab |
 
-**Example Calculation** (for 128-byte allocations):
-- 4KB slab holds 32 slots
-- Per-allocation overhead: 4 bytes (header) + 1/32 bit (slab map) ≈ 4.004 bytes
-- Overhead percentage: 4.004 / 128 ≈ 3.1%
+**Example Calculation** (128-byte **user** request, default alignment → 136-byte footprint → 192B class):
+- 4KB slab of 192B slots holds 21 slots (4096 / 192)
+- Per-allocation header: 8 bytes on a 128-byte request ≈ 6.25% before bitsets / class waste
+- Additional internal fragmentation: 192 − 136 = 56 bytes of unused slot capacity
 
-For smaller allocations, the percentage is higher (25% for 16-byte allocations), but this is acceptable because:
+For smaller user requests the header percentage is higher (e.g. N=16 → 24-byte footprint in a 32B class), but this is acceptable because:
 1. Small allocations are typically short-lived
 2. The bitset overhead is shared across all allocations in the slab
 3. Alternative approaches (free lists) would have similar or worse overhead
 
 ### Fragmentation Analysis
 
-**Internal Fragmentation**: Wasted space within allocated slots
+**Internal Fragmentation**: Wasted space within allocated slots after the header is included in the footprint.
 
-Example: 100-byte allocation in 128-byte slot wastes 28 bytes (22%)
+Example: user requests 100 bytes → footprint 108 → 128B class → 20 bytes unused in the slot (~16% of the slot). Comparing 100 to 128 without the header understates how `selectSlab` actually chooses.
 
 Mitigation: Multiple size classes reduce waste. Intermediate sizes (48, 96, 192, 384, 768) are specifically chosen to minimize gaps.
 
-Worst case: Just over 50% in the gap between size classes (e.g., 129-byte allocation in 192-byte slot).
+Worst case: Just over 50% in the gap between size classes (e.g., footprint 129 → 192B class).
 
 **External Fragmentation**: Inability to satisfy large allocations despite free memory
 
@@ -1571,8 +1638,8 @@ In production, this output can be disabled via compile-time flags or preprocesso
 - Educational value: Performance analysis techniques
 
 **Memory Alignment**
-- Support for aligned allocations (cache lines, SIMD)
-- Maintaining alignment with 4-byte header
+- ✅ Power-of-two alignments 4…16 via `allocate(size, alignment)` (COMPLETED; see [Memory Layout](#memory-layout))
+- Wider alignments (cache line / SIMD 32–64) still future work
 - Educational value: Hardware-aware programming
 
 **STL Allocator Interface**
@@ -1607,9 +1674,9 @@ In production, this output can be disabled via compile-time flags or preprocesso
 
 ## Demo Programs
 
-The project includes three demonstration programs showcasing different aspects of the allocator:
+Tests live under `test/`; demos under `demos/`. Default `BUILD_TYPE` is `addrsan`.
 
-### 1. `tester.cpp` - Comprehensive Unit Tests
+### 1. `test/tester.cpp` - Comprehensive Unit Tests
 
 The main test suite covering:
 - **Core Slab Operations**: Allocation, deallocation, growth
@@ -1624,19 +1691,23 @@ The main test suite covering:
 **Build and run:**
 ```bash
 make
-./obj/memsan/tester
+make test
+# or: ./obj/addrsan/tester
 ```
 
 **Sanitizer builds:**
 ```bash
-# AddressSanitizer + LeakSanitizer (default)
-BUILD=memsan make && ./obj/memsan/tester
+# AddressSanitizer + LSan + UBSan (default)
+make BUILD_TYPE=addrsan test
+
+# MemorySanitizer + UBSan (Clang)
+make BUILD_TYPE=memsan test
 
 # ThreadSanitizer (for race condition detection)
-BUILD=threadsan make && ./obj/threadsan/tester
+make BUILD_TYPE=threadsan test
 ```
 
-### 2. `demo_spalloc_shared_ptr.cpp` - Shared Pointer Usage
+### 2. `demos/demo_spalloc_shared_ptr.cpp` - Shared Pointer Usage
 
 Demonstrates `make_pool_shared` and `PoolAllocator<T>`:
 
@@ -1661,10 +1732,11 @@ auto arr = spallocator::make_pool_shared<int[]>(pool, 100);
 
 **Build and run:**
 ```bash
-make && ./obj/memsan/demo_spalloc_shared_ptr
+make demo
+# or: ./obj/addrsan/demo_spalloc_shared_ptr
 ```
 
-### 3. `demo_lifetime_observer.cpp` - Object Lifetime Tracking
+### 3. `demos/demo_lifetime_observer.cpp` - Object Lifetime Tracking
 
 Demonstrates `LifetimeObserver` for safe asynchronous callbacks:
 
@@ -1698,7 +1770,8 @@ public:
 
 **Build and run:**
 ```bash
-make && ./obj/memsan/demo_lifetime_observer
+make
+./obj/addrsan/demo_lifetime_observer
 ```
 
 ### Running All Demos
@@ -1707,9 +1780,9 @@ Quick verification that everything works:
 ```bash
 make clean
 make
-./obj/memsan/tester
-./obj/memsan/demo_spalloc_shared_ptr
-./obj/memsan/demo_lifetime_observer
+make test
+./obj/addrsan/demo_spalloc_shared_ptr
+./obj/addrsan/demo_lifetime_observer
 ```
 
 ### Educational Value

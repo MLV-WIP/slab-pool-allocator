@@ -6,26 +6,82 @@ A modern C++ implementation of a slab-based memory pool allocator with advanced 
 
 This project demonstrates high-performance memory allocation using the slab allocator pattern, featuring multiple size classes, automatic slab management, and a production-quality spinlock implementation. Designed to be both educational and production-ready, showcasing advanced C++ techniques and memory management concepts.
 
+**Layout:**
+- `spallocator/` — header-only library
+- `test/` — Google Test suite (`tester.cpp`)
+- `demos/` — example programs
+- `IMPLEMENTATION.md` — deep design and learning guide
+
 ## Key Features
 
-- **12 Optimized Size Classes** - 16 bytes to 1 KB with intelligent intermediate sizes (48, 96, 192, 384, 768)
-- **O(1) Allocation/Deallocation** - Bitset-based tracking with two-level availability maps
-- **Thread-Safe Pool** - Two-level locking (pool + per-slab) for optimal concurrency
+- **12 Optimized Size Classes** - 16 bytes to 1 KB with intermediate sizes (48, 96, 192, 384, 768)
+- **Fast Allocation / Lookup Deallocation** - Bitset-based tracking; deallocation uses an address map (O(log n) in slab count)
+- **Thread-Safe Pool** - Two-level locking (pool + per-slab) for concurrent size classes
 - **Automatic Slab Growth** - Dynamic allocation of new slabs on demand
 - **Large Allocation Fallback** - Seamless handling of allocations > 1 KB
 - **Smart Pointer Support** - `make_pool_unique` and `make_pool_shared` for RAII-based memory management
 - **Standard Allocator Interface** - `PoolAllocator<T>` for STL container integration
 - **Lifetime Observer** - `LifetimeObserver` for safe asynchronous callbacks and event handlers
 - **Production-Ready SpinLock** - TTAS with three-phase contention handling (spin → backoff → block)
-- **Modern C++20/23** - Template metaprogramming, user-defined literals, atomic operations, ranges, concepts
+- **Modern C++20/23** - Template metaprogramming, user-defined literals, atomics, ranges, concepts
 
 ## Quick Start
 
 ### Build and Test
 
+The Makefile works with defaults (`BUILD_TYPE=addrsan`) or with `./configure` for a persisted `config.mk`.
+
 ```bash
+# Optional: generate config.mk
+./configure --enable-tests --enable-demo
+
+# Build all enabled targets (tests + demos)
 make
-./tester
+
+# Run the unit test suite
+make test
+```
+
+Binaries land under `obj/<build_type>/` (default `obj/addrsan/`), with convenience symlinks in `obj/`:
+
+```bash
+./obj/addrsan/tester
+# or
+./obj/tester
+```
+
+**Build types** (override without re-running configure):
+
+```bash
+make BUILD_TYPE=debug       # unoptimized debug
+make BUILD_TYPE=release     # optimized
+make BUILD_TYPE=addrsan     # AddressSanitizer + LSan + UBSan (default)
+make BUILD_TYPE=memsan      # MemorySanitizer + UBSan (Clang)
+make BUILD_TYPE=threadsan   # ThreadSanitizer + UBSan
+```
+
+Google Test is required for `make test`. If GTest is not found, tests are disabled automatically.
+
+### Demos
+
+Sources live in `demos/`. After `make`:
+
+| Program | Source | What it shows |
+|---------|--------|----------------|
+| `demo_spalloc_shared_ptr` | `demos/demo_spalloc_shared_ptr.cpp` | `make_pool_shared`, sharing, `PoolAllocator` with `std::vector` |
+| `demo_lifetime_observer` | `demos/demo_lifetime_observer.cpp` | `LifetimeObserver` for safe async / event-style callbacks |
+
+```bash
+# Build everything, then run the shared_ptr demo (Makefile `demo` target)
+make demo
+
+# Or run either binary directly (default build type = addrsan)
+./obj/addrsan/demo_spalloc_shared_ptr
+./obj/addrsan/demo_lifetime_observer
+
+# Same via obj/ symlinks
+./obj/demo_spalloc_shared_ptr
+./obj/demo_lifetime_observer
 ```
 
 ### Basic Usage
@@ -80,7 +136,7 @@ int main() {
 16B, 32B, 48B, 64B, 96B, 128B, 192B, 256B, 384B, 512B, 768B, 1024B
 ```
 
-Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation significantly.
+Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs are selected by **total footprint** (requested size + allocation header), not the user size alone — see [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## Performance Characteristics
 
@@ -90,7 +146,7 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation signifi
 | Deallocation | O(log n) | Address map lookup (n = slabs) |
 | SpinLock lock/unlock | O(1) | No contention case |
 
-**Space Overhead**: ~3% for typical allocations (4-byte header + bitset amortization)
+**Space Overhead**: Default header is 8 bytes (`header_size = max(8, alignment)`), so ~6% for a 128-byte user request before bitset amortization. Details in [IMPLEMENTATION.md](IMPLEMENTATION.md#memory-layout).
 
 ## SpinLock Features
 
@@ -98,10 +154,8 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation signifi
 - **TTAS (Test-and-Test-and-Set)** - Reduces cache coherency traffic
 - **Escalating Backoff** - Randomized 1-100ns initial wait, additive doubling on contention
 - **STL Compatible** - Works with `std::scoped_lock` and `std::unique_lock` (BasicLockable)
-- **Memory Ordering** - Proper acquire/release semantics with relaxed optimization
-- **Efficient Blocking** - Uses C++20 `atomic_flag::wait()` after backoff exhaustion
 - **TSan Annotations** - ThreadSanitizer integration for race detection
-- **Production Ready** - Analyzed and validated (see `docs/SpinLock_Analysis.md`)
+- **Analysis** - See [`spallocator/docs/SpinLock_Analysis.md`](spallocator/docs/SpinLock_Analysis.md)
 
 ## Requirements
 
@@ -112,29 +166,19 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation signifi
 
 ## Documentation
 
-- **[IMPLEMENTATION.md](IMPLEMENTATION.md)** - Detailed implementation guide with educational insights
-- **[docs/SpinLock_Analysis.md](spallocator/docs/SpinLock_Analysis.md)** - Comprehensive SpinLock correctness and performance analysis
-- **Source Files** - Extensive inline comments explaining design decisions
+- **[IMPLEMENTATION.md](IMPLEMENTATION.md)** — Detailed implementation guide: memory layout, size-class selection, smart pointers, concurrency, and educational notes. Start here after the Quick Start above.
+- **[SpinLock Analysis](spallocator/docs/SpinLock_Analysis.md)** — SpinLock correctness and performance analysis
+- **Source Files** — Inline comments explaining design decisions
 
 ## Testing
 
-Comprehensive test suite covering:
-- Slab creation and allocation/deallocation
-- Pool size class selection and thread safety
-- Smart pointer lifecycle (`unique_ptr` and `shared_ptr`)
-- Proper destructor invocation and memory cleanup
-- SpinLock contention handling and multi-threading
-- STL compatibility and `PoolAllocator` integration
+The suite in `test/tester.cpp` covers slab growth, size-class routing, thread safety, smart pointers, destructor invocation, SpinLock contention, and `PoolAllocator` / STL integration.
 
-**Build targets**:
-- `make` - Build all (tester + demo_shared_ptr + demo_lifetime_observer)
-- `BUILD=threadsan make` - Build with ThreadSanitizer for race detection
-- `BUILD=memsan make` - Build with AddressSanitizer + UBSanitizer (default)
-
-**Demo programs**:
-- `./obj/memsan/tester` - Run all unit tests
-- `./obj/memsan/demo_spalloc_shared_ptr` - Demonstrate `make_pool_shared` and `PoolAllocator<T>` usage
-- `./obj/memsan/demo_lifetime_observer` - Demonstrate `LifetimeObserver` for async callback safety
+```bash
+make test
+# equivalent:
+make && ./obj/addrsan/tester
+```
 
 ## Completed Features
 
@@ -151,13 +195,7 @@ Comprehensive test suite covering:
 
 ## Learning Value
 
-This project demonstrates:
-- Template metaprogramming and compile-time optimization
-- Modern C++20/23 features (atomics, literals, formatting, ranges, concepts)
-- Memory management patterns (slab allocation, bitset tracking, RAII)
-- Custom deleters and smart pointer integration
-- Concurrency primitives (TTAS, memory ordering, backoff strategies)
-- Performance optimization techniques
+This project demonstrates template metaprogramming, modern C++20/23 features, slab allocation and bitset tracking, custom deleters / smart pointers, concurrency primitives (TTAS, memory ordering, backoff), and performance-oriented design. See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the full walkthrough.
 
 ## References
 
@@ -167,7 +205,7 @@ This project demonstrates:
 
 ## License
 
-BSD 3-Clause License - Copyright (c) 2025, Michael VanLoon
+BSD 3-Clause License - Copyright (c) 2025-2026, Michael VanLoon
 
 See LICENSE section in source files for full text.
 
