@@ -69,7 +69,7 @@ Sources live in `demos/`. After `make`:
 | Program | Source | What it shows |
 |---------|--------|----------------|
 | `demo_spalloc_shared_ptr` | `demos/demo_spalloc_shared_ptr.cpp` | `make_pool_shared`, sharing, `PoolAllocator` with `std::vector` |
-| `demo_lifetime_observer` | `demos/demo_lifetime_observer.cpp` | `LifetimeObserver` for safe async / event-style callbacks |
+| `demo_lifetime_observer` | `demos/demo_lifetime_observer.cpp` | `LifetimeObserver`: single-strand callbacks + cross-thread mutex pattern |
 
 ```bash
 # Build everything, then run the shared_ptr demo (Makefile `demo` target)
@@ -124,7 +124,7 @@ int main() {
 | **SlabProxy** | `spallocator/slab.hpp` | Handles large allocations (>1KB) via standard allocators |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII memory management |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
-| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Observer pattern for safe object lifetime tracking in async contexts |
+| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Intrusive weak liveness tracking; pair `isAlive()` with a mutex/strand for object use |
 | **SpinLock** | `spallocator/spinlock.hpp` | Production-ready lock with TTAS, backoff, and TSan annotations |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
 
@@ -177,7 +177,7 @@ make && ./obj/addrsan/tester
 - ✅ Smart pointer support: `make_pool_unique` and `make_pool_shared`
 - ✅ Thread-safe Pool with two-level locking strategy
 - ✅ STL allocator interface: `PoolAllocator<T>`
-- ✅ Object lifetime observer for asynchronous callbacks
+- ✅ Object lifetime observer (atomic liveness; synchronize object use)
 
 ## Future Work
 

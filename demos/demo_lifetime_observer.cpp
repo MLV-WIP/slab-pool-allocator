@@ -3,7 +3,7 @@
  */
 
 #include <functional>
-#include <thread>
+#include <mutex>
 #include "spallocator/helper.hpp"
 #include "spallocator/lifetimeobserver.hpp"
 
@@ -95,11 +95,16 @@ int main()
         delete proc;
 
         println("   After deletion - observer.isAlive(): {}", observer.isAlive());
-        println("   Safe to check without dereferencing pointer!\n");
+        println("   Safe to check liveness without dereferencing the raw pointer!\n");
     }
 
-    // Example 3: Asynchronous callback scenario
-    println("3. Asynchronous callback with event engine:");
+    // Example 3: Single-threaded / single-strand async callbacks
+    //
+    // Legitimate and common: one event thread (e.g. Asio io_context run on a
+    // single thread, or a UI/event loop) posts both destruction and callbacks.
+    // Sequencing is the protocol — destroy and the callback never overlap, so
+    // isAlive()-then-use needs no mutex. See example 4 when that is not true.
+    println("3. Single-threaded callback (e.g. Asio one event thread):");
     {
         DataProcessor* proc = new DataProcessor(777);
         EventEngine engine;
@@ -129,8 +134,46 @@ int main()
     }
     println("");
 
-    // Example 4: Multiple observers tracking same object
-    println("4. Multiple observers tracking same object:");
+    // Example 4: Cross-thread use — mutex covers check + use + destroy
+    //
+    // When another thread can destroy the object while a callback runs,
+    // isAlive() alone is TOCTOU. Hold an external mutex across both the
+    // check/use path and delete (member mutex unlocked before ~LifetimeObserver
+    // is too late). Prefer weak_ptr::lock() if you need ownership upgrade.
+    println("4. Cross-thread callback (mutex avoids TOCTOU):");
+    {
+        std::mutex access_mu;
+        DataProcessor* proc = new DataProcessor(888);
+        EventEngine engine;
+
+        engine.registerCallback([&access_mu, &proc, alive = proc->getObserver()]() {
+            std::lock_guard lock(access_mu);
+            if (!alive)
+            {
+                println("   Callback: Object already destroyed, skipping");
+                return -1;
+            }
+            println("   Callback: Processing data, result = {}", proc->process());
+            return proc->process();
+        });
+
+        println("   Firing event while object is alive:");
+        engine.fireEvent();
+
+        println("   Deleting object under the access mutex...");
+        {
+            std::lock_guard lock(access_mu);
+            delete proc;
+            proc = nullptr;
+        }
+
+        println("   Firing event after object deleted:");
+        engine.fireEvent();
+    }
+    println("");
+
+    // Example 5: Multiple observers tracking same object
+    println("5. Multiple observers tracking same object:");
     {
         DataProcessor* proc = new DataProcessor(123);
 
@@ -152,8 +195,8 @@ int main()
     }
     println("");
 
-    // Example 5: RAII with stack-based objects
-    println("5. Stack-based object with observer:");
+    // Example 6: RAII with stack-based objects
+    println("6. Stack-based object with observer:");
     {
         DataProcessor proc(555);
         LifetimeObserver observer = proc.getObserver();
@@ -164,11 +207,12 @@ int main()
     println("   Stack object destroyed by RAII\n");
 
     println("=== Demo completed ===");
-    println("LifetimeObserver safely tracks object lifetimes!");
+    println("LifetimeObserver tracks liveness with atomic control-block counts.");
     println("Ideal for:");
-    println("  - Event callbacks that may fire after object deletion");
-    println("  - Asynchronous operations with uncertain lifetimes");
+    println("  - Single-strand event callbacks (Asio one thread, UI loops, …)");
+    println("  - Cross-thread use only with a mutex/strand that also covers destroy");
     println("  - Breaking reference cycles without shared_ptr overhead");
+    println("Not a substitute for weak_ptr::lock() when you need ownership upgrade.");
 
     return 0;
 }

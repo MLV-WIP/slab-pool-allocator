@@ -922,28 +922,35 @@ The `ControlBlock` is the mediator pattern implementation:
 
 ### Usage Pattern
 
+Hold an **external** mutex across both callback use and `delete`. A member mutex
+unlocked at the end of the derived destructor is too late: `~LifetimeObserver`
+(which drops the owner count) runs *after* that unlock.
+
 ```cpp
 class AsyncService: public LifetimeObserver
 {
 public:
-    AsyncService() {  // Create owner reference
-        // Register callback that captures observer
-        event_loop.on_data([alive = getObserver()](const Data& d)
-        {
-            // Liveness check is race-free; synchronize before using *this
-            if (alive)
-            {
-                process_data(d);  // still needs your object-access protocol
-            }
-        });
-    }
-
-    ~AsyncService()
-    {
-        // Control block survives destruction
-        // Callbacks can still safely check observer.isAlive() → false
-    }
+    void process_data(const Data& d);
 };
+
+std::mutex mu;  // outlives the service
+AsyncService* svc = new AsyncService();
+
+event_loop.on_data([&mu, svc, alive = svc->getObserver()](const Data& d)
+{
+    std::lock_guard lock(mu);
+    if (alive)
+    {
+        svc->process_data(d);  // safe: delete cannot run while we hold mu
+    }
+});
+
+{
+    std::lock_guard lock(mu);
+    delete svc;  // full dtor chain (including owner release) runs under lock
+    svc = nullptr;
+}
+// Later callbacks take the lock, see isAlive() == false, and skip
 ```
 
 ### Key Components
@@ -1008,9 +1015,10 @@ bool isAlive() const {
 
 **Usage in Callbacks**:
 ```cpp
-auto callback = [observer = obj.getObserver()]() {
-    if (observer) {  // operator bool() = isAlive()
-        // Liveness is race-free; synchronize before using the observed object
+auto callback = [&mu, &obj, observer = obj.getObserver()]() {
+    std::lock_guard lock(mu);  // same mutex teardown holds around delete
+    if (observer) {            // operator bool() = isAlive()
+        obj->use();            // safe under the lock
     }
 };
 ```
@@ -1136,8 +1144,8 @@ This implementation teaches:
 4. **Move Semantics**: Efficient ownership transfer and moved-from object validity
 5. **Copy Assignment**: Exception-safe assignment with reference swapping
 6. **RAII**: Automatic cleanup through scope (destructor calls release)
-7. **Async Safety**: Safe callback patterns when lifetime checks follow the thread model
-8. **Control Flow**: Checking preconditions before accessing objects
+7. **Async Safety**: Liveness checks plus an external sync protocol (mutex/strand)
+8. **Control Flow**: Checking preconditions before accessing objects; liveness ≠ ownership
 
 ### Common Pitfalls
 
@@ -1150,42 +1158,56 @@ event_loop.on_event([obs = obj]() {  // Wrong: makes owner copy
     // This prevents obj from being destroyed!
 });
 
-// ✅ RIGHT - callback holds weak reference
+// ✅ RIGHT - callback holds weak reference via getObserver()
 LifetimeObserver obj;
-event_loop.on_event([obs = obj.getObserver()]() {  // Correct: weak reference
-    if (obs.isAlive()) {
-        // Safe to proceed
-    }
+event_loop.on_event([obs = obj.getObserver()]() {
+    // Still must synchronize before using the observed object (see #2)
+    if (!obs.isAlive())
+        return;
 });
 ```
 
-#### 2. Forgetting to Check isAlive()
+#### 2. isAlive() ≠ Safe Access (TOCTOU)
+
+`isAlive()` answers “is there still an owner ref?” It does **not** pin the object.
+Atomic counts close data races on the control block; they do **not** make
+check-then-use of a raw pointer race-free across threads.
 
 ```cpp
-// ❌ WRONG - object might be destroyed
+// ❌ WRONG - object can be destroyed between check and use
+if (observer.isAlive()) {
+    use_object();  // TOCTOU on another thread
+}
+
+// ❌ WRONG - checked once, then used later with no sync
 auto observer = obj.getObserver();
-// ... later ...
-obj_method();  // CRASH if obj was destroyed
+// ... later, another thread may destroy obj ...
+obj_method();  // CRASH / UAF if destroyed
 
-// ✅ RIGHT - always check before accessing
-if (observer.isAlive()) {
-    obj_method();  // Safe
-}
-```
-
-#### 3. Race Conditions (Multi-threaded)
-
-```cpp
-// ❌ Potential race: object destroyed between check and use
-if (observer.isAlive()) {
-    // Object might be destroyed here by another thread
-    use_object();  // RACE CONDITION
-}
-
-// ✅ Use synchronization if accessing from multiple threads
+// ✅ RIGHT - mutex (or strand) also covers destruction
 std::lock_guard lock(mutex);
 if (observer.isAlive()) {
     use_object();  // Protected
+}
+
+// ✅ ALSO RIGHT - single-threaded / same-strand event loop where
+// destroy and the callback never overlap (sequencing is the protocol)
+```
+
+Prefer `std::weak_ptr::lock()` when you need an ownership upgrade instead of an
+external mutex.
+
+#### 3. Forgetting to Check isAlive() at All
+
+```cpp
+// ❌ WRONG - no liveness check
+auto observer = obj.getObserver();
+obj_method();  // UAF if obj was already destroyed on this strand
+
+// ✅ RIGHT - check under your access protocol
+std::lock_guard lock(mutex);
+if (observer.isAlive()) {
+    obj_method();
 }
 ```
 
@@ -1873,32 +1895,40 @@ make demo
 
 ### 3. `demos/demo_lifetime_observer.cpp` - Object Lifetime Tracking
 
-Demonstrates `LifetimeObserver` for safe asynchronous callbacks:
+Demonstrates both the common single-strand callback pattern and the
+cross-thread mutex pattern when destroy can race with use:
 
 ```cpp
-class EventHandler : public LifetimeObserver {
-public:
-    void registerCallback(std::function<void()> cb) {
-        // Capture weak reference to avoid preventing destruction
-        event_loop.on_event([alive = getObserver(), cb]() {
-            if (alive) {  // Liveness check; synchronize if multi-threaded
-                cb();
-            }
-        });
-    }
-};
+// Example 3 — single event thread (e.g. Asio): sequencing is enough
+engine.on_event([&obj, alive = obj->getObserver()]() {
+    if (alive)
+        obj->do_work();
+});
+
+// Example 4 — cross-thread: external mutex covers check/use and delete
+engine.on_event([&mu, &obj, alive = obj->getObserver()]() {
+    std::lock_guard lock(mu);
+    if (alive)
+        obj->do_work();
+});
+{
+    std::lock_guard lock(mu);
+    delete obj;
+}
 ```
 
 **Key Examples:**
 1. **Basic Ownership Tracking** - Creating and destroying owner references
 2. **Weak References** - Observers that don't prevent object destruction
-3. **Async Callbacks** - Safe callback patterns without race conditions
-4. **Multiple Observers** - Many observers tracking a single object
-5. **Stack-Based Objects** - RAII with automatic lifetime management
+3. **Single-strand Async Callbacks** - Asio-style one event thread; no mutex required
+4. **Cross-thread Callbacks** - Mutex-guarded check-then-use (avoids TOCTOU)
+5. **Multiple Observers** - Many observers tracking a single object
+6. **Stack-Based Objects** - RAII with automatic lifetime management
 
 **Features Demonstrated:**
 - Creating weak observer references via `getObserver()`
-- Safe liveness checking via `isAlive()` and `operator bool()`
+- Race-free liveness checking via `isAlive()` / `operator bool()`
+- Single-strand vs cross-thread access protocols
 - Reference counting mechanics (owner vs. observer counts)
 - Move semantics and moved-from object validity
 - Control block survival after original object destruction

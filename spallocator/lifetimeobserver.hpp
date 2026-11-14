@@ -57,19 +57,19 @@
 //   mutex that also covers destruction.
 //
 // A common use case goes something like this:
-// - An object A derives from LifetimeObserver.
+// - An object A derives from LifetimeObserver and shares a mutex (or strand)
+//   that also covers A's destructor / teardown.
 // - Object A registers a callback or event handler with some external
 //   system (e.g., an event loop, a timer, a network handler).
 // - The callback captures a weak reference to A's LifetimeObserver via
-//   getObserver().
-// - The callback is used while the object A is alive.
-// - When the callback is invoked, it first checks if the object
-//   is still alive by calling isAlive() on the captured LifetimeObserver.
-// - If isAlive() returns true, the callback proceeds to use object A only
-//   under an appropriate synchronization protocol for that object.
-// - At some point, A is destroyed but the callback handler still exists.
-// - If isAlive() returns false, the callback safely exits without
-//   accessing the destroyed object.
+//   getObserver() (not an owner copy).
+// - When the callback runs, it locks that same mutex, then checks isAlive().
+// - If isAlive() is true under the lock, the object cannot be destroyed until
+//   the lock is released, so member access is safe.
+// - If isAlive() is false, the callback exits without touching A.
+// - Same-thread / single-strand event loops are also fine when destruction
+//   and the callback never overlap; cross-thread use needs the mutex (or
+//   shared_ptr / weak_ptr::lock() instead).
 //
 // This implementation is abstractly based on the Observer Pattern, with
 // a specialization based on the Mediator Pattern to manage both strong

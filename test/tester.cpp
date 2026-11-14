@@ -33,6 +33,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -1134,6 +1135,8 @@ TEST(LifetimeObserverTest, SelfAssignment)
 }
 */
 
+// Single-threaded / same-strand callback: destroy and use never overlap, so
+// isAlive()-then-use needs no mutex (e.g. Asio on one event thread).
 TEST(LifetimeObserverTest, TestSimpleCallback)
 {
     class TestObject: public LifetimeObserver
@@ -1153,11 +1156,10 @@ TEST(LifetimeObserverTest, TestSimpleCallback)
         {
             bool objIsAlive = false;
 
-            // We're holding a weak reference to the object via obj_lifetime.
-            // Check if the object is still alive before using it.
+            // Weak observer: check liveness before using the raw pointer.
+            // Safe here because this test is single-threaded (sequencing).
             if (obj_lifetime.isAlive())
             {
-                // Object is still alive and valid. We can safely use it.
                 objIsAlive = obj->isAlive();
             }
 
@@ -1195,13 +1197,95 @@ TEST(LifetimeObserverTest, TestSimpleCallback)
 
         delete obj;
 
-        // Emulate a callback on an interface that is holding a weak reference
-        // to our object after the object has been deleted.
+        // Emulate a callback holding a weak reference after delete.
         EXPECT_FALSE(holder.testAlive(false));
     }
 }
 
 
+// Cross-thread variant of TestSimpleCallback: external mutex covers check/use
+// and delete (isAlive() alone would be TOCTOU).
+TEST(LifetimeObserverTest, TestSimpleCallbackThreaded)
+{
+    class TestObject: public LifetimeObserver
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+    };
+
+    struct TestObjHolder
+    {
+        TestObjHolder(TestObject*& p, std::mutex& m)
+            : obj(p), mu(m), obj_lifetime(p->getObserver()) { }
+        TestObjHolder() = delete;
+        ~TestObjHolder() = default;
+
+        bool testAlive(bool assumeAlive)
+        {
+            std::lock_guard lock(mu);
+            bool objIsAlive = false;
+            if (obj_lifetime.isAlive())
+            {
+                objIsAlive = obj->isAlive();
+            }
+            EXPECT_EQ(objIsAlive, assumeAlive);
+            return objIsAlive;
+        }
+
+        void poke()
+        {
+            std::lock_guard lock(mu);
+            if (obj_lifetime.isAlive())
+            {
+                (void)obj->isAlive();
+            }
+        }
+
+    private:
+        TestObject*& obj;
+        std::mutex& mu;
+        LifetimeObserver obj_lifetime;
+    };
+
+    std::mutex access_mu;
+    TestObject* obj = new TestObject();
+    TestObjHolder holder(obj, access_mu);
+
+    std::atomic<bool> start{false};
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i)
+    {
+        readers.emplace_back([&]() {
+            while (!start.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+            for (int n = 0; n < 10000; ++n)
+            {
+                holder.poke();
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    {
+        std::lock_guard lock(access_mu);
+        delete obj;
+        obj = nullptr;
+    }
+
+    for (auto& t : readers)
+    {
+        t.join();
+    }
+
+    EXPECT_FALSE(holder.testAlive(false));
+}
+
+
+// Single-threaded deferred callbacks (same-strand event engine).
 TEST(LifetimeObserverTest, TestDeferredCallback)
 {
     class TestObject: public LifetimeObserver
@@ -1260,10 +1344,9 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
         EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
         EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 0);
 
-        // Create some long-running event engine
         EventEngine engine;
 
-        // Register a callback that uses a weak reference to the object
+        // Weak observer; safe without a mutex on a single event strand.
         engine.registerEventCallback([&obj, alive = obj->getObserver()]() {
             if (alive)
                 return obj->incValue();
@@ -1273,7 +1356,6 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
         EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
         EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 1);
 
-        // Invoke the event callback at some future point in time, while the object is alive
         int result = engine.event();
         EXPECT_EQ(result, 1);
         result = engine.event();
@@ -1281,9 +1363,7 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
 
         delete obj;
 
-        // Invoke the event callback after the object has been deleted.
-        // Because of the aliveness check, we will never call and object that
-        // has been deleted asynchronously.
+        // After delete on the same strand, the aliveness check skips the object.
         result = engine.event();
         EXPECT_EQ(result, -1);
     }
@@ -1293,10 +1373,8 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
         EXPECT_EQ(obj->getCount(TestObject::e_refType::owner), 1);
         EXPECT_EQ(obj->getCount(TestObject::e_refType::observer), 0);
 
-        // Create some long-running event engine
         EventEngine engine;
 
-        // Register a callback that uses a weak reference to the object
         engine.registerEventCallback([&obj, alive = obj->getObserver()]() {
             if (alive)
                 return obj->incValue();
@@ -1311,17 +1389,85 @@ TEST(LifetimeObserverTest, TestDeferredCallback)
 
         delete obj;
 
-        // Invoke the event callback after the object has been deleted.
-        // Because of the aliveness check, we will never call and object that
-        // has been deleted asynchronously.
-
-        // nothing should happen and should return with no work done;
-        // no live object to call
+        // No live object; loop should return with no further work.
         engine.startEventLoop(10);
 
         int result = engine.event();
         EXPECT_EQ(result, -1);
     }
+}
+
+
+// Cross-thread deferred callbacks: mutex covers check/use and delete.
+TEST(LifetimeObserverTest, TestDeferredCallbackThreaded)
+{
+    class TestObject: public LifetimeObserver
+    {
+    public:
+        TestObject() = default;
+        ~TestObject() = default;
+
+        int incValue() { return ++i; }
+
+    private:
+        int i = 0;
+    };
+
+    std::mutex access_mu;
+    TestObject* obj = new TestObject();
+
+    // Each worker gets its own std::function copy; the external mutex serializes
+    // isAlive()/use against delete (avoid TOCTOU).
+    auto make_callback = [&]() {
+        return std::function<int()>([&access_mu, &obj, alive = obj->getObserver()]() {
+            std::lock_guard lock(access_mu);
+            if (alive)
+                return obj->incValue();
+            return -1;
+        });
+    };
+
+    auto probe = make_callback();
+
+    std::atomic<bool> start{false};
+    std::atomic<int> live_hits{0};
+    std::atomic<int> dead_hits{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 4; ++i)
+    {
+        auto cb = make_callback();
+        workers.emplace_back([cb = std::move(cb), &start, &live_hits, &dead_hits]() {
+            while (!start.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+            for (int n = 0; n < 10000; ++n)
+            {
+                int result = cb();
+                if (result >= 0)
+                    live_hits.fetch_add(1, std::memory_order_relaxed);
+                else
+                    dead_hits.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    {
+        std::lock_guard lock(access_mu);
+        delete obj;
+        obj = nullptr;
+    }
+
+    for (auto& t : workers)
+    {
+        t.join();
+    }
+
+    EXPECT_GT(live_hits.load(), 0);
+    EXPECT_GT(dead_hits.load(), 0);
+    EXPECT_EQ(probe(), -1);
 }
 
 
