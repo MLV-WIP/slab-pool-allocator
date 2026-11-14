@@ -94,11 +94,12 @@ namespace spallocator
         // ... else the slab native buffer alignment is 16, which can cover
         // all the supported alignment requests
 
-        // Store the actual allocated size and the alignment in bytes directly
-        // before the data returned to the user. We may need to pad for
-        // alignment, but the size will always be in the preceding 4 bytes,
-        // and the alignment in the 1 byte preceding that. This allows us to
-        // use the size for quick lookup during deallocation.
+        // Store footprint metadata in a header immediately before the user
+        // pointer. header_size = max(8, alignment) so the returned pointer
+        // meets alignment; pad bytes may precede the two metadata fields.
+        // Layout (from user pointer backward): uint32 alloc_size at −4,
+        // uint8 header_size at −5. Deallocate uses these to recover the
+        // slab slot base and to re-select the slab.
         std::size_t header_size = 8 < alignment ? alignment : 8;
         std::size_t alloc_size = item_size + header_size;
         alloc.size = alloc_size;

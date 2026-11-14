@@ -166,12 +166,12 @@ The count of 100 is arbitrary. This is a tuning parameter that could be:
 - Too few on others (excessive test_and_set attempts)
 - Consider making this configurable
 
-⚠️ **Minor: Variable initialization**
+⚠️ **Invariant: `backoff_count` must live across loop iterations**
 ```cpp
-std::chrono::nanoseconds wait_time{dist(gen)};  // Line 83
-int backoff_count = 0;  // Line 85
+std::chrono::nanoseconds wait_time{dist(gen)};
+int backoff_count = 0;  // OUTSIDE while (true) — required
 ```
-These are initialized outside the loop but only used inside. Could move inside for clarity, though current placement is a minor performance optimization.
+Do **not** reset `backoff_count` each iteration. Doing so makes the `wait()` fallback unreachable (the bug fixed in the current code). `wait_time` and `backoff_count` belong outside the loop on purpose.
 
 **Verdict**: ✅ **CORRECT** - No correctness issues, excellent three-phase design
 
@@ -722,7 +722,8 @@ extern "C" {
 
 **Design notes**:
 - Annotations compile to nothing when TSan is disabled (zero overhead in production)
-- Only enabled when `__has_feature(thread_sanitizer)` is true
+- Enabled today when Clang `__has_feature(thread_sanitizer)` is true (`TSAN_ENABLED`)
+- **Caveat**: GCC typically defines `__SANITIZE_THREAD__` instead; under GCC `-fsanitize=thread` these macros may still be no-ops unless the gate is extended
 - Uses TSan's internal `__tsan_acquire` and `__tsan_release` functions
 - The naming is a bit confusing: `__tsan_release` corresponds to HAPPENS_BEFORE
 
@@ -942,24 +943,19 @@ private:
 
 **Use case**: Debugging lock contention issues
 
-### 6. Exponential vs Additive Backoff
+### 6. Doubling vs capped backoff
 
-Current implementation uses additive doubling:
+Current implementation doubles each failed attempt:
 ```cpp
-wait_time += wait_time;  // 1→2→4→8→16→32→64→128→256→512
+wait_time += wait_time;  // identical growth to wait_time *= 2
 ```
 
-Alternative: True exponential backoff:
-```cpp
-wait_time *= 2;  // 1→2→4→8→16→32→64→128→256→512
-```
-
-Or capped exponential:
+A useful alternative is **capped** doubling:
 ```cpp
 wait_time = std::min(wait_time * 2, max_backoff);
 ```
 
-**Trade-off**: True exponential grows faster but can lead to excessive delays. Current additive approach is a good middle ground.
+**Trade-off**: Uncapped doubling differentiates threads well but the last intervals grow large; a cap bounds latency under prolonged contention.
 
 ---
 

@@ -124,28 +124,39 @@ constexpr std::size_t Pool::selectSlab(std::size_t size) const
 
 **Size class selection**: The ladder of sizes (16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024) balances fragmentation vs. number of slabs. Intermediate sizes (48, 96, 192, 384, 768) significantly reduce waste. With the default 8-byte header, a 100-byte user request becomes a 108-byte footprint and lands in the 128B class (20 bytes of slot waste, ~16%). Without intermediate classes, that same 108-byte footprint would still fit 128B; the win shows up at boundaries such as 90 → 98 → 128 vs a coarser 256B ladder.
 
-**Constexpr function**: `selectSlab()` can be evaluated at compile-time when possible, enabling zero-overhead abstraction for constant-size allocations.
+**Constexpr function**: `selectSlab()` is marked `constexpr`, so a call with a compile-time-constant footprint can fold away. In the live `Pool::allocate` path the argument is almost always a **runtime** `item_size + header_size`, so routing still happens at run time. Treat `constexpr` here as a clean, optimizable API — not as “all allocations are compile-time dispatched.”
 
 ---
 
 ### 3. SlabProxy (`spallocator/slab.hpp`)
 
-Handles large allocations by delegating to standard allocators.
+Handles large allocations by delegating to the system allocator (`::operator new[]` / `delete[]` with 16-byte alignment).
 
 **Key Concepts Demonstrated**:
-- **Adapter Pattern**: Provides uniform interface while delegating to different backend
-- **Separation of Concerns**: Large allocations have different performance characteristics
+- **Adapter Pattern**: Same `AbstractSlab` interface as pooled slabs
+- **Separation of Concerns**: Large allocations skip bitsets and address maps
 
 **Design Insights**:
-- Allocations > 1 KB are typically too large to benefit from pooling
-- Inherits from `AbstractSlab` to maintain uniform interface
-- No internal state needed - pure delegation
+- Used when footprint is **> 1 KB** (`selectSlab` returns “large”)
+- Hard ceiling: **≤ 1 GB** (Pool also rejects `item_size > 1_GB` before routing)
+- **No ownership map**: unlike `Slab`, there is no `base_address_map` — each large block is a standalone `new[]`
+- `deallocateItem` always `delete[]`s the pointer it is given (fire-and-forget)
+- Pool still routes free via the **allocation header** (`selectSlab(alloc_size)` → `large_slab`), so the user pointer must be a pool-issued pointer
+
+**Small slab vs SlabProxy**:
+
+| | `Slab<N>` | `SlabProxy` |
+|--|-----------|-------------|
+| Tracking | Bitsets + `base_address_map` | None |
+| Free path | Interval lookup, clear bit | Unconditional `delete[]` |
+| Growth | More 4KB (etc.) slabs | N/A — one system allocation per request |
+| Best for | Hot size classes ≤ 1KB | Occasional large buffers |
 
 **Educational Highlights**:
 
-**When NOT to pool**: Large allocations are infrequent and don't benefit from pre-allocation overhead. The bookkeeping cost of maintaining a pool for large objects often exceeds the allocation cost itself. For such allocations, deferring to the system allocator (which is already optimized for varied sizes) is the right choice.
+**When NOT to pool**: Large allocations are infrequent and don't benefit from pre-allocation overhead. The bookkeeping cost of maintaining a pool for large objects often exceeds the allocation cost itself.
 
-**Interface uniformity**: Same `allocateItem()`/`deallocateItem()` API regardless of backend. This demonstrates the power of polymorphism - the Pool class doesn't need to know which strategy is used.
+**Interface uniformity**: Same `allocateItem()`/`deallocateItem()` API regardless of backend — Pool does not special-case call sites beyond choosing which `AbstractSlab*` to use.
 
 ---
 
@@ -447,16 +458,25 @@ std::map<std::byte*, std::size_t> base_address_map;
 
 1. Use `upper_bound()` to find the first slab starting AFTER the pointer
 2. Back up one entry to find the slab starting BEFORE the pointer
-3. Verify pointer is within [slab_start, slab_end) range
-4. Return slab index
+3. Verify pointer is within `[slab_start, slab_end)` range
+4. Return slab index as `std::optional<std::size_t>`
+
+### Failure mode (unknown / invalid pointers)
+
+`upper_bound` + predecessor only yields a **candidate** slab. Pointers in gaps between slabs, before the first slab, or otherwise outside every `[start, end)` must not abort the process:
+
+1. **`findSlabForItem`**: if the candidate range check fails (or there is no predecessor), emit `debug_println` (when verbose debug is on) and return `std::nullopt`
+2. **`deallocateItem`**: if the optional is empty, throw `std::invalid_argument` (“no corresponding slab found”)
+
+So invalid frees are **detectable errors**, not `runtime_assert` fatals. Callers that pass non-pool pointers or already-freed addresses should expect an exception from the slab layer (Pool still assumes a well-formed header behind the user pointer).
 
 ### Why This Works
 
-The map is keyed by slab start addresses. For any valid pointer:
-- It must fall within some slab's range [start, start+size)
+The map is keyed by slab start addresses. For any **valid** pool pointer:
+- It must fall within some slab's range `[start, start+size)`
 - `upper_bound(ptr)` finds the next slab after ptr
 - Backing up one entry finds the slab that could contain ptr
-- Final bounds check confirms it's actually in that slab
+- Final bounds check confirms it's actually in that slab; otherwise treat as unknown
 
 ### Alternative Approaches
 
@@ -656,7 +676,8 @@ constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, std::size
 
 **Deleter-held size vs pool header**: Two different “sizes” are in play — `PoolDeleter::size` is the **element count** for destructor loops; `Pool`’s header stores the **byte footprint** for slab routing. Do not confuse them.
 
-**Exception safety consideration**: If construction of element N throws, elements 0..N-1 need cleanup. This implementation doesn't handle that (educational simplification). Production code would use a guard:
+> **Exception safety (educational trade-off):** If construction of element *N* throws, elements `0..N-1` are leaked unless you unwind them and `deallocate` before rethrowing. The shipped factory does **not** install that guard — fine for demos/tests with non-throwing element types; copy a production pattern before using throwing constructors:
+
 ```cpp
 std::size_t constructed = 0;
 try {
@@ -741,32 +762,36 @@ class PoolAllocator
 {
 public:
     using value_type = T;
+    using propagate_on_container_copy_assignment = std::false_type;
+    using propagate_on_container_move_assignment = std::false_type;
+    using propagate_on_container_swap = std::false_type;
+    using is_always_equal = std::false_type;  // equal only if same Pool&
 
     explicit PoolAllocator(Pool& pool) noexcept : pool_ref(pool) {}
 
-    T* allocate(std::size_t n) {
-        std::byte* mem = pool_ref.allocate(n * sizeof(T), alignof(T));
-        return reinterpret_cast<T*>(mem);
-    }
+    template<typename U>
+    PoolAllocator(const PoolAllocator<U>& other) noexcept;  // rebind
 
-    void deallocate(T* p, std::size_t n) noexcept {
-        pool_ref.deallocate(reinterpret_cast<std::byte*>(p));
-    }
+    T* allocate(std::size_t n);
+    void deallocate(T* p, std::size_t n) noexcept;
 
 private:
-    Pool& pool_ref;
+    Pool& pool_ref;  // non-owning; pool must outlive allocator + containers
 };
-
-template<typename T, typename... Args>
-std::shared_ptr<T> make_pool_shared(Pool& pool, Args&&... args)
-{
-    PoolAllocator<T> alloc(pool);
-    return std::allocate_shared<T>(alloc, std::forward<Args>(args)...);
-}
 ```
 
-**How It Works**:
-- `std::allocate_shared` uses our custom allocator for **both** the object and control block
+#### Stateful allocator contract
+
+| Trait / rule | Value | Why it matters |
+|--------------|-------|----------------|
+| **Pool lifetime** | `Pool&` only | Destroying the pool while a `vector`/`shared_ptr` still uses it is UB |
+| **POCCA / POCMA / POCS** | `false` | Copy/move/swap of containers must **not** steal or replace the pool reference |
+| **`is_always_equal`** | `false` | Allocators compare equal iff they refer to the **same** `Pool` instance |
+| **`operator==`** | `&lhs.pool_ref == &rhs.pool_ref` | Cross-pool container operations that assume interchangeable allocators are unsafe |
+| **Rebind** | `PoolAllocator<U>(PoolAllocator<T>)` | Node-based containers (`map`, `list`) allocate different `U` from the same pool |
+
+**How `make_pool_shared` works**:
+- `std::allocate_shared` uses `PoolAllocator` for **both** the object and control block
 - Standard library handles reference counting, weak pointers, and thread safety
 - Control block and object allocated from the pool in a single allocation (like `std::make_shared`)
 - Deleter is embedded in the control block (no custom deleter needed)
@@ -1074,17 +1099,17 @@ LifetimeObserver& operator=(const LifetimeObserver& other) {
 
 **Safety guarantee**: If cleanup throws, object still points to valid control block. Exception propagates.
 
-### Comparison to std::shared_ptr/std::weak_ptr
+### Comparison to shared_ptr / enable_shared_from_this
 
-| Feature | `std::shared_ptr`/`std::weak_ptr` | `LifetimeObserver` |
-|---------|-----------------------------------|-------------------|
-| **Purpose** | General-purpose shared ownership | Lightweight object lifetime tracking |
-| **Space overhead** | 16+ bytes (pointer + control block ref) | 16 bytes (pointer + ownership type) |
-| **Thread safety** | Full atomic reference counting | Application-dependent |
-| **Flexibility** | Works with any object | Object must derive from LifetimeObserver |
-| **Liveness check** | `use_count() > 0` | `isAlive()` |
-| **Complexity** | More sophisticated (deleter, allocator) | Simpler, educational |
-| **Use case** | Production shared ownership | Async callback safety, teaching |
+| Feature | `shared_ptr` / `weak_ptr` | `enable_shared_from_this` | `LifetimeObserver` |
+|---------|---------------------------|---------------------------|------------------|
+| **Purpose** | Shared ownership | Intrusive weak-from-`this` | Lightweight liveness tracking |
+| **Thread safety** | Atomic refcounts | Same as `shared_ptr` | Plain `int64_t` — external sync only |
+| **Weak view** | `weak_ptr(shared)` | `weak_from_this()` | `getObserver()` |
+| **Requires** | External `shared_ptr` | Object already owned by `shared_ptr` | Derive from `LifetimeObserver` |
+| **Use case** | Production sharing | Callbacks needing weak `this` with `shared_ptr` | Teaching async checks without full sharing |
+
+`enable_shared_from_this` is the closer cousin: both are intrusive “object exposes a weak self.” Prefer it (or plain `weak_ptr`) when you already use `shared_ptr`; use `LifetimeObserver` for the educational owner/observer split without shared ownership.
 
 ### Learning Value
 
@@ -1228,13 +1253,13 @@ public:
 - Slab critical section: ~20-50 cycles (bitset + allocation)
 - Total lock hold time minimized
 
-**Performance Characteristics**:
+**Performance Characteristics** (order-of-magnitude intuition, not measured benchmarks — profile with `perf` / sanitizer builds for real numbers):
 
 | Scenario | Pool Lock | Slab Lock | Total Time |
 |----------|-----------|-----------|------------|
-| **No contention** | 5-10 cycles | 20-50 cycles | 25-60 cycles |
-| **Different slabs** | Serialized (5-10 cycles) | **Parallel** ✅ | 25-60 cycles each |
-| **Same slab** | Serialized (5-10 cycles) | Serialized (20-50 cycles) | 25-60 cycles each |
+| **No contention** | ~5–10 cycles | ~20–50 cycles | ~25–60 cycles |
+| **Different slabs** | Serialized briefly | **Parallel** ✅ | ~same ballpark each |
+| **Same slab** | Serialized briefly | Serialized | Contends on one slab |
 
 **Why this design is excellent**:
 1. ✅ Allows true parallelism for different size classes
@@ -1370,13 +1395,12 @@ for (std::size_t i = 0; i < 10; ++i) {
 flag.wait(true, memory_order_acquire);
 ```
 
-**Why additive doubling instead of exponential?**
-- Iteration 1: random 1-100ns
-- Iteration 2: 2-200ns
-- Iteration 3: 4-400ns
-- Iteration 10: 512-51200ns (max ~51μs)
+**Doubling backoff** (`wait_time += wait_time`, same growth as `*= 2`):
+- Iteration 1: random 1–100ns (OS timers often coarsen the smallest sleeps)
+- Iteration 2: 2–200ns … Iteration 10 last interval: 512–51200ns (~51μs peak interval)
+- Cumulative sleeps across 10 attempts ≈ `W·(2¹⁰−1)` (up to ~102μs for `W=100ns`), then `wait()`
 
-True exponential (2^n) would reach milliseconds quickly, adding unnecessary latency. Additive doubling (`wait += wait`) provides enough differentiation without excessive delays.
+The important property is **differentiation across threads**, not literal nanosecond accuracy. Cap the wait if you need a hard latency bound.
 
 ### Memory Ordering Semantics
 
@@ -1424,6 +1448,20 @@ unlock() [release]
 
 Without proper memory ordering, the compiler or CPU could reorder operations, breaking this guarantee.
 
+### ThreadSanitizer annotations
+
+Custom locks are invisible to TSan unless you publish happens-before edges. `spinlock.hpp` does that with:
+
+```cpp
+// after successful acquire
+TSAN_ANNOTATE_HAPPENS_AFTER(this);   // → __tsan_acquire
+
+// before clear(release) in unlock
+TSAN_ANNOTATE_HAPPENS_BEFORE(this);  // → __tsan_release
+```
+
+Without these, TSan may report false races on data protected only by `SpinLock`. The macros are no-ops unless `TSAN_ENABLED` is set (today via Clang `__has_feature(thread_sanitizer)`). Full correctness write-up: [`spallocator/docs/SpinLock_Analysis.md`](spallocator/docs/SpinLock_Analysis.md).
+
 ---
 
 ## Performance Analysis
@@ -1434,7 +1472,7 @@ Without proper memory ordering, the compiler or CPU could reorder operations, br
 |-----------|-----------|------------|-----------|-------|
 | Allocation | O(1) | O(n) | O(1) | n = slots per slab |
 | Deallocation | O(log m) | O(log m) | O(log m) | m = number of slabs |
-| Slab Selection | O(1) | O(1) | O(1) | Compile-time lookup |
+| Slab Selection | O(1) | O(1) | O(1) | Ladder of compares (`constexpr`-friendly API) |
 | SpinLock lock() (no contention) | O(1) | O(1) | O(1) | Single atomic |
 | SpinLock lock() (contention) | O(k) | O(k) | O(k) | k = backoff iterations (max 10) |
 | SpinLock try_lock() | O(1) | O(1) | O(1) | Non-blocking |
@@ -1446,14 +1484,20 @@ The claim requires careful explanation:
 
 **Best case**: Free slot in first available slab → O(1)
 
-**Worst case**: Must scan all slots in a slab to find a free one → O(slots_per_slab)
+**Worst case**: Must scan all slots in a slab to find a free one → O(slots_per_slab). The implementation scans **from bit 0 upward** with no freelist cursor, so a single free bit at the end of a busy slab costs a full scan of that slab’s bitset.
 
-**Real-world behavior**: The availability map provides coarse filtering, so we only scan slabs that are known to have free slots. Bitset operations are extremely fast (hardware-supported), making even the worst case quite fast in practice.
+**Real-world behavior**: The availability map provides coarse filtering, so we only scan slabs that are known to have free slots. Bitset ops are cheap on modern CPUs, so the educational “scan from zero” choice stays practical for 4KB slabs.
+
+**Scan-from-zero vs free list** (see also Future Enhancements):
+- **Bitset scan** — compact metadata, simple correctness, worse-case linear in slots per slab
+- **Free list / bump cursor** — O(1) alloc when a free slot is known, extra storage and more complex free/coalesce logic
+
+This project favors bitsets for clarity; a freelist would be the usual next optimization if profiling showed scan cost dominating.
 
 **Why it works in practice:**
 1. Temporal locality: Allocations and deallocations tend to cluster
 2. Availability map: Skips completely full slabs
-3. Hardware optimization: Bitset operations are highly optimized (often using SIMD)
+3. Hardware-friendly bitset tests
 
 ### Space Complexity
 
@@ -1660,30 +1704,30 @@ This computes the slab size at compile time, with zero runtime overhead.
 
 ## Debugging and Instrumentation
 
-The codebase includes extensive debug output capabilities via `println()`:
+### Observability & builds cheat sheet
 
-**What's logged:**
-- Slab creation and destruction with sizes
-- Individual allocation/deallocation events with addresses
-- Bitset states after operations (via `printHex()`)
-- Slab selection decisions
+| Knob | Effect |
+|------|--------|
+| `NDEBUG` / `DEBUG_BUILD` | Without `NDEBUG`, `runtime_assert` is active; with `NDEBUG`, asserts are compile-time no-ops |
+| `-DVDEBUG` / `VERBOSE_DEBUG` | Enables `debug_print` / `debug_println` (slab alloc/free, unknown-pointer notes, etc.) |
+| `BUILD_TYPE=debug` | Unoptimized debug binary under `obj/debug/` |
+| `BUILD_TYPE=addrsan` | **Default** — ASan + LSan + UBSan (`obj/addrsan/`) |
+| `BUILD_TYPE=memsan` | MemorySanitizer + UBSan (Clang; `obj/memsan/`) |
+| `BUILD_TYPE=threadsan` | ThreadSanitizer + UBSan (`obj/threadsan/`) — exercise `SpinLock` races |
+| `make test` / `make demo` | Run tester or shared_ptr demo for current build type |
 
-**How to use:**
-1. Build with debug output enabled
-2. Run tests or your application
-3. Review console output to understand allocation patterns
-4. Trace memory lifecycle of specific objects
-5. Verify bitset correctness visually
+SpinLock happens-before design and TSan annotation details: [`spallocator/docs/SpinLock_Analysis.md`](spallocator/docs/SpinLock_Analysis.md).
 
-**Educational value:**
+**Typical workflow:**
+```bash
+make BUILD_TYPE=addrsan test          # memory bugs
+make BUILD_TYPE=threadsan test        # data races / lock misuse
+# rebuild with -DVDEBUG for verbose pool/slab traces
+```
 
-Observability is critical in systems programming. The debug output demonstrates:
-- How to instrument low-level code
-- What information is useful for debugging
-- Trade-offs between verbosity and clarity
-- How to make internals visible without affecting performance
+**What's logged** (when verbose debug is on): slab create/destroy, alloc/free addresses, bitset snapshots, slab selection, unknown-pointer misses in `findSlabForItem`.
 
-In production, this output can be disabled via compile-time flags or preprocessor macros, achieving zero-overhead when not needed.
+**Educational value:** Instrument low-level code with `if constexpr` gates so release builds pay zero cost for debug paths.
 
 ---
 
