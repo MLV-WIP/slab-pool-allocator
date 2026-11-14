@@ -92,8 +92,17 @@ namespace spallocator
     constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, Args&&... args)
     {
         void* mem = pool.allocate(sizeof(T), alignof(T));
-        T* obj = new (mem) T(std::forward<Args>(args)...);
-        return unique_pool_ptr<T>(obj, PoolDeleter<T>{pool});
+        try
+        {
+            T* obj = new (mem) T(std::forward<Args>(args)...);
+            return unique_pool_ptr<T>(obj, PoolDeleter<T>{pool});
+        }
+        catch (...)
+        {
+            // Constructor failed: object was never constructed; return the slot.
+            pool.deallocate(reinterpret_cast<std::byte*>(mem));
+            throw;
+        }
     }
 
     // Unknown bound array version

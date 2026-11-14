@@ -419,7 +419,9 @@ TEST(PoolTest, uniquePoolPtr)
 
 
 // Throws on the Nth successful live object when constructed == throw_at.
-struct ThrowOnNthConstruct
+// alignas(8): Pool::allocate requires alignment in [4, 16]; empty types are
+// often alignof 1 and would hit the alignment check before the ctor path.
+struct alignas(8) ThrowOnNthConstruct
 {
     inline static int live = 0;
     inline static int throw_at = -1;
@@ -456,6 +458,25 @@ TEST(PoolTest, uniquePoolPtrArrayStrongExceptionSafety)
     ThrowOnNthConstruct::throw_at = -1;
     auto ok = make_pool_unique<ThrowOnNthConstruct[]>(pool, 3);
     EXPECT_EQ(ThrowOnNthConstruct::live, 3);
+    ok.reset();
+    EXPECT_EQ(ThrowOnNthConstruct::live, 0);
+}
+
+
+TEST(PoolTest, uniquePoolPtrSingleStrongExceptionSafety)
+{
+    Pool pool;
+    ThrowOnNthConstruct::live = 0;
+    ThrowOnNthConstruct::throw_at = 0; // first construction throws
+
+    EXPECT_THROW(
+        (void)make_pool_unique<ThrowOnNthConstruct>(pool),
+        std::runtime_error);
+    EXPECT_EQ(ThrowOnNthConstruct::live, 0);
+
+    ThrowOnNthConstruct::throw_at = -1;
+    auto ok = make_pool_unique<ThrowOnNthConstruct>(pool);
+    EXPECT_EQ(ThrowOnNthConstruct::live, 1);
     ok.reset();
     EXPECT_EQ(ThrowOnNthConstruct::live, 0);
 }

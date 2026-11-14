@@ -622,8 +622,13 @@ template<typename T, typename... Args>
 constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, Args&&... args)
 {
     void* mem = pool.allocate(sizeof(T), alignof(T));
-    T* obj = new (mem) T(std::forward<Args>(args)...);
-    return unique_pool_ptr<T>(obj, PoolDeleter<T>{pool});
+    try {
+        T* obj = new (mem) T(std::forward<Args>(args)...);
+        return unique_pool_ptr<T>(obj, PoolDeleter<T>{pool});
+    } catch (...) {
+        pool.deallocate(reinterpret_cast<std::byte*>(mem));
+        throw;
+    }
 }
 ```
 
@@ -638,6 +643,8 @@ auto obj = make_pool_unique<MyClass>(pool, std::move(expensive_arg));
 ```
 
 **Placement new**: `new (mem) T(...)` constructs object at specific memory location. The pool provides raw memory; placement new invokes the constructor.
+
+**Exception safety (strong guarantee):** If `T`’s constructor throws, the object was never constructed, so the factory returns the raw slot to the pool and rethrows — no leak.
 
 **Alignment specification**: Passing `alignof(T)` ensures properly aligned memory for the type. Misaligned access can cause crashes on some architectures (e.g., ARM) or performance degradation on others (e.g., x86).
 
