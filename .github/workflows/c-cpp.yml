@@ -11,6 +11,7 @@ jobs:
     #runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm64' || 'ubuntu-latest' }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         #arch: [amd64, arm64]
         arch: [amd64]
@@ -19,14 +20,27 @@ jobs:
           - name: addrsan
             enable-flags: "--enable-asan --enable-lsan --enable-ubsan"
             build-type: "addrsan"
+            # No special container privileges needed for ASan/UBSan.
+            container-options: ""
           - name: threadsan
             enable-flags: "--enable-tsan"
             build-type: "threadsan"
+            # Privileged so we can lower vm.mmap_rnd_bits for TSan on
+            # modern Ubuntu hosts (default 32 breaks older/container TSan).
+            container-options: "--privileged"
 
-    container: ghcr.io/mlv-wip/${{ matrix.compiler }}-builder:latest
+    container:
+      image: ghcr.io/mlv-wip/${{ matrix.compiler }}-builder:latest
+      options: ${{ matrix.sanitizer-config.container-options }}
 
     steps:
     - uses: actions/checkout@v4
+    - name: Limit mmap ASLR entropy for ThreadSanitizer
+      if: matrix.sanitizer-config.name == 'threadsan'
+      run: |
+        echo "Current vm.mmap_rnd_bits=$(sysctl -n vm.mmap_rnd_bits)"
+        sysctl -w vm.mmap_rnd_bits=28
+        echo "Updated vm.mmap_rnd_bits=$(sysctl -n vm.mmap_rnd_bits)"
     - name: configure (${{ matrix.sanitizer-config.name }})
       run: ./configure ${{ matrix.sanitizer-config.enable-flags }} --enable-tests --enable-demo --build-type=${{ matrix.sanitizer-config.build-type }}
     - name: make
