@@ -6,24 +6,24 @@ A modern C++ implementation of a slab-based memory pool allocator with advanced 
 
 This project demonstrates high-performance memory allocation using the slab allocator pattern, featuring multiple size classes, automatic slab management, and a production-quality spinlock implementation. Designed to be both educational and production-ready, showcasing advanced C++ techniques and memory management concepts.
 
-**Layout:**
-- `spallocator/` — header-only library
-- `test/` — Google Test suite (`tester.cpp`)
-- `demos/` — example programs
-- `IMPLEMENTATION.md` — deep design and learning guide
+**Directory map:**
+```
+spallocator/          # header-only library (+ docs/SpinLock_Analysis.md)
+test/                 # Google Test suite (tester.cpp)
+demos/                # example programs
+IMPLEMENTATION.md     # deep design and learning guide
+README.md             # this overview + build/run
+```
 
 ## Key Features
 
-- **12 Optimized Size Classes** - 16 bytes to 1 KB with intermediate sizes (48, 96, 192, 384, 768)
-- **Fast Allocation / Lookup Deallocation** - Bitset-based tracking; deallocation uses an address map (O(log n) in slab count)
-- **Thread-Safe Pool** - Two-level locking (pool + per-slab) for concurrent size classes
-- **Automatic Slab Growth** - Dynamic allocation of new slabs on demand
-- **Large Allocation Fallback** - Seamless handling of allocations > 1 KB
-- **Smart Pointer Support** - `make_pool_unique` and `make_pool_shared` for RAII-based memory management
-- **Standard Allocator Interface** - `PoolAllocator<T>` for STL container integration
-- **Lifetime Observer** - `LifetimeObserver` for safe asynchronous callbacks and event handlers
-- **Production-Ready SpinLock** - TTAS with three-phase contention handling (spin → backoff → block)
-- **Modern C++20/23** - Template metaprogramming, user-defined literals, atomics, ranges, concepts
+- **12 size classes** (16B–1KB) with intermediate sizes to cut fragmentation
+- **Thread-safe pool** with two-level locking and large-allocation fallback (>1KB)
+- **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>`
+- **LifetimeObserver** for async callback safety; **SpinLock** (TTAS → backoff → block)
+- **Modern C++20/23** — templates, atomics, ranges, concepts
+
+Deep design notes live in [IMPLEMENTATION.md](IMPLEMENTATION.md), not here.
 
 ## Quick Start
 
@@ -148,15 +148,6 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 
 **Space Overhead**: Default header is 8 bytes (`header_size = max(8, alignment)`), so ~6% for a 128-byte user request before bitset amortization. Details in [IMPLEMENTATION.md](IMPLEMENTATION.md#memory-layout).
 
-## SpinLock Features
-
-- **Three-Phase Contention** - Active spin → escalating backoff → efficient blocking
-- **TTAS (Test-and-Test-and-Set)** - Reduces cache coherency traffic
-- **Escalating Backoff** - Randomized 1-100ns initial wait, additive doubling on contention
-- **STL Compatible** - Works with `std::scoped_lock` and `std::unique_lock` (BasicLockable)
-- **TSan Annotations** - ThreadSanitizer integration for race detection
-- **Analysis** - See [`spallocator/docs/SpinLock_Analysis.md`](spallocator/docs/SpinLock_Analysis.md)
-
 ## Requirements
 
 - **Minimum**: C++20 (for `atomic_flag::wait()`/`notify_one()`)
@@ -192,10 +183,6 @@ make && ./obj/addrsan/tester
 
 - Memory statistics and profiling API
 - Configurable SpinLock parameters
-
-## Learning Value
-
-This project demonstrates template metaprogramming, modern C++20/23 features, slab allocation and bitset tracking, custom deleters / smart pointers, concurrency primitives (TTAS, memory ordering, backoff), and performance-oriented design. See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the full walkthrough.
 
 ## References
 

@@ -1,15 +1,51 @@
 # Implementation Guide
 
-This document provides an in-depth analysis of the slab pool allocator implementation, design decisions, and educational insights. For a quick overview, see [README.md](README.md).
+This document provides an in-depth analysis of the slab pool allocator implementation, design decisions, and educational insights. For build/test/demo instructions and a project overview, see [README.md](README.md).
 
-**Educational Focus**: This guide is designed to teach advanced C++ techniques, memory management concepts, and concurrent programming patterns through detailed explanations and real-world examples.
+**Educational Focus**: This guide teaches advanced C++ techniques, memory management concepts, and concurrent programming patterns through detailed explanations and real-world examples.
+
+---
+
+## How to Read This Guide (5-minute path)
+
+1. **Component map** (below) — who owns what
+2. **[Memory Layout](#memory-layout)** + **[Alignment API](#alignment-api)** — what sits in front of every allocation
+3. **[Request Lifecycle](#request-lifecycle)** — one numeric walkthrough of allocate/free
+4. Skim **[Smart Pointer Integration](#smart-pointer-integration)** or **[SpinLock Design](#spinlock-design)** depending on your goal
+5. Run demos from the README, then return for **[LifetimeObserver](#lifetimeobserver---asynchronous-object-lifetime-tracking)** or **[Thread Safety](#thread-safety-and-concurrent-access)** as needed
+
+Build, test, and demo commands stay in the README so this file can stay focused on design.
+
+### Component diagram
+
+```
+                    ┌─────────────────────────────────────┐
+                    │         spallocator::Pool           │
+                    │  (routes by footprint; pool SpinLock)│
+                    └──────────────┬──────────────────────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+              ▼                    ▼                    ▼
+     AbstractSlab           AbstractSlab          SlabProxy
+     Slab<16> … Slab<1024>  (size classes)        (>1KB → ::new[])
+              │
+              └── per-slab SpinLock, bitsets, base_address_map
+
+  Smart pointers (spallocator.hpp)          LifetimeObserver
+  make_pool_unique / make_pool_shared  ──►  (stand-alone utility;
+  PoolAllocator<T> → Pool&                  not part of Pool)
+```
+
+**Layers**: `Pool` chooses a slab and writes the allocation header; `Slab`/`SlabProxy` own raw slots; smart pointers and `PoolAllocator` are clients of `Pool&`; `LifetimeObserver` is independent of the allocator.
 
 ---
 
 ## Table of Contents
 
+- [How to Read This Guide (5-minute path)](#how-to-read-this-guide-5-minute-path)
 - [Architecture Deep Dive](#architecture-deep-dive)
 - [Memory Layout](#memory-layout)
+- [Alignment API](#alignment-api)
 - [Request Lifecycle](#request-lifecycle)
 - [Slab Allocation Strategy](#slab-allocation-strategy)
 - [Bitset Tracking System](#bitset-tracking-system)
@@ -21,6 +57,9 @@ This document provides an in-depth analysis of the slab pool allocator implement
 - [Performance Analysis](#performance-analysis)
 - [Advanced Topics](#advanced-topics)
 - [Learning Objectives](#learning-objectives)
+- [Further Reading](#further-reading)
+- [Debugging and Instrumentation](#debugging-and-instrumentation)
+- [Future Enhancements](#future-enhancements)
 - [Demo Programs](#demo-programs)
 
 ---
@@ -176,7 +215,7 @@ constexpr std::size_t operator""_KB(unsigned long long value) {
 
 **User-defined literals**: Enable `4_KB` instead of `4096` for better readability. This is a powerful C++ feature that allows domain-specific syntax while maintaining type safety.
 
-**Runtime assertions**: Unlike `assert()`, these work in release builds and provide rich context. Production systems need verification even in optimized builds, making runtime assertions essential for catching bugs early.
+**Runtime assertions**: `spallocator::runtime_assert` is a **debug-build** check. It is compiled in only when `DEBUG_BUILD` is true (`NDEBUG` is not defined). In release builds the body is discarded via `if constexpr`, so it is a no-op — closer to `<cassert>` than to a always-on production invariant. Prefer real error handling (`throw`, return codes) for conditions that can fail because of callers or the environment. When active, failures print file/line via `std::source_location` and call `std::abort()`.
 
 **Modern formatting**: `std::format` is type-safe unlike `printf`, and more efficient than streams. It combines the best of both worlds: compile-time format string checking with runtime efficiency.
 
@@ -235,6 +274,29 @@ Alternative approaches:
 3. **Separate size table**: Extra indirection, more memory overhead for large numbers of allocations
 
 The header approach is simple, efficient, and robust.
+
+### Alignment API
+
+`Pool::allocate` accepts an optional alignment:
+
+```cpp
+std::byte* Pool::allocate(std::size_t size, std::size_t alignment = 8);
+```
+
+| Rule | Detail |
+|------|--------|
+| Default | `alignment = 8` |
+| Allowed | Power of two in **`[4, 16]`** |
+| Rejected | Non-power-of-two, `< 4`, or `> 16` → `std::invalid_argument` (debug builds also `runtime_assert`) |
+| Header width | `header_size = max(8, alignment)` so the returned user pointer is aligned |
+| Slab buffers | Underlying small-slab storage is 16-byte aligned, which covers all supported requests |
+
+**Examples:**
+- `allocate(64)` → 8-byte header, footprint 72 → 96B class
+- `allocate(64, 16)` → 16-byte header, footprint 80 → 96B class
+- `alignof(T)` from `make_pool_unique` / `PoolAllocator` is passed through when constructing objects
+
+Wider alignments (cache line 64, AVX 32) are **not** supported yet; see [Future Enhancements](#future-enhancements).
 
 ---
 
@@ -782,7 +844,20 @@ This creates a use-after-free vulnerability: the callback invokes a method on a 
 - **Observer Pattern**: Separation of concerns between object lifetime and observers
 - **Mediator Pattern**: Control block mediates between strong and weak references
 - **Reference Counting**: Lightweight reference counting for lifetime management
-- **Async-Safe Operations**: Checking liveness without locks in many cases
+- **Async-oriented checks**: Observers can ask “is the owner still alive?” before touching the object
+
+### Thread model (read this first)
+
+`ControlBlock` stores **plain `int64_t` counts**, not `std::atomic`. The type is **not** internally synchronized.
+
+| Situation | Safe? |
+|-----------|--------|
+| Single-threaded event loop: register observer, destroy owner, later check `isAlive()` | Yes — the intended educational use |
+| All `addRef` / `releaseRef` / `isAlive` on one thread, or under an external mutex you hold | Yes |
+| Concurrent `isAlive()` vs destroy/release from another thread without external sync | **No** — data race on the counts |
+| Check `isAlive()` then use the object without holding a lock that also covers destruction | **No** — TOCTOU even if counts were atomic |
+
+Treat `LifetimeObserver` like an intrusive weak-ref teaching tool: **single-threaded or externally synchronized only**. For lock-free cross-thread lifetime, use `std::shared_ptr` / `std::weak_ptr` (or add atomics yourself). The [pitfalls](#common-pitfalls) section expands on the check-then-use race.
 
 ### Design Architecture
 
@@ -814,7 +889,7 @@ public:
         // Register callback that captures observer
         event_loop.on_data([alive = getObserver()](const Data& d)
         {
-            // Safe to check liveness without locks
+            // Check liveness (single-threaded / externally synced — see Thread model)
             if (alive)
             {
                 // Object still exists, safe to access
@@ -885,16 +960,17 @@ bool isAlive() const {
 }
 ```
 
-**Why this is safe**:
-- Lock-free check: No synchronization needed (atomic-like semantics expected)
-- Observer can outlive object: Control block never destroyed while references exist
-- Simple: Just checks owner count > 0
+**What this means**:
+- Reads `owner_count` from the shared control block — a normal `int64_t` load, **not** an atomic or lock-free primitive
+- Safe when the observer and owner lifetimes are sequenced on one thread (or under your mutex)
+- Observer can outlive the object: the control block remains while any owner or observer refs exist
+- Does **not** by itself make a following member call race-free on another thread (see [Thread model](#thread-model-read-this-first))
 
-**Usage in Callbacks**:
+**Usage in Callbacks** (single-threaded / externally synchronized):
 ```cpp
 auto callback = [observer = obj.getObserver()]() {
     if (observer) {  // operator bool() = isAlive()
-        // Safe to proceed
+        // Safe to proceed only under the thread model above
     }
 };
 ```
@@ -1020,7 +1096,7 @@ This implementation teaches:
 4. **Move Semantics**: Efficient ownership transfer and moved-from object validity
 5. **Copy Assignment**: Exception-safe assignment with reference swapping
 6. **RAII**: Automatic cleanup through scope (destructor calls release)
-7. **Async Safety**: Safe callback patterns without locks
+7. **Async Safety**: Safe callback patterns when lifetime checks follow the thread model
 8. **Control Flow**: Checking preconditions before accessing objects
 
 ### Common Pitfalls
@@ -1746,7 +1822,7 @@ public:
     void registerCallback(std::function<void()> cb) {
         // Capture weak reference to avoid preventing destruction
         event_loop.on_event([alive = getObserver(), cb]() {
-            if (alive) {  // Safe to check without locks (in most cases)
+            if (alive) {  // Liveness check; synchronize if multi-threaded
                 cb();
             }
         });
