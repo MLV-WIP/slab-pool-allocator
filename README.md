@@ -219,9 +219,11 @@ This is an educational project. Contributions should:
 
 ## AI Assistance Declaration
 
-README and documentation generated with AI assistance (Claude Code, GitHub Copilot).
+README and documentation generated with AI assistance (Claude Code, Grok, Cursor, GitHub Copilot).
 
-Architecture, design, and core implementation are human-generated. Standard library
+Architecture, design, and core implementation are human-generated. Initial
+implementation exclusively by Michael VanLoon. Standard library
 adaptations (make_unique and make_shared support, along with standard allocator
 support) also developed with AI assistance, but in all cases, all code has
-been validated, reviewed, and forged by human hands.
+been validated, reviewed, and forged by human hands and inspired by human
+software development experience.
