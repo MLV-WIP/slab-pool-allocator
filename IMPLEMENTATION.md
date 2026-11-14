@@ -657,8 +657,17 @@ constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, std::size
     std::byte* mem = pool.allocate(array_size, alignment);
     ElementType* array_ptr = reinterpret_cast<ElementType*>(mem);
 
-    for (std::size_t i = 0; i < size; ++i) {
-        new (&array_ptr[i]) ElementType();
+    std::size_t constructed = 0;
+    try {
+        for (; constructed < size; ++constructed) {
+            new (&array_ptr[constructed]) ElementType();
+        }
+    } catch (...) {
+        while (constructed > 0) {
+            array_ptr[--constructed].~ElementType();
+        }
+        pool.deallocate(mem);
+        throw;
     }
 
     // Element count travels with the deleter, not a second in-memory prefix
@@ -676,14 +685,13 @@ constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, std::size
 
 **Deleter-held size vs pool header**: Two different “sizes” are in play — `PoolDeleter::size` is the **element count** for destructor loops; `Pool`’s header stores the **byte footprint** for slab routing. Do not confuse them.
 
-> **Exception safety (educational trade-off):** If construction of element *N* throws, elements `0..N-1` are leaked unless you unwind them and `deallocate` before rethrowing. The shipped factory does **not** install that guard — fine for demos/tests with non-throwing element types; copy a production pattern before using throwing constructors:
+**Exception safety (strong guarantee):** If construction of element *N* throws, already-constructed elements are destroyed in reverse order and the block is returned to the pool before rethrowing:
 
 ```cpp
 std::size_t constructed = 0;
 try {
-    for (std::size_t i = 0; i < size; ++i) {
-        new (&array_ptr[i]) ElementType();
-        ++constructed;
+    for (; constructed < size; ++constructed) {
+        new (&array_ptr[constructed]) ElementType();
     }
 } catch (...) {
     while (constructed > 0) {
@@ -744,7 +752,7 @@ objects.push_back(spallocator::make_pool_unique<MyClass>(pool, args...));
 | **Deallocation** | `delete` | `pool.deallocate()` |
 | **Destructor handling** | Automatic | Explicit call (placement new counterpart) |
 | **Array support** | Yes (`T[]`) | Yes; element count in `PoolDeleter`, reverse destruction |
-| **Exception safety** | Full | Partial (educational implementation) |
+| **Exception safety** | Full | Full (array ctor unwind + `pool.deallocate`) |
 | **Alignment** | Standard alignment | Explicit alignment specification |
 | **Performance** | General-purpose | Optimized for specific size classes |
 

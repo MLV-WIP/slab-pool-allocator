@@ -31,6 +31,7 @@
  */
 
 #include <cstdlib>
+#include <stdexcept>
 #include <gtest/gtest.h>
 
 #include "spallocator/helper.hpp"
@@ -414,6 +415,49 @@ TEST(PoolTest, uniquePoolPtr)
             EXPECT_EQ(item3[i], i * 10);
         }
     } // items go out of scope and are deallocated
+}
+
+
+// Throws on the Nth successful live object when constructed == throw_at.
+struct ThrowOnNthConstruct
+{
+    inline static int live = 0;
+    inline static int throw_at = -1;
+
+    ThrowOnNthConstruct()
+    {
+        if (live == throw_at)
+        {
+            throw std::runtime_error("ThrowOnNthConstruct");
+        }
+        ++live;
+    }
+
+    ~ThrowOnNthConstruct()
+    {
+        --live;
+    }
+};
+
+
+TEST(PoolTest, uniquePoolPtrArrayStrongExceptionSafety)
+{
+    Pool pool;
+    ThrowOnNthConstruct::live = 0;
+    ThrowOnNthConstruct::throw_at = 3; // fail while constructing the 4th element (0-based)
+
+    EXPECT_THROW(
+        (void)make_pool_unique<ThrowOnNthConstruct[]>(pool, 5),
+        std::runtime_error);
+
+    // All partially constructed elements destroyed; pool block returned.
+    EXPECT_EQ(ThrowOnNthConstruct::live, 0);
+
+    ThrowOnNthConstruct::throw_at = -1;
+    auto ok = make_pool_unique<ThrowOnNthConstruct[]>(pool, 3);
+    EXPECT_EQ(ThrowOnNthConstruct::live, 3);
+    ok.reset();
+    EXPECT_EQ(ThrowOnNthConstruct::live, 0);
 }
 
 

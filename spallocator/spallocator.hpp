@@ -107,14 +107,28 @@ namespace spallocator
         std::size_t alignment = alignof(ElementType) > alignof(std::size_t) ?
                                 alignof(ElementType) : alignof(std::size_t);
 
-        // Allocate memory for header + array
+        // Pool writes its own allocation header; mem is the user pointer.
         std::byte* mem = pool.allocate(array_size, alignment);
         ElementType* array_ptr = reinterpret_cast<ElementType*>(mem);
 
-        // Use placement new to construct each element
-        for (std::size_t i = 0; i < size; ++i)
+        // Strong exception guarantee: if any element ctor throws, destroy
+        // already-constructed elements and return the block to the pool.
+        std::size_t constructed = 0;
+        try
         {
-            new (&array_ptr[i]) ElementType();
+            for (; constructed < size; ++constructed)
+            {
+                new (&array_ptr[constructed]) ElementType();
+            }
+        }
+        catch (...)
+        {
+            while (constructed > 0)
+            {
+                array_ptr[--constructed].~ElementType();
+            }
+            pool.deallocate(mem);
+            throw;
         }
 
         return unique_pool_ptr<T>(array_ptr, PoolDeleter<T>{pool, size});
