@@ -158,7 +158,7 @@ namespace spallocator
         AbstractSlab* getOrCreateLazy(std::size_t axis, std::size_t index);
 
         static std::unique_ptr<AbstractSlab> makeLazySlab(std::size_t axis,
-                                                         std::size_t index);
+                                                          std::size_t index);
 
     private: // data members
         std::array<std::unique_ptr<AbstractSlab>, kLadder16Count> slabs16{};
@@ -172,7 +172,7 @@ namespace spallocator
 
 
     inline std::unique_ptr<AbstractSlab> Pool::makeLazySlab(std::size_t axis,
-                                                           std::size_t index)
+                                                            std::size_t index)
     {
         if (axis == 32)
         {
@@ -274,18 +274,27 @@ namespace spallocator
 
         if (item_size > 1_GB)
         {
+            // excessively large allocations don't belong in the pool
+            // slabs; use other allocation methods instead
             throw std::out_of_range("Allocation size exceeds maximum limit for pool allocator");
         }
 
-        runtime_assert((alignment & (alignment - 1)) == 0,
-            "Alignment must be a power of two");
-        if (alignment < kMinAlignment || alignment > kMaxAlignment)
+        // Range and power-of-two checks throw in all builds (including release).
+        // Non-power-of-two values in [4, 64] (e.g. 12) would break header/axis math.
+        if (alignment < kMinAlignment || alignment > kMaxAlignment
+            || (alignment & (alignment - 1)) != 0)
         {
             throw std::invalid_argument("Unsupported alignment requested");
         }
 
+        // Store footprint metadata in a header immediately before the user
+        // pointer.
         // header_size = max(8, alignment). For align 4/8 this stays 8 (axis 16);
         // for 16/32/64 it equals the request align so free can recover the axis.
+        // Layout (from user pointer backward): uint32 alloc_size at −4,
+        // uint8 header_size at −5. Deallocate uses these to recover the
+        // slot base (user − header_size) and to re-select the slab via
+        // (alloc_size, axis-from-header_size).
         std::size_t header_size = 8 < alignment ? alignment : 8;
         std::size_t alloc_size = item_size + header_size;
         alloc.size = alloc_size;

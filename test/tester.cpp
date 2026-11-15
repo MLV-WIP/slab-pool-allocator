@@ -593,6 +593,9 @@ TEST(PoolTest, Alignment)
     }
 
     EXPECT_THROW(pool.allocate(16, 128), std::invalid_argument);
+    // Non-power-of-two must fail in all builds (not only debug asserts).
+    EXPECT_THROW(pool.allocate(16, 12), std::invalid_argument);
+    EXPECT_THROW(pool.allocate(16, 24), std::invalid_argument);
 }
 
 

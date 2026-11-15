@@ -302,7 +302,7 @@ std::byte* Pool::allocate(std::size_t size, std::size_t alignment = 8);
 |------|--------|
 | Default | `alignment = 8` |
 | Allowed | Power of two in **`[4, 64]`** (`kMinAlignment` … `kMaxAlignment`) |
-| Rejected | `< 4` or `> 64` → `std::invalid_argument` (debug builds also `runtime_assert`; power-of-two is assert-checked) |
+| Rejected | `< 4`, `> 64`, or non-power-of-two → `std::invalid_argument` (all builds) |
 | Header width | `header_size = max(8, alignment)` so the returned user pointer is aligned |
 | Native axis | `nativeAxis(align)`: 4/8/16 → **16**; 32 → 32; 64 → 64 |
 | Size classes | `Slab<ElemSize, Alignment>` ladders per axis (16 eager; 32/64 lazy) |
@@ -321,7 +321,7 @@ std::byte* Pool::allocate(std::size_t size, std::size_t alignment = 8);
 
 End-to-end path for a typical call `pool.allocate(100)` (default alignment 8):
 
-1. **Validate** — reject `N > 1_GB`; require alignment in `[4, 64]` (power-of-two checked in debug)
+1. **Validate** — reject `N > 1_GB`; require power-of-two alignment in `[4, 64]` (throws in all builds)
 2. **Compute header** — `header_size = max(8, 8) = 8`
 3. **Compute footprint** — `alloc_size = 100 + 8 = 108`
 4. **Select slab** — `nativeAxis(8) → 16`, then `selectClassIndex(108, 16)` → **128B** class (not 96B: 108 > 96); lazy axes use `slab_init_lock` on first create
