@@ -297,11 +297,26 @@ namespace spallocator
             auto slab_index = *slab_index_opt;
 
             auto slab_start = slab_data[slab_index];
-            //auto slab_end = slab_start + slab_alloc_size;
-
-            // Calculate the item index within the slab
-            std::size_t item_index = (item - slab_start) / ElemSize;
             auto& slab_slots = slab_map[slab_index];
+
+            // Require an exact slot base. Integer division alone would map an
+            // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
+            // the freemap — or free a live neighbor.
+            const auto offset = item - slab_start;
+            if (offset < 0)
+            {
+                throw std::invalid_argument(
+                    "Invalid item pointer; address is before slab start");
+            }
+            const std::size_t byte_offset = static_cast<std::size_t>(offset);
+            const std::size_t item_index = byte_offset / ElemSize;
+            if (item_index >= slab_slots.size()
+                || item != slab_start + item_index * ElemSize)
+            {
+                throw std::invalid_argument(
+                    "Invalid item pointer; not aligned to a slot boundary");
+            }
+
             if (slab_slots.test(item_index))
             {
                 // Free the item

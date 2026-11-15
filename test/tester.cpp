@@ -164,8 +164,14 @@ TEST(SlabTest, DeallocateInvalidItem)
     EXPECT_THROW(slab.deallocateItem(invalid_item), std::invalid_argument);
     std::free(invalid_item);
 
-    // double free
+    // Interior pointer into a live slot must not clear that (or any) bit.
+    EXPECT_THROW(slab.deallocateItem(item1 + 1), std::invalid_argument);
+    EXPECT_THROW(slab.deallocateItem(item1 + 128), std::invalid_argument);
+
+    // Valid free still works after rejected interior frees.
     slab.deallocateItem(item1);
+
+    // double free
     EXPECT_THROW(slab.deallocateItem(item1), std::invalid_argument);
 }
 

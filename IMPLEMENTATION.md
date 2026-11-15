@@ -473,8 +473,9 @@ std::map<std::byte*, std::size_t> base_address_map;
 
 1. **`findSlabForItem`**: if the candidate range check fails (or there is no predecessor), emit `debug_println` (when verbose debug is on) and return `std::nullopt`
 2. **`deallocateItem`**: if the optional is empty, throw `std::invalid_argument` (“no corresponding slab found”)
+3. **`deallocateItem`**: require an **exact slot base** — `item == slab_start + index * ElemSize` (and `index` in range). An interior pointer must not use integer division alone (that would clear the wrong freemap bit)
 
-So invalid frees are **detectable errors**, not `runtime_assert` fatals. Callers that pass non-pool pointers or already-freed addresses should expect an exception from the slab layer (Pool still assumes a well-formed header behind the user pointer).
+So invalid frees are **detectable errors**, not `runtime_assert` fatals. Callers that pass non-pool pointers, interior pointers, or already-freed addresses should expect an exception from the slab layer (Pool still assumes a well-formed header behind the user pointer).
 
 ### Why This Works
 
