@@ -261,19 +261,23 @@ Default layout (alignment ≤ 8 → header_size = 8):
 
 **Rules implemented in `Pool::allocate`:**
 
-- `alignment` must be a power of two in `[4, 16]` (default `8`)
+- `alignment` must be a power of two in `[4, 64]` (default `8`)
 - `header_size = max(8, alignment)` — at least 8 bytes so size + header_size byte always fit; larger alignments widen the prefix so the user pointer stays aligned
-- Slab selection uses **`alloc_size`**, not bare `N`
+- Request align **4/8** map to native **axis 16** (slot over-align is valid; header stays 8)
+- **Compound-key slabs** `Slab<ElemSize, Alignment>` with per-axis ladders (16 eager; 32/64 lazy on first use)
+- Beyond that axis’s max footprint → `SlabProxy` (always `align_val_t{64}`)
+- Slab selection uses **`(alloc_size, nativeAxis(alignment))`**
 
 **Overhead examples** (header only, before bitset amortization):
 
-| User request N | Alignment | header_size | alloc_size | Size class | Header / N |
-|----------------|-----------|-------------|------------|------------|------------|
-| 128 | 8 (default) | 8 | 136 | 192B | 6.25% |
-| 100 | 8 | 8 | 108 | 128B | 8% |
-| 16 | 8 | 8 | 24 | 32B | 50% |
-| 8 | 8 | 8 | 16 | 16B | 100% of footprint is half header |
-| 64 | 16 | 16 | 80 | 96B | 25% |
+| User request N | Alignment | header_size | alloc_size | Size class / path | Header / N |
+|----------------|-----------|-------------|------------|-------------------|------------|
+| 128 | 8 (default) | 8 | 136 | 192B (axis 16) | 6.25% |
+| 100 | 8 | 8 | 108 | 128B (axis 16) | 8% |
+| 16 | 8 | 8 | 24 | 32B (axis 16) | 50% |
+| 8 | 8 | 8 | 16 | 16B (axis 16) | 100% of footprint is half header |
+| 64 | 16 | 16 | 80 | 96B (axis 16) | 25% |
+| 64 | 64 | 64 | 128 | 128B (axis 64, lazy) | 100% |
 
 **Why this design?**
 
@@ -297,17 +301,19 @@ std::byte* Pool::allocate(std::size_t size, std::size_t alignment = 8);
 | Rule | Detail |
 |------|--------|
 | Default | `alignment = 8` |
-| Allowed | Power of two in **`[4, 16]`** |
-| Rejected | Non-power-of-two, `< 4`, or `> 16` → `std::invalid_argument` (debug builds also `runtime_assert`) |
+| Allowed | Power of two in **`[4, 64]`** (`kMinAlignment` … `kMaxAlignment`) |
+| Rejected | `< 4` or `> 64` → `std::invalid_argument` (debug builds also `runtime_assert`; power-of-two is assert-checked) |
 | Header width | `header_size = max(8, alignment)` so the returned user pointer is aligned |
-| Slab buffers | Underlying small-slab storage is 16-byte aligned, which covers all supported requests |
+| Native axis | `nativeAxis(align)`: 4/8/16 → **16**; 32 → 32; 64 → 64 |
+| Size classes | `Slab<ElemSize, Alignment>` ladders per axis (16 eager; 32/64 lazy) |
+| Over axis max | `SlabProxy` with always `align_val_t{64}` |
+| Factories | `static_assert(alignof(T) ≤ 64)` |
 
 **Examples:**
-- `allocate(64)` → 8-byte header, footprint 72 → 96B class
-- `allocate(64, 16)` → 16-byte header, footprint 80 → 96B class
+- `allocate(64)` → 8-byte header, footprint 72 → 96B class (axis 16)
+- `allocate(64, 16)` → 16-byte header, footprint 80 → 96B class (axis 16)
+- `allocate(64, 64)` → 64-byte header, footprint 128 → 128B class (axis 64, lazy slab)
 - `alignof(T)` from `make_pool_unique` / `PoolAllocator` is passed through when constructing objects
-
-Wider alignments (cache line 64, AVX 32) are **not** supported yet; see [Future Enhancements](#future-enhancements).
 
 ---
 
@@ -315,11 +321,11 @@ Wider alignments (cache line 64, AVX 32) are **not** supported yet; see [Future 
 
 End-to-end path for a typical call `pool.allocate(100)` (default alignment 8):
 
-1. **Validate** — reject `N > 1_GB`; require power-of-two alignment in `[4, 16]`
+1. **Validate** — reject `N > 1_GB`; require alignment in `[4, 64]` (power-of-two checked in debug)
 2. **Compute header** — `header_size = max(8, 8) = 8`
 3. **Compute footprint** — `alloc_size = 100 + 8 = 108`
-4. **Select slab** — under the pool lock, `selectSlab(108)` → index for the **128B** class (not 96B: 108 > 96)
-5. **Allocate slot** — release pool lock conceptually after choosing the slab pointer; the slab’s own lock guards bitset updates; return a slot base pointer
+4. **Select slab** — `nativeAxis(8) → 16`, then `selectClassIndex(108, 16)` → **128B** class (not 96B: 108 > 96); lazy axes use `slab_init_lock` on first create
+5. **Allocate slot** — slab’s own lock guards bitset updates; return a slot base pointer
 6. **Write header** — at `base + header_size − 4` store `108`; at `base + header_size − 5` store `8`
 7. **Return** — `base + header_size` to the caller
 
@@ -1795,8 +1801,8 @@ make BUILD_TYPE=threadsan test        # data races / lock misuse
 - Educational value: Performance analysis techniques
 
 **Memory Alignment**
-- ✅ Power-of-two alignments 4…16 via `allocate(size, alignment)` (COMPLETED; see [Memory Layout](#memory-layout))
-- Wider alignments (cache line / SIMD 32–64) still future work
+- ✅ Power-of-two alignments 4…64 via `allocate(size, alignment)` (COMPLETED; see [Memory Layout](#memory-layout))
+- ✅ Compound-key `Slab<ElemSize, Alignment>` ladders (16 eager; 32/64 lazy); `SlabProxy` always 64-align
 - Educational value: Hardware-aware programming
 
 **STL Allocator Interface**

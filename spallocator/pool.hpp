@@ -33,16 +33,98 @@
 #ifndef POOL_HPP_
 #define POOL_HPP_
 
+#include <array>
+#include <limits>
+#include <memory>
+
 #include "slab.hpp"
 
 
 namespace spallocator
 {
 
+    // Alignment contract for Pool::allocate:
+    // - Powers of two in [kMinAlignment, kMaxAlignment]
+    // - Request aligns 4/8 map to native axis 16 (slot over-align is fine)
+    // - Axes 16 / 32 / 64 use Slab<ElemSize, Alignment> size ladders
+    // - Beyond that axis's max footprint → SlabProxy (always align_val_t{64})
+    inline constexpr std::size_t kMinAlignment = 4;
+    inline constexpr std::size_t kSlabNativeAlignment = 16;
+    inline constexpr std::size_t kMaxAlignment = 64;
+    inline constexpr std::size_t kSlabIndexNpos = std::numeric_limits<std::size_t>::max();
+
+    inline constexpr std::size_t kLadder16[] = {
+        16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024};
+    inline constexpr std::size_t kLadder32[] = {
+        32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048};
+    inline constexpr std::size_t kLadder64[] = {
+        64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
+
+    inline constexpr std::size_t kLadder16Count =
+        sizeof(kLadder16) / sizeof(kLadder16[0]);
+    inline constexpr std::size_t kLadder32Count =
+        sizeof(kLadder32) / sizeof(kLadder32[0]);
+    inline constexpr std::size_t kLadder64Count =
+        sizeof(kLadder64) / sizeof(kLadder64[0]);
+
+    // Map request alignment to a native slab axis (4/8 → 16).
+    constexpr std::size_t nativeAxis(std::size_t alignment)
+    {
+        if (alignment <= kSlabNativeAlignment)
+        {
+            return kSlabNativeAlignment;
+        }
+        return alignment;
+    }
+
+    constexpr std::size_t axisMaxElem(std::size_t axis)
+    {
+        if (axis <= kSlabNativeAlignment)
+        {
+            return 1024;
+        }
+        if (axis == 32)
+        {
+            return 2048;
+        }
+        return 4096; // axis 64
+    }
+
+    constexpr std::size_t selectClassIndex(std::size_t alloc_size, std::size_t axis)
+    {
+        const std::size_t* ladder = nullptr;
+        std::size_t count = 0;
+        if (axis <= kSlabNativeAlignment)
+        {
+            ladder = kLadder16;
+            count = kLadder16Count;
+        }
+        else if (axis == 32)
+        {
+            ladder = kLadder32;
+            count = kLadder32Count;
+        }
+        else
+        {
+            ladder = kLadder64;
+            count = kLadder64Count;
+        }
+
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (alloc_size <= ladder[i])
+            {
+                return i;
+            }
+        }
+        return kSlabIndexNpos;
+    }
+
+
     struct Allocation
     {
         std::byte* ptr;
-        std::size_t size;        
+        std::size_t size;
     };
 
 
@@ -55,7 +137,16 @@ namespace spallocator
         Pool();
         ~Pool() = default;
 
-        constexpr::size_t selectSlab(std::size_t size) const;
+        // Default: axis 16. Pass alignment (or use selectClassIndex) for 32/64.
+        constexpr std::size_t selectSlab(std::size_t size) const
+        {
+            return selectClassIndex(size, kSlabNativeAlignment);
+        }
+
+        constexpr std::size_t selectSlab(std::size_t size, std::size_t alignment) const
+        {
+            return selectClassIndex(size, nativeAxis(alignment));
+        }
 
     private: // methods
         Pool(const Pool&) = delete;
@@ -63,12 +154,117 @@ namespace spallocator
         Pool(Pool&&) = delete;
         Pool& operator=(Pool&&) = delete;
 
+        AbstractSlab* resolveSlab(std::size_t alloc_size, std::size_t axis);
+        AbstractSlab* getOrCreateLazy(std::size_t axis, std::size_t index);
+
+        static std::unique_ptr<AbstractSlab> makeLazySlab(std::size_t axis,
+                                                         std::size_t index);
+
     private: // data members
-        std::vector<std::unique_ptr<AbstractSlab>> small_slabs;
+        std::array<std::unique_ptr<AbstractSlab>, kLadder16Count> slabs16{};
+        std::array<std::unique_ptr<AbstractSlab>, kLadder32Count> slabs32{};
+        std::array<std::unique_ptr<AbstractSlab>, kLadder64Count> slabs64{};
         SlabProxy large_slab;
 
         SpinLock lock;
+        SpinLock slab_init_lock;
     };
+
+
+    inline std::unique_ptr<AbstractSlab> Pool::makeLazySlab(std::size_t axis,
+                                                           std::size_t index)
+    {
+        if (axis == 32)
+        {
+            switch (index)
+            {
+                case 0:  return std::make_unique<Slab<32, 32>>();
+                case 1:  return std::make_unique<Slab<64, 32>>();
+                case 2:  return std::make_unique<Slab<96, 32>>();
+                case 3:  return std::make_unique<Slab<128, 32>>();
+                case 4:  return std::make_unique<Slab<192, 32>>();
+                case 5:  return std::make_unique<Slab<256, 32>>();
+                case 6:  return std::make_unique<Slab<384, 32>>();
+                case 7:  return std::make_unique<Slab<512, 32>>();
+                case 8:  return std::make_unique<Slab<768, 32>>();
+                case 9:  return std::make_unique<Slab<1024, 32>>();
+                case 10: return std::make_unique<Slab<1536, 32>>();
+                case 11: return std::make_unique<Slab<2048, 32>>();
+                default: break;
+            }
+        }
+        else if (axis == 64)
+        {
+            switch (index)
+            {
+                case 0:  return std::make_unique<Slab<64, 64>>();
+                case 1:  return std::make_unique<Slab<128, 64>>();
+                case 2:  return std::make_unique<Slab<192, 64>>();
+                case 3:  return std::make_unique<Slab<256, 64>>();
+                case 4:  return std::make_unique<Slab<384, 64>>();
+                case 5:  return std::make_unique<Slab<512, 64>>();
+                case 6:  return std::make_unique<Slab<768, 64>>();
+                case 7:  return std::make_unique<Slab<1024, 64>>();
+                case 8:  return std::make_unique<Slab<1536, 64>>();
+                case 9:  return std::make_unique<Slab<2048, 64>>();
+                case 10: return std::make_unique<Slab<3072, 64>>();
+                case 11: return std::make_unique<Slab<4096, 64>>();
+                default: break;
+            }
+        }
+        throw std::invalid_argument(
+            std::format("Invalid lazy slab axis={} index={}", axis, index));
+    }
+
+
+    inline AbstractSlab* Pool::getOrCreateLazy(std::size_t axis, std::size_t index)
+    {
+        auto& registry = (axis == 32) ? slabs32 : slabs64;
+        {
+            std::scoped_lock<SpinLock> guard(lock);
+            if (registry[index])
+            {
+                return registry[index].get();
+            }
+        }
+
+        std::scoped_lock<SpinLock> init_guard(slab_init_lock);
+        {
+            std::scoped_lock<SpinLock> guard(lock);
+            if (registry[index])
+            {
+                return registry[index].get();
+            }
+        }
+
+        // Heavy construction while holding only slab_init_lock (not Pool::lock).
+        auto created = makeLazySlab(axis, index);
+
+        std::scoped_lock<SpinLock> guard(lock);
+        if (!registry[index])
+        {
+            registry[index] = std::move(created);
+        }
+        return registry[index].get();
+    }
+
+
+    inline AbstractSlab* Pool::resolveSlab(std::size_t alloc_size, std::size_t axis)
+    {
+        const std::size_t index = selectClassIndex(alloc_size, axis);
+        if (index == kSlabIndexNpos)
+        {
+            return &large_slab;
+        }
+
+        if (axis <= kSlabNativeAlignment)
+        {
+            std::scoped_lock<SpinLock> guard(lock);
+            return slabs16[index].get();
+        }
+
+        return getOrCreateLazy(axis, index);
+    }
 
 
     std::byte* Pool::allocate(std::size_t item_size, std::size_t alignment /* = 8 */)
@@ -78,47 +274,28 @@ namespace spallocator
 
         if (item_size > 1_GB)
         {
-            // excessively large allocations don't belong in the pool
-            // allocator; use other allocation methods instead
             throw std::out_of_range("Allocation size exceeds maximum limit for pool allocator");
         }
 
-        runtime_assert((alignment >= 4) && ((alignment & (alignment - 1)) == 0),
-            "Alignment must be a power of two and at least 4 bytes");
-        runtime_assert(alignment <= 16,
-            "Alignment greater than 16 bytes is not supported");
-        if (alignment < 4 || alignment > 16)
+        runtime_assert((alignment & (alignment - 1)) == 0,
+            "Alignment must be a power of two");
+        if (alignment < kMinAlignment || alignment > kMaxAlignment)
         {
             throw std::invalid_argument("Unsupported alignment requested");
         }
-        // ... else the slab native buffer alignment is 16, which can cover
-        // all the supported alignment requests
 
-        // Store footprint metadata in a header immediately before the user
-        // pointer. header_size = max(8, alignment) so the returned pointer
-        // meets alignment; pad bytes may precede the two metadata fields.
-        // Layout (from user pointer backward): uint32 alloc_size at −4,
-        // uint8 header_size at −5. Deallocate uses these to recover the
-        // slab slot base and to re-select the slab.
+        // header_size = max(8, alignment). For align 4/8 this stays 8 (axis 16);
+        // for 16/32/64 it equals the request align so free can recover the axis.
         std::size_t header_size = 8 < alignment ? alignment : 8;
         std::size_t alloc_size = item_size + header_size;
         alloc.size = alloc_size;
 
-        AbstractSlab* slab = nullptr;
-        {
-            std::scoped_lock<SpinLock> guard(lock);
-            auto slab_index = selectSlab(alloc_size);
-            if (slab_index != std::numeric_limits<std::size_t>::max())
-            {
-                slab = small_slabs[slab_index].get();
-            }
-            else
-            {
-                slab = &large_slab;
-            }
-            debug_println("Allocated {} bytes, slab={}", alloc_size,
-                          (slab == &large_slab) ? "large_slab" : std::format("small_slab {}", slab_index));
-        }
+        const std::size_t axis = nativeAxis(alignment);
+        AbstractSlab* slab = resolveSlab(alloc_size, axis);
+        debug_println("Allocated {} bytes, axis={}, slab={}",
+                      alloc_size, axis,
+                      (slab == &large_slab) ? "large_slab" : "size_class");
+
         alloc.ptr = slab->allocateItem(alloc_size);
 
         uint32_t* size_ptr = reinterpret_cast<uint32_t*>(alloc.ptr + header_size - 4);
@@ -146,58 +323,34 @@ namespace spallocator
 
         std::byte* original_ptr = item - header_size;
 
-        AbstractSlab* slab = nullptr;
-        {
-            std::scoped_lock<SpinLock> guard(lock);
-            auto slab_index = selectSlab(alloc_size);
-            if (slab_index != std::numeric_limits<std::size_t>::max())
-            {
-                slab = small_slabs[slab_index].get();
-            }
-            else
-            {
-                slab = &large_slab;
-            }
-            debug_println("Deallocating {} bytes at ptr={}, slab={}",
-                          alloc_size, static_cast<void*>(original_ptr),
-                          (slab == &large_slab) ? "large_slab" : std::format("small_slab {}", slab_index));
-        }
+        // header_size 8 or 16 → axis 16; 32 → 32; 64 → 64.
+        const std::size_t axis = (header_size <= kSlabNativeAlignment)
+            ? kSlabNativeAlignment
+            : static_cast<std::size_t>(header_size);
+
+        AbstractSlab* slab = resolveSlab(alloc_size, axis);
+        debug_println("Deallocating {} bytes at ptr={}, axis={}, slab={}",
+                      alloc_size, static_cast<void*>(original_ptr), axis,
+                      (slab == &large_slab) ? "large_slab" : "size_class");
         slab->deallocateItem(original_ptr);
     }
 
 
-    constexpr std::size_t Pool::selectSlab(std::size_t size) const
-    {
-        if (size <= 16) return 0;
-        else if (size <= 32) return 1;
-        else if (size <= 48) return 2;
-        else if (size <= 64) return 3;
-        else if (size <= 96) return 4;
-        else if (size <= 128) return 5;
-        else if (size <= 192) return 6;
-        else if (size <= 256) return 7;
-        else if (size <= 384) return 8;
-        else if (size <= 512) return 9;
-        else if (size <= 768) return 10;
-        else if (size <= 1_KB) return 11;
-        else return std::numeric_limits<std::size_t>::max(); // indicates large slab
-    }
-
     Pool::Pool()
     {
-        // create slabs for small sizes (up to 1KB)
-        small_slabs.push_back(std::make_unique<Slab<16>>());   // 0
-        small_slabs.push_back(std::make_unique<Slab<32>>());   // 1
-        small_slabs.push_back(std::make_unique<Slab<48>>());   // 2
-        small_slabs.push_back(std::make_unique<Slab<64>>());   // 3
-        small_slabs.push_back(std::make_unique<Slab<96>>());   // 4
-        small_slabs.push_back(std::make_unique<Slab<128>>());  // 5
-        small_slabs.push_back(std::make_unique<Slab<192>>());  // 6
-        small_slabs.push_back(std::make_unique<Slab<256>>());  // 7
-        small_slabs.push_back(std::make_unique<Slab<384>>());  // 8
-        small_slabs.push_back(std::make_unique<Slab<512>>());  // 9
-        small_slabs.push_back(std::make_unique<Slab<768>>());  // 10
-        small_slabs.push_back(std::make_unique<Slab<1_KB>>()); // 11
+        // Eager native-16 ladder only; 32/64 axes are created on first use.
+        slabs16[0]  = std::make_unique<Slab<16, 16>>();
+        slabs16[1]  = std::make_unique<Slab<32, 16>>();
+        slabs16[2]  = std::make_unique<Slab<48, 16>>();
+        slabs16[3]  = std::make_unique<Slab<64, 16>>();
+        slabs16[4]  = std::make_unique<Slab<96, 16>>();
+        slabs16[5]  = std::make_unique<Slab<128, 16>>();
+        slabs16[6]  = std::make_unique<Slab<192, 16>>();
+        slabs16[7]  = std::make_unique<Slab<256, 16>>();
+        slabs16[8]  = std::make_unique<Slab<384, 16>>();
+        slabs16[9]  = std::make_unique<Slab<512, 16>>();
+        slabs16[10] = std::make_unique<Slab<768, 16>>();
+        slabs16[11] = std::make_unique<Slab<1024, 16>>();
     }
 
 }; // namespace spallocator

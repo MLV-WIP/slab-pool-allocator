@@ -216,6 +216,7 @@ TEST(PoolTest, Selector)
 {
     Pool pool;
 
+    // Default selectSlab(size) ⇒ axis 16
     EXPECT_EQ(pool.selectSlab(16), 0u);
     EXPECT_EQ(pool.selectSlab(32), 1u);
     EXPECT_EQ(pool.selectSlab(48), 2u);
@@ -259,6 +260,32 @@ TEST(PoolTest, Selector)
     EXPECT_EQ(pool.selectSlab(769), 11u);
     EXPECT_EQ(pool.selectSlab(1023), 11u);
     EXPECT_EQ(pool.selectSlab(1025), std::numeric_limits<std::size_t>::max());
+
+    // Align 4/8 map to axis 16
+    EXPECT_EQ(nativeAxis(4), 16u);
+    EXPECT_EQ(nativeAxis(8), 16u);
+    EXPECT_EQ(nativeAxis(16), 16u);
+    EXPECT_EQ(nativeAxis(32), 32u);
+    EXPECT_EQ(nativeAxis(64), 64u);
+    EXPECT_EQ(pool.selectSlab(64, 8), pool.selectSlab(64));
+    EXPECT_EQ(pool.selectSlab(64, 4), pool.selectSlab(64));
+
+    // Explicit axis 32 ladder (incl. denser top)
+    EXPECT_EQ(pool.selectSlab(32, 32), 0u);
+    EXPECT_EQ(pool.selectSlab(96, 32), 2u);
+    EXPECT_EQ(pool.selectSlab(1024, 32), 9u);
+    EXPECT_EQ(pool.selectSlab(1536, 32), 10u);
+    EXPECT_EQ(pool.selectSlab(2048, 32), 11u);
+    EXPECT_EQ(pool.selectSlab(2049, 32), std::numeric_limits<std::size_t>::max());
+
+    // Explicit axis 64 ladder
+    EXPECT_EQ(pool.selectSlab(64, 64), 0u);
+    EXPECT_EQ(pool.selectSlab(1024, 64), 7u);
+    EXPECT_EQ(pool.selectSlab(1536, 64), 8u);
+    EXPECT_EQ(pool.selectSlab(2048, 64), 9u);
+    EXPECT_EQ(pool.selectSlab(3072, 64), 10u);
+    EXPECT_EQ(pool.selectSlab(4096, 64), 11u);
+    EXPECT_EQ(pool.selectSlab(4097, 64), std::numeric_limits<std::size_t>::max());
 }
 
 
@@ -424,7 +451,7 @@ TEST(PoolTest, uniquePoolPtr)
 
 
 // Throws on the Nth successful live object when constructed == throw_at.
-// alignas(8): Pool::allocate requires alignment in [4, 16]; empty types are
+// alignas(8): Pool::allocate requires alignment in [4, 64]; empty types are
 // often alignof 1 and would hit the alignment check before the ctor path.
 struct alignas(8) ThrowOnNthConstruct
 {
@@ -543,16 +570,18 @@ TEST(PoolTest, Alignment)
 {
     Pool pool;
 
-    for (size_t align : { 4, 8, 16 })
+    for (size_t align : { 4, 8, 16, 32, 64 })
     {
         std::vector<std::byte*> items;
-        for (int i = 0; i <= 64; ++i)
+        // Fewer rounds for 32/64: lazy size-class slabs on first use.
+        int rounds = (align > 16) ? 8 : 64;
+        for (int i = 0; i <= rounds; ++i)
         {
             for (size_t size = 1; size <= 128; ++size)
             {
                 auto item = pool.allocate(size, align);
                 EXPECT_NE(item, nullptr);
-                EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % align, 0u); // align-byte alignment
+                EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % align, 0u);
                 items.push_back(item);
             }
         }
@@ -562,6 +591,77 @@ TEST(PoolTest, Alignment)
             pool.deallocate(it);
         }
     }
+
+    EXPECT_THROW(pool.allocate(16, 128), std::invalid_argument);
+}
+
+
+TEST(PoolTest, HighAlignmentFactories)
+{
+    Pool pool;
+
+    struct alignas(32) AvxLike
+    {
+        std::byte data[32];
+    };
+    struct alignas(64) CacheLine
+    {
+        std::byte data[64];
+    };
+
+    {
+        auto p = make_pool_unique<AvxLike>(pool);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p.get()) % 32, 0u);
+    }
+    {
+        auto p = make_pool_unique<CacheLine>(pool);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p.get()) % 64, 0u);
+    }
+    {
+        auto p = make_pool_shared<CacheLine>(pool);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p.get()) % 64, 0u);
+    }
+    {
+        auto arr = make_pool_unique<CacheLine[]>(pool, 3);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(arr.get()) % 64, 0u);
+    }
+}
+
+
+// High-align size classes reuse slots; over-axis-max uses SlabProxy.
+TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
+{
+    Pool pool;
+
+    std::vector<std::byte*> first_round;
+    for (int i = 0; i < 32; ++i)
+    {
+        auto* p = pool.allocate(64, 64);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p) % 64, 0u);
+        first_round.push_back(p);
+    }
+    for (auto* p : first_round)
+    {
+        pool.deallocate(p);
+    }
+
+    // Re-allocate into the same axis-64 size class (lazy slab already live).
+    for (int i = 0; i < 32; ++i)
+    {
+        auto* p = pool.allocate(64, 64);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p) % 64, 0u);
+        pool.deallocate(p);
+    }
+
+    // Footprint > 4096 on axis 64 → Proxy (still 64-byte aligned storage).
+    auto* big = pool.allocate(4100, 64);
+    EXPECT_NE(big, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(big) % 64, 0u);
+    pool.deallocate(big);
+
+    auto* mid = pool.allocate(2000, 32);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(mid) % 32, 0u);
+    pool.deallocate(mid);
 }
 
 

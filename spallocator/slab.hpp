@@ -83,7 +83,9 @@ namespace spallocator
     };
 
 
-    template<const std::size_t ElemSize>
+    // Compound key: every slot is Alignment-aligned because the buffer uses
+    // align_val_t{Alignment} and ElemSize is a multiple of Alignment.
+    template<std::size_t ElemSize, std::size_t Alignment = 16>
     class Slab: public AbstractSlab
     {
     public: // methods
@@ -91,6 +93,7 @@ namespace spallocator
         void deallocateItem(std::byte* item);
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
+        constexpr std::size_t getAlignment() const { return Alignment; }
         constexpr std::size_t getAllocSize() const { return slab_alloc_size; }
         std::size_t getAllocatedMemory() const { return slab_data.size() * slab_alloc_size; }
 
@@ -108,6 +111,13 @@ namespace spallocator
         void allocateNewSlab();
     
     private: // data members
+        static_assert(Alignment == 16 || Alignment == 32 || Alignment == 64,
+            "Slab Alignment must be 16, 32, or 64");
+        static_assert(ElemSize % Alignment == 0,
+            "ElemSize must be a multiple of Alignment");
+        static_assert(ElemSize >= Alignment,
+            "ElemSize must be at least Alignment");
+
         static constexpr std::size_t slab_alloc_size{selectBufferSize<ElemSize>()};
         static_assert(slab_alloc_size >= 4_KB, "Allocation size must be greater than 4096 bytes");
         static_assert(
@@ -185,8 +195,8 @@ namespace spallocator
     }
 
 
-    template<const std::size_t ElemSize>
-    std::byte* Slab<ElemSize>::allocateItem(std::size_t size)
+    template<std::size_t ElemSize, std::size_t Alignment>
+    std::byte* Slab<ElemSize, Alignment>::allocateItem(std::size_t size)
     {
         // Must remain active in release builds: an oversized request would
         // otherwise be placed in a too-small slot (silent overrun).
@@ -211,8 +221,8 @@ namespace spallocator
             {
                 // need to allocate a new slab
                 allocateNewSlab();
-                debug_println("New slab<{}> allocated, total slabs: {}/{}",
-                              ElemSize, slab_data.size(), slab_map.size());
+                debug_println("New slab<{},{}> allocated, total slabs: {}/{}",
+                              ElemSize, Alignment, slab_data.size(), slab_map.size());
             }
 
             auto& slab_slots = slab_map[slab_index];
@@ -227,19 +237,21 @@ namespace spallocator
                         // this slab is now full
                         slab_available_map.reset(slab_index);
                     }
-                    debug_println("Item allocated ({}/{}), slab_map<{}>: {}",
-                                  slab_index, item_index, ElemSize, printHex(slab_slots));
+                    debug_println("Item allocated ({}/{}), slab_map<{},{}>: {}",
+                                  slab_index, item_index, ElemSize, Alignment,
+                                  printHex(slab_slots));
                     return slab_data[slab_index] + item_index * ElemSize;
                 }
             }
         }
 
-        throw std::out_of_range(std::format("Memory for {}-byte slab has been exhausted", ElemSize));
+        throw std::out_of_range(std::format(
+            "Memory for {}-byte / {}-align slab has been exhausted", ElemSize, Alignment));
     }
 
 
-    template<const std::size_t ElemSize>
-    std::optional<std::size_t> Slab<ElemSize>::findSlabForItem(std::byte* item) const
+    template<std::size_t ElemSize, std::size_t Alignment>
+    std::optional<std::size_t> Slab<ElemSize, Alignment>::findSlabForItem(std::byte* item) const
     {
         auto it = base_address_map.upper_bound(item);
         if (it != base_address_map.begin())
@@ -265,8 +277,8 @@ namespace spallocator
     }
 
 
-    template<const std::size_t ElemSize>
-    void Slab<ElemSize>::deallocateItem(std::byte* item)
+    template<std::size_t ElemSize, std::size_t Alignment>
+    void Slab<ElemSize, Alignment>::deallocateItem(std::byte* item)
     {
         if (!item)
         {
@@ -310,11 +322,11 @@ namespace spallocator
     }
 
 
-    template<const std::size_t ElemSize>
-    Slab<ElemSize>::Slab()
+    template<std::size_t ElemSize, std::size_t Alignment>
+    Slab<ElemSize, Alignment>::Slab()
     {
-        debug_println("Slab created with element size: {}, allocation size: {}",
-                      getElemSize(), getAllocSize());
+        debug_println("Slab created with element size: {}, alignment: {}, allocation size: {}",
+                      getElemSize(), getAlignment(), getAllocSize());
 
         // all slabs are initially available
         slab_available_map.set();
@@ -322,8 +334,8 @@ namespace spallocator
         allocateNewSlab();
     }
 
-    template<const std::size_t ElemSize>
-    Slab<ElemSize>::~Slab()
+    template<std::size_t ElemSize, std::size_t Alignment>
+    Slab<ElemSize, Alignment>::~Slab()
     {
         debug_println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
         for (auto ptr : slab_data)
@@ -334,15 +346,15 @@ namespace spallocator
             // gcc-14's implementation of the address sanitizer in spite of
             // otherwise decent C++23 support, so we need to use the older C++17
             // style deallocation here for portability
-            ::operator delete[](ptr, std::align_val_t{16});  // Explicitly pass alignment
+            ::operator delete[](ptr, std::align_val_t{Alignment});
 
             // Preferred C++23 form that we are avoiding for now due to above issues:
             //delete[] ptr;
         }
     }
 
-    template<const std::size_t ElemSize>
-    void Slab<ElemSize>::allocateNewSlab()
+    template<std::size_t ElemSize, std::size_t Alignment>
+    void Slab<ElemSize, Alignment>::allocateNewSlab()
     {
         if (slab_data.size() >= max_slabs)
         {
@@ -351,24 +363,22 @@ namespace spallocator
                             max_slabs, slab_alloc_size));
         }
 
-        static_assert(ElemSize >= 16,
-            "Element size must be at least 16 bytes");
-        static_assert(ElemSize % 16 == 0,
-            "Element size must be a multiple of 16 bytes");
-    
-        // allocate a new slab of memory
-        std::byte* new_slab = new(std::align_val_t{16}) std::byte[slab_alloc_size];
+        std::byte* new_slab = new(std::align_val_t{Alignment}) std::byte[slab_alloc_size];
         slab_data.push_back(new_slab);
         base_address_map[new_slab] = slab_data.size() - 1;
         slab_map.emplace_back();
     }
 
 
+    // SlabProxy: oversize / beyond-axis-max path. Always uses 64-byte aligned
+    // new/delete so any Pool request alignment ≤ 64 is satisfied.
+    inline constexpr std::size_t kProxyAlignment = 64;
+
     inline std::byte* SlabProxy::allocateItem(std::size_t elem_size)
     {
         // Active in all build types (not runtime_assert): mis-sized large
         // allocations must fail loudly rather than allocate or be rejected
-        // only under DEBUG_BUILD.
+        // only under DEBUG_BUILD. Lower bound is the smallest axis max (1KB).
         if (elem_size <= 1_KB)
         {
             throw std::invalid_argument(
@@ -380,29 +390,18 @@ namespace spallocator
                 std::format("Requested size {} exceeds maximum allowed size for SlabProxy", elem_size));
         }
 
-        // allocate memory using standard methods
-        std::byte* item = new(std::align_val_t{16}) std::byte[elem_size];
-        debug_println("Allocated {} bytes via SlabProxy, ptr={}",
-                      elem_size, static_cast<void*>(item));
+        std::byte* item = new(std::align_val_t{kProxyAlignment}) std::byte[elem_size];
+        debug_println("Allocated {} bytes via SlabProxy (align={}), ptr={}",
+                      elem_size, kProxyAlignment, static_cast<void*>(item));
         return item;
     }
 
 
     inline void SlabProxy::deallocateItem(std::byte* item)
     {
-        // deallocate memory using standard methods
         debug_println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));
 
-        // C++23 is improved to handle aligned deallocation automatically.
-        // For earlier standards, we need to explicitly pass the alignment
-        // to the delete operator. Unfortunately, this is incomplete in
-        // gcc-14's implementation of the address sanitizer in spite of
-        // otherwise decent C++23 support, so we need to use the older C++17
-        // style deallocation here for portability
-        ::operator delete[](item, std::align_val_t{16});  // Explicitly pass alignment
-
-        // Preferred C++23 form that we are avoiding for now due to above issues:
-        //delete[] item;
+        ::operator delete[](item, std::align_val_t{kProxyAlignment});
     }
 
 

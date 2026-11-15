@@ -17,7 +17,7 @@ README.md             # this overview + build/run
 
 ## Key Features
 
-- **12 size classes** (16B–1KB) with intermediate sizes to cut fragmentation
+- **Compound-key size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB
 - **Thread-safe pool** with two-level locking and large-allocation fallback (>1KB)
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>`
 - **LifetimeObserver** with atomic liveness checks for async callbacks (object use still needs sync); **SpinLock** (TTAS → backoff → block)
@@ -130,11 +130,15 @@ int main() {
 
 ### Size Classes
 
-12 size classes from 16B to 1KB, optimized for common allocation patterns:
+Per-alignment ladders (`Slab<ElemSize, Alignment>`). Align 4/8 use the 16-byte axis.
 
 ```
-16B, 32B, 48B, 64B, 96B, 128B, 192B, 256B, 384B, 512B, 768B, 1024B
+Axis 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
+Axis 32 (lazy):  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+Axis 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 ```
+
+Beyond an axis max → `SlabProxy` (always 64-byte aligned `new[]`).
 
 Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs are selected by **total footprint** (requested size + allocation header), not the user size alone — see [IMPLEMENTATION.md](IMPLEMENTATION.md).
 

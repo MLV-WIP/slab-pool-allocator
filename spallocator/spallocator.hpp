@@ -91,6 +91,8 @@ namespace spallocator
         requires (!std::is_array_v<T>)
     constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, Args&&... args)
     {
+        static_assert(alignof(T) <= kMaxAlignment,
+            "make_pool_unique: alignof(T) exceeds Pool max alignment (64)");
         void* mem = pool.allocate(sizeof(T), alignof(T));
         try
         {
@@ -111,6 +113,8 @@ namespace spallocator
     constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, std::size_t size)
     {
         using ElementType = std::remove_extent_t<T>;
+        static_assert(alignof(ElementType) <= kMaxAlignment,
+            "make_pool_unique: alignof(element) exceeds Pool max alignment (64)");
 
         std::size_t array_size = sizeof(ElementType) * size;
         std::size_t alignment = alignof(ElementType) > alignof(std::size_t) ?
@@ -175,6 +179,9 @@ namespace spallocator
         using propagate_on_container_move_assignment = std::false_type;
         using propagate_on_container_swap = std::false_type;
         using is_always_equal = std::false_type;  // Different pools = different allocators
+
+        static_assert(alignof(T) <= kMaxAlignment,
+            "PoolAllocator: alignof(T) exceeds Pool max alignment (64)");
 
         // Constructor - requires a pool reference
         explicit PoolAllocator(spallocator::Pool& pool) noexcept : pool_ref(pool) {}
