@@ -149,7 +149,13 @@ namespace spallocator
     {
     public: // methods
         std::byte* allocate(std::size_t size, std::size_t alignment = 8);
+
+        // Throws std::invalid_argument (or from the slab layer) on bad pointers.
         void deallocate(std::byte* item);
+
+        // Non-throwing free for noexcept clients (PoolAllocator, PoolDeleter).
+        // Returns false if the pointer is not a live pool allocation.
+        bool try_deallocate(std::byte* item) noexcept;
 
         Pool();
         ~Pool() = default;
@@ -298,8 +304,8 @@ namespace spallocator
 
         // Range and power-of-two checks throw in all builds (including release).
         // Non-power-of-two values in [4, 64] (e.g. 12) would break header/axis math.
-        if (alignment < kMinAlignment || alignment > kMaxAlignment
-            || (alignment & (alignment - 1)) != 0)
+        if (alignment < kMinAlignment || alignment > kMaxAlignment ||
+            (alignment & (alignment - 1)) != 0)
         {
             throw std::invalid_argument("Unsupported alignment requested");
         }
@@ -344,52 +350,110 @@ namespace spallocator
 
     void Pool::deallocate(std::byte* item)
     {
-        if (item == nullptr)
-        {
-            return;
-        }
-
-        // Validate header before trusting it to choose a slab (P9).
-        uint8_t header_size = *reinterpret_cast<uint8_t*>(item - 5);
-        if (header_size != 8 && header_size != 16
-            && header_size != 32 && header_size != 64)
-        {
-            throw std::invalid_argument("Invalid allocation header_size");
-        }
-
-        uint8_t magic = *reinterpret_cast<uint8_t*>(item - 6);
-        if (magic != kAllocMagic)
+        if (!try_deallocate(item))
         {
             throw std::invalid_argument(
-                "Invalid allocation magic (not a live pool pointer, or double free)");
+                "Pool::deallocate failed (invalid pointer, corrupt header, or double free)");
         }
+    }
 
-        uint32_t alloc_size_u32 = *reinterpret_cast<uint32_t*>(item - 4);
-        std::size_t alloc_size = alloc_size_u32;
-        if (alloc_size < header_size || alloc_size > 1_GB + kMaxAlignment)
+
+    bool Pool::try_deallocate(std::byte* item) noexcept
+    {
+        if (item == nullptr)
         {
-            throw std::invalid_argument("Invalid allocation size in header");
+            return true;
         }
 
-        std::byte* original_ptr = item - header_size;
-
-        // header_size 8 or 16 → axis 16; 32 → 32; 64 → 64.
-        const std::size_t axis = (header_size <= kSlabNativeAlignment)
-            ? kSlabNativeAlignment
-            : static_cast<std::size_t>(header_size);
-
-        // Invalidate header before returning the slot (detects Pool double-free).
-        *reinterpret_cast<uint8_t*>(item - 6) = 0;
-
+        try
+        {
+            // Metadata always lives in the 8 bytes immediately before the user
+            // pointer. A prior free poisons the header; temporarily unpoison so
+            // double-free / corrupt-header checks can read it without ASan abort.
+            [[maybe_unused]] constexpr std::size_t kHeaderPeek = 8;
 #if defined(SPALLOCATOR_HAS_ASAN)
-        ASAN_POISON_MEMORY_REGION(original_ptr, header_size);
+            const bool header_was_poisoned =
+                __asan_address_is_poisoned(item - 5) != 0;
+            ASAN_UNPOISON_MEMORY_REGION(item - kHeaderPeek, kHeaderPeek);
 #endif
 
-        AbstractSlab* slab = resolveSlab(alloc_size, axis);
-        debug_println("Deallocating {} bytes at ptr={}, axis={}, slab={}",
-                      alloc_size, static_cast<void*>(original_ptr), axis,
-                      (slab == &large_slab) ? "large_slab" : "size_class");
-        slab->deallocateItem(original_ptr);
+            // Validate header before trusting it to choose a slab (P9).
+            uint8_t header_size = *reinterpret_cast<uint8_t*>(item - 5);
+            if (header_size != 8 && header_size != 16 &&
+                header_size != 32 && header_size != 64)
+            {
+                debug_println("Invalid allocation header_size {} at ptr={}",
+                              header_size, static_cast<void*>(item));
+#if defined(SPALLOCATOR_HAS_ASAN)
+                if (header_was_poisoned)
+                {
+                    ASAN_POISON_MEMORY_REGION(item - kHeaderPeek, kHeaderPeek);
+                }
+#endif
+                return false;
+            }
+
+            uint8_t magic = *reinterpret_cast<uint8_t*>(item - 6);
+            if (magic != kAllocMagic)
+            {
+                debug_println(
+                    "Invalid allocation magic {:#x} at ptr={} "
+                    "(not a live pool pointer, or double free)",
+                    magic, static_cast<void*>(item));
+#if defined(SPALLOCATOR_HAS_ASAN)
+                if (header_was_poisoned)
+                {
+                    ASAN_POISON_MEMORY_REGION(item - header_size, header_size);
+                }
+#endif
+                return false;
+            }
+
+            uint32_t alloc_size_u32 = *reinterpret_cast<uint32_t*>(item - 4);
+            std::size_t alloc_size = alloc_size_u32;
+            if (alloc_size < header_size || alloc_size > 1_GB + kMaxAlignment)
+            {
+                debug_println(
+                    "Invalid allocation size {} in header at ptr={} (header_size={})",
+                    alloc_size, static_cast<void*>(item), header_size);
+#if defined(SPALLOCATOR_HAS_ASAN)
+                if (header_was_poisoned)
+                {
+                    ASAN_POISON_MEMORY_REGION(item - header_size, header_size);
+                }
+#endif
+                return false;
+            }
+
+            std::byte* original_ptr = item - header_size;
+
+            // header_size 8 or 16 → axis 16; 32 → 32; 64 → 64.
+            const std::size_t axis = (header_size <= kSlabNativeAlignment)
+                ? kSlabNativeAlignment
+                : static_cast<std::size_t>(header_size);
+
+            // Invalidate header before returning the slot (detects Pool double-free).
+            *reinterpret_cast<uint8_t*>(item - 6) = 0;
+
+#if defined(SPALLOCATOR_HAS_ASAN)
+            ASAN_POISON_MEMORY_REGION(original_ptr, header_size);
+#endif
+
+            AbstractSlab* slab = resolveSlab(alloc_size, axis);
+            debug_println("Deallocating {} bytes at ptr={}, axis={}, slab={}",
+                          alloc_size, static_cast<void*>(original_ptr), axis,
+                          (slab == &large_slab) ? "large_slab" : "size_class");
+            slab->deallocateItem(original_ptr);
+            return true;
+        }
+        catch (...)
+        {
+            // Slab layer may throw; noexcept clients must not see that.
+            debug_println(
+                "Pool::try_deallocate: slab deallocate failed for ptr={}",
+                static_cast<void*>(item));
+            return false;
+        }
     }
 
 

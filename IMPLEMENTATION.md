@@ -261,7 +261,7 @@ Default layout (alignment ≤ 8 → header_size = 8):
 | `−6` | `uint8_t` | Allocation magic (`kAllocMagic`); validated then cleared on free |
 | `−header_size … −7` | padding | Remaining pad so the user pointer meets `alignment` |
 
-**Deallocate checks** (before trusting the header): `header_size ∈ {8,16,32,64}`, magic matches, `header_size ≤ alloc_size ≤ 1_GB + kMaxAlignment`. Non-pool pointers, corrupted headers, and Pool-level double-frees throw `std::invalid_argument`. Returned blocks are exclusively owned until `deallocate`; do not mutate the hidden header. In ASan builds the header region is poisoned after free and unpoisoned on the next allocate into that slot.
+**Deallocate checks** (before trusting the header): `header_size ∈ {8,16,32,64}`, magic matches, `header_size ≤ alloc_size ≤ 1_GB + kMaxAlignment`. Non-pool pointers, corrupted headers, and Pool-level double-frees fail validation. Direct `Pool::deallocate` throws `std::invalid_argument`; `Pool::try_deallocate` returns `false` without throwing. **`PoolAllocator::deallocate` and `PoolDeleter`** are `noexcept` and use `try_deallocate` (abort on failure) so exceptions never cross the STL/`unique_ptr` noexcept boundary. Returned blocks are exclusively owned until free; do not mutate the hidden header. In ASan builds the header region is poisoned after free and unpoisoned on the next allocate into that slot.
 
 **Rules implemented in `Pool::allocate`:**
 

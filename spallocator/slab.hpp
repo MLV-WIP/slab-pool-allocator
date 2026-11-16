@@ -310,8 +310,8 @@ namespace spallocator
             }
             const std::size_t byte_offset = static_cast<std::size_t>(offset);
             const std::size_t item_index = byte_offset / ElemSize;
-            if (item_index >= slab_slots.size()
-                || item != slab_start + item_index * ElemSize)
+            if (item_index >= slab_slots.size() ||
+                item != slab_start + item_index * ElemSize)
             {
                 throw std::invalid_argument(
                     "Invalid item pointer; not aligned to a slot boundary");

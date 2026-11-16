@@ -307,20 +307,43 @@ TEST(PoolTest, DeallocateValidatesHeader)
     ASSERT_NE(live, nullptr);
     *(live - 6) = std::byte{0};
     EXPECT_THROW(pool.deallocate(live), std::invalid_argument);
+    EXPECT_FALSE(pool.try_deallocate(live));
 
     // Corrupt header_size at user − 5 (keep magic intact on a fresh block)
     auto* live2 = pool.allocate(32);
     ASSERT_NE(live2, nullptr);
     *(live2 - 5) = std::byte{7};
     EXPECT_THROW(pool.deallocate(live2), std::invalid_argument);
+    EXPECT_FALSE(pool.try_deallocate(live2));
 
     // Non-pool pointer
     std::byte stack_buf[64]{};
     EXPECT_THROW(pool.deallocate(stack_buf + 16), std::invalid_argument);
+    EXPECT_FALSE(pool.try_deallocate(stack_buf + 16));
 
     // Double free at Pool layer (magic cleared on first free)
     pool.deallocate(p);
     EXPECT_THROW(pool.deallocate(p), std::invalid_argument);
+    EXPECT_FALSE(pool.try_deallocate(p));
+}
+
+
+TEST(PoolAllocatorTest, DeallocateIsNoexcept)
+{
+    Pool pool;
+    PoolAllocator<int> alloc(pool);
+
+    static_assert(noexcept(alloc.deallocate(nullptr, 0)));
+    static_assert(std::is_nothrow_invocable_v<PoolDeleter<int>, int*>);
+
+    int* p = alloc.allocate(1);
+    ASSERT_NE(p, nullptr);
+    alloc.deallocate(p, 1);
+
+    // try_deallocate is the non-throwing policy under noexcept clients
+    EXPECT_TRUE(pool.try_deallocate(nullptr));
+    std::byte junk[32]{};
+    EXPECT_FALSE(pool.try_deallocate(junk + 16));
 }
 
 

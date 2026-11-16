@@ -34,6 +34,7 @@
 #define SPALLOCATOR_HPP_
 
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <ranges>
@@ -46,18 +47,28 @@
 
 namespace spallocator
 {
-    // Custom deleter for unique_ptr that uses Pool::deallocate
+    // noexcept free for unique_ptr / allocator paths. Invalid pointers are
+    // programming errors; abort rather than throw through a noexcept boundary.
+    inline void pool_deallocate_noexcept(Pool& pool, std::byte* p) noexcept
+    {
+        if (!pool.try_deallocate(p))
+        {
+            std::abort();
+        }
+    }
+
+    // Custom deleter for unique_ptr that uses Pool::try_deallocate
     template<typename T>
     struct PoolDeleter
     {
         spallocator::Pool& pool;
 
-        void operator()(T* p) const
+        void operator()(T* p) const noexcept
         {
             if (p)
             {
                 p->~T();  // Explicitly call destructor since we use placement new
-                pool.deallocate(reinterpret_cast<std::byte*>(p));
+                pool_deallocate_noexcept(pool, reinterpret_cast<std::byte*>(p));
             }
         }
     };
@@ -70,14 +81,14 @@ namespace spallocator
 
         const std::size_t size;
 
-        void operator()(T* p) const  // Note: T*, not T*[]
+        void operator()(T* p) const noexcept  // Note: T*, not T*[]
         {
             if (p)
             {
                 // Call destructors in reverse order
                 std::ranges::for_each(std::views::counted(p, size) | std::views::reverse,
                                       [](T& elem){ elem.~T(); });
-                pool.deallocate(reinterpret_cast<std::byte*>(p));
+                pool_deallocate_noexcept(pool, reinterpret_cast<std::byte*>(p));
             }
         }
     };
@@ -208,11 +219,15 @@ namespace spallocator
             return reinterpret_cast<T*>(mem);
         }
 
-        // Deallocate memory
+        // Deallocate memory. Must not throw ([allocator.requirements]);
+        // invalid pointers abort via try_deallocate rather than unwind.
         void deallocate(T* p, std::size_t n) noexcept
         {
             (void)n;  // Size not needed for pool deallocation
-            pool_ref.deallocate(reinterpret_cast<std::byte*>(p));
+            if (p)
+            {
+                pool_deallocate_noexcept(pool_ref, reinterpret_cast<std::byte*>(p));
+            }
         }
 
         // Equality comparison - allocators are equal only if they use the same pool
