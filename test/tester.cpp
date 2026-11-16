@@ -295,6 +295,35 @@ TEST(PoolTest, Selector)
 }
 
 
+TEST(PoolTest, DeallocateValidatesHeader)
+{
+    Pool pool;
+
+    auto* p = pool.allocate(64);
+    ASSERT_NE(p, nullptr);
+
+    // Corrupt magic at user − 6
+    auto* live = pool.allocate(32);
+    ASSERT_NE(live, nullptr);
+    *(live - 6) = std::byte{0};
+    EXPECT_THROW(pool.deallocate(live), std::invalid_argument);
+
+    // Corrupt header_size at user − 5 (keep magic intact on a fresh block)
+    auto* live2 = pool.allocate(32);
+    ASSERT_NE(live2, nullptr);
+    *(live2 - 5) = std::byte{7};
+    EXPECT_THROW(pool.deallocate(live2), std::invalid_argument);
+
+    // Non-pool pointer
+    std::byte stack_buf[64]{};
+    EXPECT_THROW(pool.deallocate(stack_buf + 16), std::invalid_argument);
+
+    // Double free at Pool layer (magic cleared on first free)
+    pool.deallocate(p);
+    EXPECT_THROW(pool.deallocate(p), std::invalid_argument);
+}
+
+
 TEST(PoolTest, AllocateItems)
 {
     Pool pool;

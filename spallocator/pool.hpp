@@ -34,10 +34,23 @@
 #define POOL_HPP_
 
 #include <array>
+#include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 
 #include "slab.hpp"
+
+#if defined(__SANITIZE_ADDRESS__)
+#  define SPALLOCATOR_HAS_ASAN 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define SPALLOCATOR_HAS_ASAN 1
+#  endif
+#endif
+#if defined(SPALLOCATOR_HAS_ASAN)
+#  include <sanitizer/asan_interface.h>
+#endif
 
 
 namespace spallocator
@@ -48,10 +61,14 @@ namespace spallocator
     // - Request aligns 4/8 map to native axis 16 (slot over-align is fine)
     // - Axes 16 / 32 / 64 use Slab<ElemSize, Alignment> size ladders
     // - Beyond that axis's max footprint → SlabProxy (always align_val_t{64})
+    // - Returned memory is exclusively owned until matching deallocate;
+    //   do not free non-pool pointers or mutate the hidden header
     inline constexpr std::size_t kMinAlignment = 4;
     inline constexpr std::size_t kSlabNativeAlignment = 16;
     inline constexpr std::size_t kMaxAlignment = 64;
     inline constexpr std::size_t kSlabIndexNpos = std::numeric_limits<std::size_t>::max();
+    // Written at user_ptr − 6; validated (then cleared) on deallocate.
+    inline constexpr std::uint8_t kAllocMagic = 0xA7;
 
     inline constexpr std::size_t kLadder16[] = {
         16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024};
@@ -292,8 +309,8 @@ namespace spallocator
         // header_size = max(8, alignment). For align 4/8 this stays 8 (axis 16);
         // for 16/32/64 it equals the request align so free can recover the axis.
         // Layout (from user pointer backward): uint32 alloc_size at −4,
-        // uint8 header_size at −5. Deallocate uses these to recover the
-        // slot base (user − header_size) and to re-select the slab via
+        // uint8 header_size at −5, uint8 magic at −6. Deallocate validates
+        // magic/size then recovers the slot base and re-selects the slab via
         // (alloc_size, axis-from-header_size).
         std::size_t header_size = 8 < alignment ? alignment : 8;
         std::size_t alloc_size = item_size + header_size;
@@ -307,11 +324,19 @@ namespace spallocator
 
         alloc.ptr = slab->allocateItem(alloc_size);
 
+#if defined(SPALLOCATOR_HAS_ASAN)
+        // Slot may have been header-poisoned on a prior free.
+        ASAN_UNPOISON_MEMORY_REGION(alloc.ptr, header_size);
+#endif
+
         uint32_t* size_ptr = reinterpret_cast<uint32_t*>(alloc.ptr + header_size - 4);
         *size_ptr = uint32_t(alloc_size & 0xffffffff);
 
         uint8_t* header_size_ptr = reinterpret_cast<uint8_t*>(alloc.ptr + header_size - 5);
         *header_size_ptr = uint8_t(header_size & 0xff);
+
+        uint8_t* magic_ptr = reinterpret_cast<uint8_t*>(alloc.ptr + header_size - 6);
+        *magic_ptr = kAllocMagic;
 
         return alloc.ptr + header_size;
     }
@@ -324,11 +349,27 @@ namespace spallocator
             return;
         }
 
-        uint32_t* size_ptr = reinterpret_cast<uint32_t*>(item - 4);
-        std::size_t alloc_size = *size_ptr;
+        // Validate header before trusting it to choose a slab (P9).
+        uint8_t header_size = *reinterpret_cast<uint8_t*>(item - 5);
+        if (header_size != 8 && header_size != 16
+            && header_size != 32 && header_size != 64)
+        {
+            throw std::invalid_argument("Invalid allocation header_size");
+        }
 
-        uint8_t* header_size_ptr = reinterpret_cast<uint8_t*>(item - 5);
-        uint8_t header_size = *header_size_ptr;
+        uint8_t magic = *reinterpret_cast<uint8_t*>(item - 6);
+        if (magic != kAllocMagic)
+        {
+            throw std::invalid_argument(
+                "Invalid allocation magic (not a live pool pointer, or double free)");
+        }
+
+        uint32_t alloc_size_u32 = *reinterpret_cast<uint32_t*>(item - 4);
+        std::size_t alloc_size = alloc_size_u32;
+        if (alloc_size < header_size || alloc_size > 1_GB + kMaxAlignment)
+        {
+            throw std::invalid_argument("Invalid allocation size in header");
+        }
 
         std::byte* original_ptr = item - header_size;
 
@@ -336,6 +377,13 @@ namespace spallocator
         const std::size_t axis = (header_size <= kSlabNativeAlignment)
             ? kSlabNativeAlignment
             : static_cast<std::size_t>(header_size);
+
+        // Invalidate header before returning the slot (detects Pool double-free).
+        *reinterpret_cast<uint8_t*>(item - 6) = 0;
+
+#if defined(SPALLOCATOR_HAS_ASAN)
+        ASAN_POISON_MEMORY_REGION(original_ptr, header_size);
+#endif
 
         AbstractSlab* slab = resolveSlab(alloc_size, axis);
         debug_println("Deallocating {} bytes at ptr={}, axis={}, slab={}",

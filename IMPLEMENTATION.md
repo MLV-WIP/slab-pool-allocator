@@ -242,22 +242,26 @@ Default layout (alignment ≤ 8 → header_size = 8):
   slab slot base                                                user pointer
   │                                                             │
   ▼                                                             ▼
-┌─────────────┬────────────────┬────────────────┬──────────────────────────┐
-│ pad (3 B)   │ header_size    │ alloc_size     │ requested payload (N B)  │
-│             │ (1 byte)       │ (uint32 / 4 B) │                          │
-└─────────────┴────────────────┴────────────────┴──────────────────────────┘
-                ▲                ▲
-                │                └─ readable at user_ptr − 4
-                └─ readable at user_ptr − 5
+┌──────────┬─────────┬────────────────┬────────────────┬──────────────────┐
+│ pad      │ magic   │ header_size    │ alloc_size     │ payload (N B)    │
+│ (2 B)    │ (1 B)   │ (1 byte)       │ (uint32 / 4 B) │                  │
+└──────────┴─────────┴────────────────┴────────────────┴──────────────────┘
+             ▲         ▲                ▲
+             │         │                └─ user_ptr − 4
+             │         └─ user_ptr − 5
+             └─ user_ptr − 6  (kAllocMagic; cleared on free)
 ```
 
 **Fields** (from the user pointer backward):
 
 | Offset from user ptr | Type | Meaning |
 |----------------------|------|---------|
-| `−4 … −1` | `uint32_t` | Total footprint `alloc_size = N + header_size` (used by `selectSlab` on free) |
-| `−5` | `uint8_t` | `header_size` itself (so free can recover the slab slot base) |
-| `−header_size … −6` | padding | Zero or more pad bytes so the user pointer meets `alignment` |
+| `−4 … −1` | `uint32_t` | Total footprint `alloc_size = N + header_size` (used to select slab on free) |
+| `−5` | `uint8_t` | `header_size` itself (recover slot base; must be 8/16/32/64) |
+| `−6` | `uint8_t` | Allocation magic (`kAllocMagic`); validated then cleared on free |
+| `−header_size … −7` | padding | Remaining pad so the user pointer meets `alignment` |
+
+**Deallocate checks** (before trusting the header): `header_size ∈ {8,16,32,64}`, magic matches, `header_size ≤ alloc_size ≤ 1_GB + kMaxAlignment`. Non-pool pointers, corrupted headers, and Pool-level double-frees throw `std::invalid_argument`. Returned blocks are exclusively owned until `deallocate`; do not mutate the hidden header. In ASan builds the header region is poisoned after free and unpoisoned on the next allocate into that slot.
 
 **Rules implemented in `Pool::allocate`:**
 
@@ -326,8 +330,8 @@ End-to-end path for a typical call `pool.allocate(100)` (default alignment 8):
 3. **Compute footprint** — `alloc_size = 100 + 8 = 108`
 4. **Select slab** — `nativeAxis(8) → 16`, then `selectClassIndex(108, 16)` → **128B** class (not 96B: 108 > 96); lazy axes use `slab_init_lock` on first create
 5. **Allocate slot** — slab’s own lock guards bitset updates; return a slot base pointer
-6. **Write header** — at `base + header_size − 4` store `108`; at `base + header_size − 5` store `8`
-7. **Return** — `base + header_size` to the caller
+6. **Write header** — store `alloc_size`, `header_size`, and `kAllocMagic` at fixed offsets behind the user pointer
+7. **Return** — `base + header_size` to the caller (exclusive ownership until `deallocate`)
 
 Deallocate reverses the path:
 
