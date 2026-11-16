@@ -18,8 +18,8 @@ ENABLE_ASAN ?= auto
 ENABLE_LSAN ?= auto
 ENABLE_MSAN ?= auto
 ENABLE_UBSAN ?= auto
-ENABLE_TSAN ?= no
-ENABLE_COVERAGE ?= no
+ENABLE_TSAN ?= auto
+ENABLE_COVERAGE ?= auto
 
 # Auto-detect Google Test if not specified
 ifndef GTEST_DIR
@@ -49,7 +49,7 @@ DOCDIR := ./spallocator/docs
 CXXSTD := -std=c++23
 # -I. so sources in test/ and demos/ can #include "spallocator/..."
 INCLUDES := -I. -I$(INCLUDEDIR)
-WARNINGS := -Wall -Wextra -Wpedantic
+WARNINGS := -Wall -Wextra -Wpedantic -Werror
 
 # Add Google Test includes if tests are enabled
 ifeq ($(ENABLE_TESTS),yes)
@@ -62,7 +62,10 @@ CXXFLAGS := $(CXXSTD) $(INCLUDES) $(WARNINGS) -MMD -MP $(USER_CXXFLAGS)
 LDFLAGS := $(LDLIBS)
 
 
-# Build-type specific flags
+# Build-type specific flags.
+# Sanitizer -fsanitize=* flags are applied only inside these mutually exclusive
+# BUILD_TYPE branches (addrsan / memsan / threadsan). ASan+LSan+UBSan may
+# combine; ASan/LSan, MSan, and TSan never share a branch.
 ifeq ($(BUILD_TYPE),debug)
     CXXFLAGS += -DDEBUG -O0 -g -fno-omit-frame-pointer
     LDFLAGS += -g
@@ -103,11 +106,11 @@ else ifeq ($(BUILD_TYPE),memsan)
     CXXFLAGS += -DDEBUG -O0 -g -fno-omit-frame-pointer
     LDFLAGS += -g
     OBJDIRNAME := memsan
-    ifeq ($(ENABLE_MSAN),yes)
-        CXXFLAGS += -fsanitize=memory
-        LDFLAGS += -fsanitize=memory
-    endif
-    # UndefinedBehaviorSanitizer
+    # BUILD_TYPE selects the sanitizer; do not require ENABLE_MSAN=yes from configure.
+    # Note: usable MSan needs an instrumented C++ stdlib + gtest; deferred for now.
+    # Available locally; omitted from GitHub CI until that is sorted.
+    CXXFLAGS += -fsanitize=memory
+    LDFLAGS += -fsanitize=memory
     ifeq ($(ENABLE_UBSAN),yes)
         CXXFLAGS += -fsanitize=undefined
         LDFLAGS += -fsanitize=undefined
@@ -119,10 +122,11 @@ else ifeq ($(BUILD_TYPE),threadsan)
     CXXFLAGS += -DDEBUG -O0 -g -fno-omit-frame-pointer
     LDFLAGS += -g
     OBJDIRNAME := threadsan
-    ifeq ($(ENABLE_TSAN),yes)
-        CXXFLAGS += -fsanitize=thread
-        LDFLAGS += -fsanitize=thread
-    endif
+    # BUILD_TYPE selects the sanitizer; bare `make BUILD_TYPE=threadsan` must
+    # not silently omit -fsanitize=thread when ENABLE_TSAN defaults to no/auto
+    # or a stale config.mk left it off.
+    CXXFLAGS += -fsanitize=thread
+    LDFLAGS += -fsanitize=thread
     # UndefinedBehaviorSanitizer
     ifeq ($(ENABLE_UBSAN),yes)
         CXXFLAGS += -fsanitize=undefined
@@ -133,7 +137,13 @@ else ifeq ($(BUILD_TYPE),threadsan)
     endif
 endif
 
-# Coverage flags
+# Coverage: release promotes auto → yes (matches configure). Other build types
+# need an explicit ENABLE_COVERAGE=yes.
+ifeq ($(BUILD_TYPE),release)
+    ifeq ($(ENABLE_COVERAGE),auto)
+        ENABLE_COVERAGE := yes
+    endif
+endif
 ifeq ($(ENABLE_COVERAGE),yes)
     CXXFLAGS += --coverage -fprofile-arcs -ftest-coverage
     LDFLAGS += --coverage
@@ -231,6 +241,34 @@ test: $(OBJDIR)/$(TESTER_TARGET)
 	$(ECHO) "  RUN     $(TESTER_TARGET)"
 	$(Q)$(OBJDIR)/$(TESTER_TARGET)
 
+# Coverage summary (ENABLE_COVERAGE=yes). Clang → llvm-cov; GCC → gcov.
+# Tool versions come from PATH / update-alternatives — no version probing here.
+coverage: test
+ifeq ($(ENABLE_COVERAGE),yes)
+	$(ECHO) "  COVERAGE $(OBJDIR)"
+	$(Q)set -e; \
+	is_clang="$(IS_CLANG)"; \
+	if [ "$$is_clang" != "yes" ] && $(CXX) --version 2>/dev/null | grep -qi clang; then \
+		is_clang=yes; \
+	fi; \
+	stem="$(TESTER_TARGET)-$(TESTER_TARGET)"; \
+	if [ ! -f "$(OBJDIR)/$$stem.gcda" ]; then stem="$(TESTER_TARGET)"; fi; \
+	if [ ! -f "$(OBJDIR)/$$stem.gcda" ]; then \
+		echo "No coverage data in $(OBJDIR) — rebuild with ENABLE_COVERAGE=yes"; \
+		exit 1; \
+	fi; \
+	cd $(OBJDIR); \
+	if [ "$$is_clang" = "yes" ]; then \
+		llvm-cov gcov -o . "$$stem"; \
+	else \
+		gcov -o . "$$stem"; \
+	fi 2>&1 | awk '/^File '\''(spallocator|test)\//{show=1; print; next} \
+		show && /Lines executed/{print; show=0}' || true; \
+	echo "Coverage notes under $(OBJDIR)/*.gcov"
+else
+	@echo "Coverage disabled (ENABLE_COVERAGE=$(ENABLE_COVERAGE); use --enable-coverage or BUILD_TYPE=release)"
+endif
+
 # Run demo
 demo: $(OBJDIR)/$(DEMO_TARGET)
 	$(ECHO) "  RUN     $(DEMO_TARGET)"
@@ -261,7 +299,7 @@ uninstall:
 clean:
 	$(ECHO) "  CLEAN   $(OBJDIR)"
 	$(Q)rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET) $(OBJDIR)/$(DEMO_LIFETIME_TARGET)
-	$(Q)rm -f $(OBJDIR)/*.o $(OBJDIR)/*.d
+	$(Q)rm -f $(OBJDIR)/*.o $(OBJDIR)/*.d $(OBJDIR)/*.gcda $(OBJDIR)/*.gcno $(OBJDIR)/*.gcov
 	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET) $(BASEOBJDIR)/$(DEMO_LIFETIME_TARGET)
 	$(Q)rm -f *.gcov *.gcda *.gcno
 	$(ECHO) "Clean complete!"
@@ -284,6 +322,7 @@ help:
 	@echo "  make                   - Build all enabled targets"
 	@echo "  make all               - Same as 'make'"
 	@echo "  make test              - Run test suite"
+	@echo "  make coverage          - Run tests and print gcov summary (release default)"
 	@echo "  make demo              - Run demo program"
 	@echo "  make clean             - Remove build artifacts"
 	@echo "  make distclean         - Remove all generated files"

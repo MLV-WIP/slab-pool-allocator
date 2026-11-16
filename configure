@@ -26,7 +26,7 @@ ENABLE_LSAN="auto"
 ENABLE_MSAN="auto"
 ENABLE_UBSAN="auto"
 ENABLE_TSAN="no"
-ENABLE_COVERAGE="no"
+ENABLE_COVERAGE="auto"
 VERBOSE="no"
 
 # Detected values
@@ -78,7 +78,9 @@ Optional Features:
   --enable-ubsan          enable UndefinedBehaviorSanitizer [default: auto]
   --disable-ubsan         disable UndefinedBehaviorSanitizer
   --enable-tsan           enable ThreadSanitizer [default: no]
-  --enable-coverage       enable code coverage instrumentation [default: no]
+  --enable-coverage       enable code coverage instrumentation [default: auto;
+                          yes for --build-type=release]
+  --disable-coverage      disable code coverage instrumentation
   --enable-verbose        verbose output during build [default: no]
 
 Optional Packages:
@@ -150,6 +152,9 @@ for arg in "$@"; do
         --enable-coverage)
             ENABLE_COVERAGE="yes"
             ;;
+        --disable-coverage)
+            ENABLE_COVERAGE="no"
+            ;;
         --enable-verbose)
             VERBOSE="yes"
             ;;
@@ -206,6 +211,37 @@ else
     [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="no"
     [ "$ENABLE_MSAN" = "auto" ] && ENABLE_MSAN="no"
     [ "$ENABLE_TSAN" = "auto" ] && ENABLE_TSAN="no"
+fi
+
+# ASan (incl. LSan), MSan, and TSan are mutually exclusive instrumentors.
+# UBsan may combine with any of them. Sanitizer BUILD_TYPEs already clear
+# the others above; this catches explicit --enable-* clashes on debug/release.
+asan_family=no
+msan_on=no
+tsan_on=no
+[ "$ENABLE_ASAN" = "yes" ] || [ "$ENABLE_LSAN" = "yes" ] && asan_family=yes
+[ "$ENABLE_MSAN" = "yes" ] && msan_on=yes
+[ "$ENABLE_TSAN" = "yes" ] && tsan_on=yes
+exclusive_count=0
+[ "$asan_family" = "yes" ] && exclusive_count=$((exclusive_count + 1))
+[ "$msan_on" = "yes" ] && exclusive_count=$((exclusive_count + 1))
+[ "$tsan_on" = "yes" ] && exclusive_count=$((exclusive_count + 1))
+if [ "$exclusive_count" -gt 1 ]; then
+    print_error "Incompatible sanitizers requested (ASan/LSan, MSan, and TSan are mutually exclusive)"
+    print_error "  Address/Leak: $ENABLE_ASAN / $ENABLE_LSAN"
+    print_error "  Memory:       $ENABLE_MSAN"
+    print_error "  Thread:       $ENABLE_TSAN"
+    print_error "Use a single sanitizer build type: --build-type=addrsan|memsan|threadsan"
+    exit 1
+fi
+
+# Coverage: default on for release (CI + local optimized/NDEBUG builds), off otherwise.
+if [ "$ENABLE_COVERAGE" = "auto" ]; then
+    if [ "$BUILD_TYPE" = "release" ]; then
+        ENABLE_COVERAGE="yes"
+    else
+        ENABLE_COVERAGE="no"
+    fi
 fi
 
 print_info "Configuring Slab Pool Allocator..."
@@ -532,6 +568,9 @@ print_info "You can now run:"
 echo "  make              - Build the project"
 if [ "$ENABLE_TESTS" = "yes" ]; then
 echo "  make test         - Run tests"
+fi
+if [ "$ENABLE_COVERAGE" = "yes" ]; then
+echo "  make coverage     - Run tests and print coverage summary"
 fi
 if [ "$ENABLE_DEMO" = "yes" ]; then
 echo "  make demo         - Run demo program"

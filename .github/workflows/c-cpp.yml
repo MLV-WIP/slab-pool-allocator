@@ -16,7 +16,15 @@ jobs:
         #arch: [amd64, arm64]
         arch: [amd64]
         compiler: [clang, gcc]
+        # memsan is a valid local BUILD_TYPE but omitted here: it needs an
+        # MSan-instrumented C++ runtime and gtest from the host toolchain.
         sanitizer-config:
+          - name: release
+            enable-flags: "--enable-coverage"
+            build-type: "release"
+            # Optimized -DNDEBUG path (exercises release-only control flow)
+            # plus gcov/llvm-cov coverage instrumentation.
+            container-options: ""
           - name: addrsan
             enable-flags: "--enable-asan --enable-lsan --enable-ubsan"
             build-type: "addrsan"
@@ -47,3 +55,6 @@ jobs:
       run: make
     - name: make test
       run: make test
+    - name: coverage report
+      if: matrix.sanitizer-config.name == 'release'
+      run: make coverage

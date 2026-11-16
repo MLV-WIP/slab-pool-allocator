@@ -50,15 +50,20 @@ Binaries land under `obj/<build_type>/` (default `obj/addrsan/`), with convenien
 ./obj/tester
 ```
 
-**Build types** (override without re-running configure):
+**Build types** (override without re-running configure). `addrsan` / `memsan` /
+`threadsan` always pass the matching `-fsanitize=…` flags (driven by
+`BUILD_TYPE`, not by whether `./configure` left `ENABLE_TSAN=yes`):
 
 ```bash
 make BUILD_TYPE=debug       # unoptimized debug
-make BUILD_TYPE=release     # optimized
+make BUILD_TYPE=release     # optimized (-O3 -DNDEBUG) + coverage (CI default)
 make BUILD_TYPE=addrsan     # AddressSanitizer + LSan + UBSan (default)
-make BUILD_TYPE=memsan      # MemorySanitizer + UBSan (Clang)
+make BUILD_TYPE=memsan      # MemorySanitizer (Clang; needs host MSan runtime — not in CI)
 make BUILD_TYPE=threadsan   # ThreadSanitizer + UBSan
+make coverage               # run tests and print coverage summary (release)
 ```
+
+`make coverage` uses `llvm-cov gcov` after a Clang build and `gcov` after GCC. Put the desired tool version on `PATH` (e.g. `update-alternatives`).
 
 Google Test is required for `make test`. If GTest is not found, tests are disabled automatically.
 

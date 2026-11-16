@@ -1764,8 +1764,9 @@ This computes the slab size at compile time, with zero runtime overhead.
 | `-DVDEBUG` / `VERBOSE_DEBUG` | Enables `debug_print` / `debug_println` (slab alloc/free, unknown-pointer notes, etc.) |
 | `BUILD_TYPE=debug` | Unoptimized debug binary under `obj/debug/` |
 | `BUILD_TYPE=addrsan` | **Default** — ASan + LSan + UBSan (`obj/addrsan/`) |
-| `BUILD_TYPE=memsan` | MemorySanitizer + UBSan (Clang; `obj/memsan/`) |
-| `BUILD_TYPE=threadsan` | ThreadSanitizer + UBSan (`obj/threadsan/`) — exercise `SpinLock` races |
+| `BUILD_TYPE=memsan` | MemorySanitizer (Clang; `obj/memsan/`) — valid locally when the host provides an MSan-instrumented C++ runtime/gtest; omitted from GitHub CI |
+| `BUILD_TYPE=threadsan` | ThreadSanitizer + UBSan (`obj/threadsan/`) — exercise `SpinLock` races; `-fsanitize=thread` is implied by this build type |
+| `BUILD_TYPE=release` | `-O3 -DNDEBUG` (`obj/release/`) — covered in CI; coverage (`--coverage`) is on by default for this type (`make coverage`) |
 | `make test` / `make demo` | Run tester or shared_ptr demo for current build type |
 
 SpinLock happens-before design and TSan annotation details: [`spallocator/docs/SpinLock_Analysis.md`](spallocator/docs/SpinLock_Analysis.md).

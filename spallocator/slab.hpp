@@ -123,8 +123,8 @@ namespace spallocator
     class Slab: public AbstractSlab
     {
     public: // methods
-        std::byte* allocateItem(std::size_t size);
-        void deallocateItem(std::byte* item);
+        std::byte* allocateItem(std::size_t size) override;
+        void deallocateItem(std::byte* item) override;
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
         constexpr std::size_t getAlignment() const { return Alignment; }
@@ -140,7 +140,7 @@ namespace spallocator
         std::optional<std::size_t> findSlabForItem(std::byte* item) const;
 
         Slab();
-        virtual ~Slab();
+        ~Slab() override;
 
     private: // methods
         Slab(const Slab&) = delete;
@@ -186,11 +186,11 @@ namespace spallocator
     class SlabProxy: public AbstractSlab
     {
     public: // methods
-        std::byte* allocateItem(std::size_t size);
-        void deallocateItem(std::byte* item);
+        std::byte* allocateItem(std::size_t size) override;
+        void deallocateItem(std::byte* item) override;
 
         SlabProxy() = default;
-        virtual ~SlabProxy() = default;
+        ~SlabProxy() override = default;
 
     private: // methods
         SlabProxy(const SlabProxy&) = delete;
