@@ -411,12 +411,14 @@ std::vector<std::bitset<slab_alloc_size / ElemSize>> slab_map;
 Tracks which slabs have at least one free slot.
 
 ```cpp
-std::bitset<max_slabs> slab_available_map;
+// DynBitset: vector<uint64_t> words, sized to live slab count
+DynBitset slab_available_map;
 ```
 
-- **Size**: One bit per slab
+- **Size**: One bit per **live** slab (`⌈N/64⌉` words), grown geometrically on `allocateNewSlab` — not a fixed `bitset<4_GB/slab_size>` (~128 KiB per 4 KiB class)
 - **Semantics**: 1 = has free slots, 0 = completely full
-- **Usage**: Fast filtering to skip full slabs
+- **Usage**: Fast filtering to skip full slabs; when every live slab is full, allocate a new slab then retry (no phantom bits past `slab_data.size()`)
+- **RSS**: A fresh `Pool` with 12 eager native-16 classes pays a few words of availability metadata total, not ~1.5 MiB of empty bitsets
 
 ### Two-Level Bitmap Optimization
 
@@ -1553,7 +1555,7 @@ This project favors bitsets for clarity; a freelist would be the usual next opti
 |-----------|----------|----------------------|
 | Allocation header | `max(8, alignment)` bytes (default 8) | Fixed per allocation |
 | Slab map bitset | 1 bit per slot | Amortized across all slots in slab |
-| Availability map | 1 bit per slab | Amortized across all slabs |
+| Availability map (`DynBitset`) | 1 bit per live slab (uint64 words) | Grows with slab count; not fixed 128 KiB/class |
 | Address map | ~24 bytes per slab | Amortized across all slots in slab |
 
 **Example Calculation** (128-byte **user** request, default alignment → 136-byte footprint → 192B class):

@@ -50,6 +50,38 @@ using namespace std::literals;
 using namespace spallocator;
 
 
+TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
+{
+    // Former fixed bitset<4_GB/4_KB> was 128 KiB per Slab instance.
+    constexpr std::size_t kLegacyFixedBytes = 128_KB;
+
+    Slab<16, 16> slab;
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_GT(slab.getAvailabilityMapBytes(), 0u);
+    EXPECT_LT(slab.getAvailabilityMapBytes(), kLegacyFixedBytes);
+    EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
+
+    // Fill the first 4 KiB / 16 B slab (256 slots) to force a second slab.
+    constexpr std::size_t kSlotsPerSlab = 4_KB / 16;
+    std::vector<std::byte*> items;
+    items.reserve(kSlotsPerSlab + 1);
+    for (std::size_t i = 0; i < kSlotsPerSlab; ++i)
+    {
+        items.push_back(slab.allocateItem(16));
+        ASSERT_NE(items.back(), nullptr);
+    }
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+    items.push_back(slab.allocateItem(16));
+    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
+
+    for (auto* p : items)
+    {
+        slab.deallocateItem(p);
+    }
+}
+
+
 TEST(SlabTest, CreateSlabs)
 {
     {

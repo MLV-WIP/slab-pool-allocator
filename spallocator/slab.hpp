@@ -35,6 +35,7 @@
 
 #include <bitset>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <iostream>
 #include <map>
@@ -83,6 +84,57 @@ namespace spallocator
     };
 
 
+    // Runtime-sized bit vector over uint64_t words. Used for per-slab
+    // availability so empty size classes do not embed bitset<max_slabs>
+    // (~128 KiB for 4 KiB slabs). Word ops are load/mask/store; storage
+    // grows geometrically with live bit count.
+    class DynBitset
+    {
+    public:
+        bool test(std::size_t bit) const
+        {
+            return (words_[bit >> 6] >> (bit & 63)) & 1ull;
+        }
+
+        void set(std::size_t bit)
+        {
+            words_[bit >> 6] |= (std::uint64_t{1} << (bit & 63));
+        }
+
+        void reset(std::size_t bit)
+        {
+            words_[bit >> 6] &= ~(std::uint64_t{1} << (bit & 63));
+        }
+
+        // Append one bit valued 1 (new slab starts with free slots).
+        void push_set()
+        {
+            const std::size_t bit = size_;
+            const std::size_t word = bit >> 6;
+            if (word >= words_.size())
+            {
+                const std::size_t need = word + 1;
+                const std::size_t grown = words_.empty() ? need : words_.size() * 2;
+                words_.resize(grown > need ? grown : need, 0);
+            }
+            ++size_;
+            set(bit);
+        }
+
+        std::size_t size() const { return size_; }
+
+        // Heap buffer footprint of the word array (capacity, not size).
+        std::size_t bytes() const
+        {
+            return words_.capacity() * sizeof(std::uint64_t);
+        }
+
+    private:
+        std::vector<std::uint64_t> words_;
+        std::size_t size_{0};
+    };
+
+
     // Compound key: every slot is Alignment-aligned because the buffer uses
     // align_val_t{Alignment} and ElemSize is a multiple of Alignment.
     template<std::size_t ElemSize, std::size_t Alignment = 16>
@@ -96,6 +148,8 @@ namespace spallocator
         constexpr std::size_t getAlignment() const { return Alignment; }
         constexpr std::size_t getAllocSize() const { return slab_alloc_size; }
         std::size_t getAllocatedMemory() const { return slab_data.size() * slab_alloc_size; }
+        std::size_t getAvailabilityMapBytes() const { return slab_available_map.bytes(); }
+        std::size_t getSlabCount() const { return slab_data.size(); }
 
         std::optional<std::size_t> findSlabForItem(std::byte* item) const;
 
@@ -125,11 +179,10 @@ namespace spallocator
             "Allocation size must be a multiple of 1024 when ElemSize <= 2KB");
 
         std::vector<std::byte*> slab_data;
-        // bitsets could be optimized more by creating custom bitset class
-        // with 64-bit chunks that can be compared atomically
+        // Per-slab slot maps stay std::bitset (compile-time slot count).
         std::vector<std::bitset<slab_alloc_size / ElemSize>> slab_map;
         static constexpr std::size_t max_slabs{4_GB / slab_alloc_size};
-        std::bitset<max_slabs> slab_available_map;
+        DynBitset slab_available_map;
 
         std::map<std::byte*, std::size_t> base_address_map;
 
@@ -208,45 +261,40 @@ namespace spallocator
 
         std::scoped_lock<SpinLock> guard(slab_lock);
 
-        // Find a free item in the slabs
-        for (std::size_t slab_index = 0; slab_index <= slab_map.size(); ++slab_index)
+        // Scan live slabs only. When every live slab is full, grow then retry
+        // (no phantom availability bits past slab_data.size()).
+        for (;;)
         {
-            if (!slab_available_map.test(slab_index))
+            for (std::size_t slab_index = 0; slab_index < slab_data.size(); ++slab_index)
             {
-                // this slab is full
-                continue;
-            }
-
-            while (slab_index >= slab_data.size())
-            {
-                // need to allocate a new slab
-                allocateNewSlab();
-                debug_println("New slab<{},{}> allocated, total slabs: {}/{}",
-                              ElemSize, Alignment, slab_data.size(), slab_map.size());
-            }
-
-            auto& slab_slots = slab_map[slab_index];
-            for (std::size_t item_index = 0; item_index < slab_slots.size(); ++item_index)
-            {
-                if (!slab_slots.test(item_index))
+                if (!slab_available_map.test(slab_index))
                 {
-                    // Found a free item
-                    slab_slots.set(item_index);
-                    if (slab_slots.all())
+                    continue;
+                }
+
+                auto& slab_slots = slab_map[slab_index];
+                for (std::size_t item_index = 0; item_index < slab_slots.size(); ++item_index)
+                {
+                    if (!slab_slots.test(item_index))
                     {
-                        // this slab is now full
-                        slab_available_map.reset(slab_index);
+                        slab_slots.set(item_index);
+                        if (slab_slots.all())
+                        {
+                            slab_available_map.reset(slab_index);
+                        }
+                        debug_println("Item allocated ({}/{}), slab_map<{},{}>: {}",
+                                      slab_index, item_index, ElemSize, Alignment,
+                                      printHex(slab_slots));
+                        return slab_data[slab_index] + item_index * ElemSize;
                     }
-                    debug_println("Item allocated ({}/{}), slab_map<{},{}>: {}",
-                                  slab_index, item_index, ElemSize, Alignment,
-                                  printHex(slab_slots));
-                    return slab_data[slab_index] + item_index * ElemSize;
                 }
             }
-        }
 
-        throw std::out_of_range(std::format(
-            "Memory for {}-byte / {}-align slab has been exhausted", ElemSize, Alignment));
+            // allocateNewSlab throws when max_slabs is reached.
+            allocateNewSlab();
+            debug_println("New slab<{},{}> allocated, total slabs: {}",
+                          ElemSize, Alignment, slab_data.size());
+        }
     }
 
 
@@ -343,9 +391,6 @@ namespace spallocator
         debug_println("Slab created with element size: {}, alignment: {}, allocation size: {}",
                       getElemSize(), getAlignment(), getAllocSize());
 
-        // all slabs are initially available
-        slab_available_map.set();
-
         allocateNewSlab();
     }
 
@@ -382,6 +427,8 @@ namespace spallocator
         slab_data.push_back(new_slab);
         base_address_map[new_slab] = slab_data.size() - 1;
         slab_map.emplace_back();
+        // New slab has free slots; grow availability words only as needed.
+        slab_available_map.push_set();
     }
 
 
