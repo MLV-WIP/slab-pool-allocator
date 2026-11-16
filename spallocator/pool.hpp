@@ -157,19 +157,21 @@ namespace spallocator
         // Returns false if the pointer is not a live pool allocation.
         bool try_deallocate(std::byte* item) noexcept;
 
+        // Release fully empty size-class slab buffers back to the OS.
+        // Default growth is monotonic (free reuses slots but does not shrink);
+        // call trim() at quiet points when peak RSS should be returned.
+        // keep_min is per size class (clamped to ≥ 1). Returns slabs deleted.
+        std::size_t trim(std::size_t keep_min = 1);
+
+        // Sum of size-class slab buffer bytes currently retained (not SlabProxy).
+        std::size_t getAllocatedMemory();
+
         Pool();
         ~Pool() = default;
 
         // Default: axis 16. Pass alignment (or use selectClassIndex) for 32/64.
-        constexpr std::size_t selectSlab(std::size_t size) const
-        {
-            return selectClassIndex(size, kSlabNativeAlignment);
-        }
-
-        constexpr std::size_t selectSlab(std::size_t size, std::size_t alignment) const
-        {
-            return selectClassIndex(size, nativeAxis(alignment));
-        }
+        constexpr std::size_t selectSlab(std::size_t size) const { return selectClassIndex(size, kSlabNativeAlignment); }
+        constexpr std::size_t selectSlab(std::size_t size, std::size_t alignment) const { return selectClassIndex(size, nativeAxis(alignment)); }
 
     private: // methods
         Pool(const Pool&) = delete;
@@ -454,6 +456,72 @@ namespace spallocator
                 static_cast<void*>(item));
             return false;
         }
+    }
+
+
+    std::size_t Pool::trim(std::size_t keep_min)
+    {
+        std::size_t reclaimed = 0;
+
+        for (auto& slab : slabs16)
+        {
+            if (slab)
+            {
+                reclaimed += slab->reclaimEmptySlabs(keep_min);
+            }
+        }
+
+        // Lazy axes: hold init lock so unique_ptr slots are stable while we trim.
+        {
+            std::scoped_lock<SpinLock> init_guard(slab_init_lock);
+            for (auto& slab : slabs32)
+            {
+                if (slab)
+                {
+                    reclaimed += slab->reclaimEmptySlabs(keep_min);
+                }
+            }
+            for (auto& slab : slabs64)
+            {
+                if (slab)
+                {
+                    reclaimed += slab->reclaimEmptySlabs(keep_min);
+                }
+            }
+        }
+
+        debug_println("Pool::trim(keep_min={}): reclaimed {} slabs", keep_min, reclaimed);
+        return reclaimed;
+    }
+
+
+    std::size_t Pool::getAllocatedMemory()
+    {
+        std::size_t total = 0;
+        for (auto& slab : slabs16)
+        {
+            if (slab)
+            {
+                total += slab->getAllocatedMemory();
+            }
+        }
+
+        std::scoped_lock<SpinLock> init_guard(slab_init_lock);
+        for (auto& slab : slabs32)
+        {
+            if (slab)
+            {
+                total += slab->getAllocatedMemory();
+            }
+        }
+        for (auto& slab : slabs64)
+        {
+            if (slab)
+            {
+                total += slab->getAllocatedMemory();
+            }
+        }
+        return total;
     }
 
 

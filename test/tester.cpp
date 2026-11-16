@@ -50,6 +50,77 @@ using namespace std::literals;
 using namespace spallocator;
 
 
+TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
+{
+    Slab<16, 16> slab;
+    constexpr std::size_t kSlotsPerSlab = 4_KB / 16;
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+    const std::size_t baseline = slab.getAllocatedMemory();
+
+    std::vector<std::byte*> items;
+    items.reserve(kSlotsPerSlab + 1);
+    for (std::size_t i = 0; i < kSlotsPerSlab + 1; ++i)
+    {
+        items.push_back(slab.allocateItem(16));
+    }
+    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getAllocatedMemory(), baseline * 2);
+
+    for (auto* p : items)
+    {
+        slab.deallocateItem(p);
+    }
+    // Monotonic by default: empty slabs stay until reclaim.
+    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getAllocatedMemory(), baseline);
+    EXPECT_EQ(slab.reclaimEmptySlabs(), 0u);
+
+    // Live allocations block reclaim of their slab.
+    auto* live = slab.allocateItem(16);
+    items.clear();
+    for (std::size_t i = 0; i < kSlotsPerSlab; ++i)
+    {
+        items.push_back(slab.allocateItem(16));
+    }
+    EXPECT_EQ(slab.getSlabCount(), 2u);
+    for (auto* p : items)
+    {
+        slab.deallocateItem(p);
+    }
+    EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+    slab.deallocateItem(live);
+}
+
+
+TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
+{
+    Pool pool;
+    const std::size_t before = pool.getAllocatedMemory();
+
+    // allocate(16) → footprint 24 → 32B class; 4 KiB / 32 = 128 slots/slab.
+    constexpr std::size_t kSlotsPerSlab = 4_KB / 32;
+    std::vector<std::byte*> items;
+    items.reserve(kSlotsPerSlab + 1);
+    for (std::size_t i = 0; i < kSlotsPerSlab + 1; ++i)
+    {
+        items.push_back(pool.allocate(16));
+    }
+    EXPECT_GT(pool.getAllocatedMemory(), before);
+
+    for (auto* p : items)
+    {
+        pool.deallocate(p);
+    }
+    EXPECT_GT(pool.getAllocatedMemory(), before);
+    EXPECT_GE(pool.trim(), 1u);
+    EXPECT_EQ(pool.getAllocatedMemory(), before);
+    EXPECT_EQ(pool.trim(), 0u);
+}
+
+
 TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
 {
     // Former fixed bitset<4_GB/4_KB> was 128 KiB per Slab instance.

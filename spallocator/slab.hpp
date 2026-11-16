@@ -71,6 +71,11 @@ namespace spallocator
         virtual std::byte* allocateItem(std::size_t size) = 0;
         virtual void deallocateItem(std::byte* item) = 0;
 
+        // Release fully empty slab buffers back to the OS. Default: no-op
+        // (SlabProxy). Returns the number of slab buffers deleted.
+        virtual std::size_t reclaimEmptySlabs(std::size_t keep_min = 1);
+        virtual std::size_t getAllocatedMemory() const { return 0; }
+
         virtual ~AbstractSlab() = default;
 
     protected: // methods
@@ -91,43 +96,20 @@ namespace spallocator
     class DynBitset
     {
     public:
-        bool test(std::size_t bit) const
-        {
-            return (words_[bit >> 6] >> (bit & 63)) & 1ull;
-        }
-
-        void set(std::size_t bit)
-        {
-            words_[bit >> 6] |= (std::uint64_t{1} << (bit & 63));
-        }
-
-        void reset(std::size_t bit)
-        {
-            words_[bit >> 6] &= ~(std::uint64_t{1} << (bit & 63));
-        }
+        bool test(std::size_t bit) const;
+        void set(std::size_t bit);
+        void reset(std::size_t bit);
 
         // Append one bit valued 1 (new slab starts with free slots).
-        void push_set()
-        {
-            const std::size_t bit = size_;
-            const std::size_t word = bit >> 6;
-            if (word >= words_.size())
-            {
-                const std::size_t need = word + 1;
-                const std::size_t grown = words_.empty() ? need : words_.size() * 2;
-                words_.resize(grown > need ? grown : need, 0);
-            }
-            ++size_;
-            set(bit);
-        }
+        void push_set();
+        void swap_bits(std::size_t a, std::size_t b);
+
+        // Drop the last bit (after swap-with-last removal). Keeps word capacity.
+        void pop_back();
 
         std::size_t size() const { return size_; }
-
         // Heap buffer footprint of the word array (capacity, not size).
-        std::size_t bytes() const
-        {
-            return words_.capacity() * sizeof(std::uint64_t);
-        }
+        std::size_t bytes() const { return words_.capacity() * sizeof(std::uint64_t); }
 
     private:
         std::vector<std::uint64_t> words_;
@@ -147,9 +129,13 @@ namespace spallocator
         constexpr std::size_t getElemSize() const { return ElemSize; }
         constexpr std::size_t getAlignment() const { return Alignment; }
         constexpr std::size_t getAllocSize() const { return slab_alloc_size; }
-        std::size_t getAllocatedMemory() const { return slab_data.size() * slab_alloc_size; }
+        std::size_t getAllocatedMemory() const override { return slab_data.size() * slab_alloc_size; }
         std::size_t getAvailabilityMapBytes() const { return slab_available_map.bytes(); }
         std::size_t getSlabCount() const { return slab_data.size(); }
+
+        // Delete fully empty slab buffers; always retain at least keep_min
+        // slabs (clamped to ≥ 1). Not called from the alloc/free hot path.
+        std::size_t reclaimEmptySlabs(std::size_t keep_min = 1) override;
 
         std::optional<std::size_t> findSlabForItem(std::byte* item) const;
 
@@ -163,6 +149,7 @@ namespace spallocator
         Slab& operator=(Slab&&) = delete;
 
         void allocateNewSlab();
+        void destroySlabAt(std::size_t index);
     
     private: // data members
         static_assert(Alignment == 16 || Alignment == 32 || Alignment == 64,
@@ -215,7 +202,85 @@ namespace spallocator
     };
 
 
-    // Helper for debug output
+    // ---------------------------------------------------------------------------
+    // AbstractSlab
+    // ---------------------------------------------------------------------------
+
+    inline std::size_t AbstractSlab::reclaimEmptySlabs(std::size_t /*keep_min*/)
+    {
+        return 0;
+    }
+
+
+    // ---------------------------------------------------------------------------
+    // DynBitset
+    // ---------------------------------------------------------------------------
+
+    inline bool DynBitset::test(std::size_t bit) const
+    {
+        return (words_[bit >> 6] >> (bit & 63)) & 1ull;
+    }
+
+    inline void DynBitset::set(std::size_t bit)
+    {
+        words_[bit >> 6] |= (std::uint64_t{1} << (bit & 63));
+    }
+
+    inline void DynBitset::reset(std::size_t bit)
+    {
+        words_[bit >> 6] &= ~(std::uint64_t{1} << (bit & 63));
+    }
+
+    inline void DynBitset::push_set()
+    {
+        const std::size_t bit = size_;
+        const std::size_t word = bit >> 6;
+        if (word >= words_.size())
+        {
+            const std::size_t need = word + 1;
+            const std::size_t grown = words_.empty() ? need : words_.size() * 2;
+            words_.resize(grown > need ? grown : need, 0);
+        }
+        ++size_;
+        set(bit);
+    }
+
+    inline void DynBitset::swap_bits(std::size_t a, std::size_t b)
+    {
+        if (a == b)
+        {
+            return;
+        }
+        const bool a_set = test(a);
+        if (test(b))
+        {
+            set(a);
+        }
+        else
+        {
+            reset(a);
+        }
+        if (a_set)
+        {
+            set(b);
+        }
+        else
+        {
+            reset(b);
+        }
+    }
+
+    inline void DynBitset::pop_back()
+    {
+        if (size_ == 0)
+        {
+            return;
+        }
+        --size_;
+    }
+
+
+    // Helper for debug output (used by Slab definitions below)
     template<std::size_t N>
     std::string printHex(const std::bitset<N>& bits)
     {
@@ -247,6 +312,10 @@ namespace spallocator
         return out;
     }
 
+
+    // ---------------------------------------------------------------------------
+    // Slab
+    // ---------------------------------------------------------------------------
 
     template<std::size_t ElemSize, std::size_t Alignment>
     std::byte* Slab<ElemSize, Alignment>::allocateItem(std::size_t size)
@@ -414,6 +483,67 @@ namespace spallocator
     }
 
     template<std::size_t ElemSize, std::size_t Alignment>
+    std::size_t Slab<ElemSize, Alignment>::reclaimEmptySlabs(std::size_t keep_min)
+    {
+        // Retain at least one slab so the class stays warm for the next alloc.
+        if (keep_min < 1)
+        {
+            keep_min = 1;
+        }
+
+        std::scoped_lock<SpinLock> guard(slab_lock);
+
+        std::size_t reclaimed = 0;
+        std::size_t index = 0;
+        while (index < slab_data.size())
+        {
+            if (slab_data.size() <= keep_min)
+            {
+                break;
+            }
+
+            if (!slab_map[index].none())
+            {
+                ++index;
+                continue;
+            }
+
+            destroySlabAt(index);
+            ++reclaimed;
+            // New occupant at index (swap-with-last) must be examined next.
+        }
+
+        debug_println(
+            "reclaimEmptySlabs<{},{}>: removed {}, remaining slabs={}",
+            ElemSize, Alignment, reclaimed, slab_data.size());
+        return reclaimed;
+    }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment>
+    void Slab<ElemSize, Alignment>::destroySlabAt(std::size_t index)
+    {
+        std::byte* doomed = slab_data[index];
+        base_address_map.erase(doomed);
+
+        const std::size_t last = slab_data.size() - 1;
+        if (index != last)
+        {
+            slab_data[index] = slab_data[last];
+            slab_map[index] = slab_map[last];
+            slab_available_map.swap_bits(index, last);
+            base_address_map[slab_data[index]] = index;
+        }
+
+        slab_data.pop_back();
+        slab_map.pop_back();
+        slab_available_map.pop_back();
+
+        ::operator delete[](doomed, std::align_val_t{Alignment});
+    }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment>
     void Slab<ElemSize, Alignment>::allocateNewSlab()
     {
         if (slab_data.size() >= max_slabs)
@@ -432,8 +562,12 @@ namespace spallocator
     }
 
 
-    // SlabProxy: oversize / beyond-axis-max path. Always uses 64-byte aligned
-    // new/delete so any Pool request alignment ≤ 64 is satisfied.
+    // ---------------------------------------------------------------------------
+    // SlabProxy
+    // ---------------------------------------------------------------------------
+
+    // Oversize / beyond-axis-max path. Always uses 64-byte aligned new/delete
+    // so any Pool request alignment ≤ 64 is satisfied.
     inline constexpr std::size_t kProxyAlignment = 64;
 
     inline std::byte* SlabProxy::allocateItem(std::size_t elem_size)

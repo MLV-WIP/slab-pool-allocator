@@ -338,7 +338,7 @@ Deallocate reverses the path:
 1. Read `alloc_size` from `item − 4` and `header_size` from `item − 5`
 2. Recover `original = item − header_size`
 3. `selectSlab(alloc_size)` under the pool lock → same slab
-4. `slab->deallocateItem(original)` clears the bit and updates availability maps
+4. `slab->deallocateItem(original)` clears the bit and updates availability maps (does not delete empty slab buffers; use `Pool::trim()` for that)
 
 ### User size → size class (default alignment 8)
 
@@ -1558,6 +1558,8 @@ This project favors bitsets for clarity; a freelist would be the usual next opti
 | Availability map (`DynBitset`) | 1 bit per live slab (uint64 words) | Grows with slab count; not fixed 128 KiB/class |
 | Address map | ~24 bytes per slab | Amortized across all slots in slab |
 
+**Growth vs reclaim (RSS):** Size-class slabs grow on demand and **retain empty slabs by default** (monotonic growth) so alloc/free does not mmap/munmap thrash. `Pool::trim()` / `Slab::reclaimEmptySlabs(keep_min=1)` delete fully empty slab buffers (swap-with-last, keep ≥1 slab per class) for explicit RSS recovery at quiet points. `SlabProxy` large allocations already return memory on each free. `Pool::getAllocatedMemory()` sums retained size-class buffers.
+
 **Example Calculation** (128-byte **user** request, default alignment → 136-byte footprint → 192B class):
 - 4KB slab of 192B slots holds 21 slots (4096 / 192)
 - Per-allocation header: 8 bytes on a 128-byte request ≈ 6.25% before bitsets / class waste
@@ -1582,7 +1584,7 @@ Worst case: Just over 50% in the gap between size classes (e.g., footprint 129 �
 
 Not applicable to fixed-size allocations within slabs. Each size class operates independently.
 
-Slab-level consideration: Fragmented slabs may prevent slab deallocation, but memory remains usable for that size class.
+Slab-level consideration: Partially occupied slabs cannot be released; fully empty slabs remain until `trim()`/`reclaimEmptySlabs()`, then memory returns to the OS.
 
 **Key Insight**: This is a fundamental advantage of slab allocators - they eliminate external fragmentation at the cost of some internal fragmentation. The size class selection is critical: more classes reduce internal fragmentation but increase metadata overhead and complexity.
 
