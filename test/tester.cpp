@@ -258,6 +258,62 @@ TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
 }
 
 
+// P18 step 1: control block + live_allocs + handle() (no heap retire yet).
+TEST(PoolTest, ControlBlockTracksLiveAllocsAndHandle)
+{
+    Pool pool;
+    EXPECT_EQ(pool.live_allocation_count(), 0u);
+    ASSERT_NE(pool.control(), nullptr);
+    EXPECT_TRUE(pool.control()->is_alive());
+    EXPECT_EQ(pool.control()->handle_ref_count(), 0u);
+    // Pool holds the initial block_ref.
+    EXPECT_EQ(pool.control()->block_ref_count(), 1u);
+
+    auto* a = pool.allocate(32);
+    auto* b = pool.allocate(32);
+    EXPECT_EQ(pool.live_allocation_count(), 2u);
+
+    pool.deallocate(a);
+    EXPECT_EQ(pool.live_allocation_count(), 1u);
+
+    {
+        PoolHandle h = pool.handle();
+        EXPECT_TRUE(static_cast<bool>(h));
+        EXPECT_EQ(h.get(), &pool);
+        EXPECT_EQ(pool.control()->handle_ref_count(), 1u);
+        EXPECT_EQ(pool.control()->block_ref_count(), 2u);
+
+        PoolHandle h2 = h;
+        EXPECT_EQ(pool.control()->handle_ref_count(), 2u);
+        EXPECT_EQ(pool.control()->block_ref_count(), 3u);
+    }
+    EXPECT_EQ(pool.control()->handle_ref_count(), 0u);
+    EXPECT_EQ(pool.control()->block_ref_count(), 1u);
+
+    pool.deallocate(b);
+    EXPECT_EQ(pool.live_allocation_count(), 0u);
+}
+
+
+TEST(PoolTest, ControlBlockSurvivesPoolWhenHandleRemains)
+{
+    PoolControlBlock* block = nullptr;
+    {
+        PoolHandle h;
+        {
+            Pool pool;
+            block = pool.control();
+            h = pool.handle();
+            EXPECT_TRUE(block->is_alive());
+            EXPECT_EQ(h.get(), &pool);
+        } // ~Pool: mark_dead, drop Pool's block_ref; handle keeps block alive
+        EXPECT_FALSE(block->is_alive());
+        EXPECT_EQ(h.get(), nullptr);
+        EXPECT_GE(block->block_ref_count(), 1u);
+    } // ~PoolHandle drops last refs → ControlBlock deleted
+}
+
+
 TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
 {
     Pool pool;

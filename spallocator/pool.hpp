@@ -34,6 +34,7 @@
 #define POOL_HPP_
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -145,6 +146,42 @@ namespace spallocator
     };
 
 
+    class Pool;
+    class PoolControlBlock;
+
+
+    // Share of a PoolControlBlock that pins handle_refs (keeps empty heap pools
+    // alive once PoolHandle::create lands). Obtained via Pool::handle() for now.
+    // Declared before Pool because Pool::handle() returns PoolHandle by value.
+    class PoolHandle
+    {
+    public: // methods
+        PoolHandle() noexcept = default;
+        PoolHandle(const PoolHandle& other) noexcept;
+        PoolHandle(PoolHandle&& other) noexcept;
+        ~PoolHandle();
+
+        PoolHandle& operator=(const PoolHandle& other) noexcept;
+        PoolHandle& operator=(PoolHandle&& other) noexcept;
+
+        // nullptr if empty handle or pool already marked dead.
+        Pool* get() const noexcept;
+        explicit operator bool() const noexcept;
+
+        PoolControlBlock* control() const noexcept { return block_; }
+
+    private: // methods
+        friend class Pool;
+        explicit PoolHandle(PoolControlBlock* block) noexcept;
+
+        void retain() noexcept;
+        void release() noexcept;
+
+    private: // data members
+        PoolControlBlock* block_{nullptr};
+    };
+
+
     class Pool
     {
     public: // methods
@@ -166,8 +203,16 @@ namespace spallocator
         // Sum of size-class slab buffer bytes currently retained (not SlabProxy).
         std::size_t getAllocatedMemory();
 
+        // Outstanding user allocations (successful allocate minus successful free).
+        std::uint64_t live_allocation_count() const noexcept;
+
+        // Handle sharing this pool's control block (bumps handle_refs + block_refs).
+        PoolHandle handle();
+
+        PoolControlBlock* control() const noexcept { return control_; }
+
         Pool();
-        ~Pool() = default;
+        ~Pool();
 
         // Default: axis 16. Pass alignment (or use selectClassIndex) for 32/64.
         constexpr std::size_t selectSlab(std::size_t size) const { return selectClassIndex(size, kSlabNativeAlignment); }
@@ -186,6 +231,8 @@ namespace spallocator
                                                           std::size_t index);
 
     private: // data members
+        PoolControlBlock* control_{nullptr};
+
         std::array<std::unique_ptr<AbstractSlab>, kLadder16Count> slabs16{};
         std::array<std::unique_ptr<AbstractSlab>, kLadder32Count> slabs32{};
         std::array<std::unique_ptr<AbstractSlab>, kLadder64Count> slabs64{};
@@ -195,6 +242,239 @@ namespace spallocator
         SpinLock slab_init_lock;
     };
 
+
+    // Shared side state for Pool lifetime vs handles / future deleters.
+    // Heap-allocated; outlives Pool when block_refs remain (arena path).
+    // After Pool: only held by pointer inside Pool, so a prior forward decl suffices.
+    class PoolControlBlock
+    {
+    public: // methods
+        static PoolControlBlock* create(Pool* pool);
+
+        void add_block_ref() noexcept;
+        void release_block_ref() noexcept;
+
+        void add_handle_ref() noexcept;
+        void release_handle_ref() noexcept;
+
+        void note_alloc() noexcept;
+        void note_free() noexcept;
+
+        bool is_alive() const noexcept;
+        Pool* pool() const noexcept;
+        std::uint64_t live_allocation_count() const noexcept;
+        std::uint64_t handle_ref_count() const noexcept;
+        std::uint64_t block_ref_count() const noexcept;
+
+        // ~Pool / heap retire: publish dead, drop Pool*.
+        void mark_dead() noexcept;
+
+    private: // methods
+        PoolControlBlock() = default;
+        ~PoolControlBlock() = default;
+
+        PoolControlBlock(const PoolControlBlock&) = delete;
+        PoolControlBlock& operator=(const PoolControlBlock&) = delete;
+        PoolControlBlock(PoolControlBlock&&) = delete;
+        PoolControlBlock& operator=(PoolControlBlock&&) = delete;
+
+    private: // data members
+        std::atomic<std::uint64_t> block_refs_{0};
+        std::atomic<std::uint64_t> handle_refs_{0};
+        std::atomic<std::uint64_t> live_allocs_{0};
+        std::atomic<bool> alive_{false};
+        Pool* pool_{nullptr};
+    };
+
+
+    // ---------------------------------------------------------------------------
+    // PoolControlBlock
+    // ---------------------------------------------------------------------------
+
+    inline PoolControlBlock* PoolControlBlock::create(Pool* pool)
+    {
+        auto* block = new PoolControlBlock();
+        block->pool_ = pool;
+        block->alive_.store(true, std::memory_order_release);
+        // One block_ref held by the Pool object for the lifetime of Pool.
+        block->block_refs_.store(1, std::memory_order_relaxed);
+        return block;
+    }
+
+
+    inline void PoolControlBlock::add_block_ref() noexcept
+    {
+        block_refs_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+
+    inline void PoolControlBlock::release_block_ref() noexcept
+    {
+        if (block_refs_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            delete this;
+        }
+    }
+
+
+    inline void PoolControlBlock::add_handle_ref() noexcept
+    {
+        handle_refs_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+
+    inline void PoolControlBlock::release_handle_ref() noexcept
+    {
+        handle_refs_.fetch_sub(1, std::memory_order_acq_rel);
+        // Heap Pool retirement when handles+allocs hit zero: step 2 (PoolHandle::create).
+    }
+
+
+    inline void PoolControlBlock::note_alloc() noexcept
+    {
+        live_allocs_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+
+    inline void PoolControlBlock::note_free() noexcept
+    {
+        live_allocs_.fetch_sub(1, std::memory_order_acq_rel);
+        // maybe_retire_pool: step 2.
+    }
+
+
+    inline bool PoolControlBlock::is_alive() const noexcept
+    {
+        return alive_.load(std::memory_order_acquire);
+    }
+
+
+    inline Pool* PoolControlBlock::pool() const noexcept
+    {
+        return pool_;
+    }
+
+
+    inline std::uint64_t PoolControlBlock::live_allocation_count() const noexcept
+    {
+        return live_allocs_.load(std::memory_order_acquire);
+    }
+
+
+    inline std::uint64_t PoolControlBlock::handle_ref_count() const noexcept
+    {
+        return handle_refs_.load(std::memory_order_acquire);
+    }
+
+
+    inline std::uint64_t PoolControlBlock::block_ref_count() const noexcept
+    {
+        return block_refs_.load(std::memory_order_acquire);
+    }
+
+
+    inline void PoolControlBlock::mark_dead() noexcept
+    {
+        alive_.store(false, std::memory_order_release);
+        pool_ = nullptr;
+    }
+
+
+    // ---------------------------------------------------------------------------
+    // PoolHandle
+    // ---------------------------------------------------------------------------
+
+    inline PoolHandle::PoolHandle(PoolControlBlock* block) noexcept
+        : block_(block)
+    {
+        retain();
+    }
+
+
+    inline PoolHandle::PoolHandle(const PoolHandle& other) noexcept
+        : block_(other.block_)
+    {
+        retain();
+    }
+
+
+    inline PoolHandle::PoolHandle(PoolHandle&& other) noexcept
+        : block_(other.block_)
+    {
+        other.block_ = nullptr;
+    }
+
+
+    inline PoolHandle::~PoolHandle()
+    {
+        release();
+    }
+
+
+    inline PoolHandle& PoolHandle::operator=(const PoolHandle& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            block_ = other.block_;
+            retain();
+        }
+        return *this;
+    }
+
+
+    inline PoolHandle& PoolHandle::operator=(PoolHandle&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            block_ = other.block_;
+            other.block_ = nullptr;
+        }
+        return *this;
+    }
+
+
+    inline Pool* PoolHandle::get() const noexcept
+    {
+        if (!block_ || !block_->is_alive())
+        {
+            return nullptr;
+        }
+        return block_->pool();
+    }
+
+
+    inline PoolHandle::operator bool() const noexcept
+    {
+        return get() != nullptr;
+    }
+
+
+    inline void PoolHandle::retain() noexcept
+    {
+        if (block_)
+        {
+            block_->add_block_ref();
+            block_->add_handle_ref();
+        }
+    }
+
+
+    inline void PoolHandle::release() noexcept
+    {
+        if (block_)
+        {
+            block_->release_handle_ref();
+            block_->release_block_ref();
+            block_ = nullptr;
+        }
+    }
+
+
+    // ---------------------------------------------------------------------------
+    // Pool
+    // ---------------------------------------------------------------------------
 
     inline std::unique_ptr<AbstractSlab> Pool::makeLazySlab(std::size_t axis,
                                                             std::size_t index)
@@ -346,6 +626,7 @@ namespace spallocator
         uint8_t* magic_ptr = reinterpret_cast<uint8_t*>(alloc.ptr + header_size - 6);
         *magic_ptr = kAllocMagic;
 
+        control_->note_alloc();
         return alloc.ptr + header_size;
     }
 
@@ -446,6 +727,7 @@ namespace spallocator
                           alloc_size, static_cast<void*>(original_ptr), axis,
                           (slab == &large_slab) ? "large_slab" : "size_class");
             slab->deallocateItem(original_ptr);
+            control_->note_free();
             return true;
         }
         catch (...)
@@ -525,7 +807,20 @@ namespace spallocator
     }
 
 
+    inline std::uint64_t Pool::live_allocation_count() const noexcept
+    {
+        return control_ ? control_->live_allocation_count() : 0;
+    }
+
+
+    inline PoolHandle Pool::handle()
+    {
+        return PoolHandle(control_);
+    }
+
+
     Pool::Pool()
+        : control_(PoolControlBlock::create(this))
     {
         // Eager native-16 ladder only; 32/64 axes are created on first use.
         slabs16[0]  = std::make_unique<Slab<16, 16>>();
@@ -540,6 +835,19 @@ namespace spallocator
         slabs16[9]  = std::make_unique<Slab<512, 16>>();
         slabs16[10] = std::make_unique<Slab<768, 16>>();
         slabs16[11] = std::make_unique<Slab<1024, 16>>();
+    }
+
+
+    Pool::~Pool()
+    {
+        // Publish dead before member unique_ptrs tear down slabs so any later
+        // control-block observer (handles / deleters) sees !alive.
+        if (control_)
+        {
+            control_->mark_dead();
+            control_->release_block_ref();
+            control_ = nullptr;
+        }
     }
 
 }; // namespace spallocator
