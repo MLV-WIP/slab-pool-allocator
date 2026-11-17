@@ -1,0 +1,832 @@
+# Implementation Guide
+
+Architecture, invariants, design trade-offs, and production readiness for
+engineers integrating or extending the allocator.
+
+| Doc | Role |
+|-----|------|
+| [API.md](API.md) | Contracts, parameters, snippets |
+| [CONCEPTS.md](CONCEPTS.md) | Learning / conceptual narrative (pool ≠ slab) |
+| This file | How the pieces are built and why |
+| [README](../README.md) | Build, test, demos |
+| [SpinLock Analysis](../spallocator/docs/SpinLock_Analysis.md) | Lock correctness deep dive |
+
+**Audience:** production correctness first. Explanations stay precise so the same
+code remains readable for teaching — without soft-pedaling limits.
+
+**Pool ≠ slab:** the **pool** is the allocation domain (lifetime, routing,
+isolation). A **slab** is fixed-size slot storage the pool routes into. Keep
+those responsibilities distinct while reading below.
+
+---
+
+## Table of contents
+
+- [How to read](#how-to-read)
+- [Component map](#component-map)
+- [Memory layout](#memory-layout)
+- [Alignment design](#alignment-design)
+- [Request lifecycle](#request-lifecycle)
+- [Pool routing & registries](#pool-routing--registries)
+- [Slab strategy](#slab-strategy)
+- [Bitset tracking](#bitset-tracking)
+- [Address lookup](#address-lookup)
+- [Trim and RSS](#trim-and-rss)
+- [Smart pointers (design)](#smart-pointers-design)
+- [LifetimeObserver (design)](#lifetimeobserver-design)
+- [Thread safety & lock ordering](#thread-safety--lock-ordering)
+- [SpinLock (design summary)](#spinlock-design-summary)
+- [Performance](#performance)
+- [Debugging & sanitizers](#debugging--sanitizers)
+- [Known limits & readiness](#known-limits--readiness)
+- [Future work](#future-work)
+- [Demos & tests](#demos--tests)
+
+---
+
+## How to read
+
+1. **Component map** — who owns what (pool vs slab)  
+2. **Memory layout** + **Alignment design** — header protocol and axes  
+3. **Request lifecycle** — one numeric alloc/free walkthrough  
+4. **Pool routing** / **Slab strategy** / **bitsets** / **address lookup** — internals  
+5. **Trim**, **smart pointers**, **LifetimeObserver**, **locks** as needed  
+6. **Performance**, **debugging**, **future work** when optimizing or hardening  
+
+Skip to [API.md](API.md) for call signatures; use [CONCEPTS.md](CONCEPTS.md) when
+you need the “why pools / why slabs” story without code structure.
+
+---
+
+## Component map
+
+```
+                    ┌─────────────────────────────────────┐
+                    │  Pool — lifetime / routing domain   │
+                    │  (registry, header protocol, locks) │
+                    └──────────────┬──────────────────────┘
+                                   │
+              ┌────────────────────┼────────────────────┐
+              ▼                    ▼                    ▼
+     AbstractSlab           AbstractSlab          SlabProxy
+     Slab<16> …          (fixed-size slots)    (>axis max → ::new[])
+              │
+              └── per-slab SpinLock, bitsets, base_address_map
+
+  Smart pointers / PoolAllocator ──► clients of Pool&
+  LifetimeObserver                 (stand-alone; not part of Pool)
+```
+
+| Layer | Responsibility |
+|-------|----------------|
+| **`Pool`** | Allocation *domain*: construct/destroy as a unit, isolate shards, route by footprint + alignment, write/validate the allocation header, `trim` / accounting, pool-level locks |
+| **`Slab`** | Fixed-size *storage*: buffers, freemap, address map, growth/reclaim of empty buffers, per-slab lock |
+| **`SlabProxy`** | Same backend interface; system `new[]` / `delete[]` for oversized requests |
+| **Smart pointers** | Clients of `Pool&` (typed RAII) |
+| **`LifetimeObserver`** | Independent of pool/slab |
+
+Destroying a `Pool` destroys its slab backends. Speeding up 64-byte churn is
+primarily a slab concern; naming “memory for this shard” is a pool concern.
+Background: [CONCEPTS.md](CONCEPTS.md#what-is-a-pool-and-why-use-one).
+
+`AbstractSlab` is the narrow virtual interface (`allocateItem` /
+`deallocateItem` / reclaim / accounting) that lets `Pool` treat size-class
+`Slab`s and `SlabProxy` uniformly after routing.
+
+---
+
+## Memory layout
+
+Every `Pool::allocate(N, alignment)` reserves a **header** in front of the user
+payload. The pointer returned to the caller is past that header; free reads
+metadata behind it. The **slab** (or `SlabProxy`) only ever sees the **slot
+base**; the pool is responsible for the header protocol.
+
+```
+Default layout (alignment ≤ 8 → header_size = 8):
+
+  slab slot base                                                user pointer
+  │                                                             │
+  ▼                                                             ▼
+┌──────────┬─────────┬────────────────┬────────────────┬──────────────────┐
+│ pad      │ magic   │ header_size    │ alloc_size     │ payload (N B)    │
+│          │ (1 B)   │ (1 byte)       │ (uint32 / 4 B) │                  │
+└──────────┴─────────┴────────────────┴────────────────┴──────────────────┘
+             ▲         ▲                ▲
+             │         │                └─ user_ptr − 4
+             │         └─ user_ptr − 5
+             └─ user_ptr − 6  (kAllocMagic; cleared on free)
+```
+
+| Offset from user ptr | Type | Meaning |
+|----------------------|------|---------|
+| `−4 … −1` | `uint32_t` | Footprint `alloc_size = N + header_size` (selects backend on free) |
+| `−5` | `uint8_t` | `header_size` itself; must be 8, 16, 32, or 64 |
+| `−6` | `uint8_t` | `kAllocMagic`; validated then cleared on free |
+| `−header_size … −7` | padding | Remaining bytes so the user pointer meets `alignment` |
+
+### Division of labor
+
+| Step | Actor |
+|------|--------|
+| Choose class / allocate raw slot of `alloc_size` bytes | Slab or `SlabProxy` |
+| Write magic, `header_size`, `alloc_size`; return `base + header_size` | Pool |
+| On free: validate header, recover `base`, clear magic | Pool |
+| Mark slot free / `delete[]` | Slab or `SlabProxy` |
+
+The slab never interprets the header. That keeps storage backends simple and
+puts all “pointer looks like a pool allocation” policy in one place.
+
+### Free validation (pool)
+
+Before trusting the header:
+
+1. `header_size ∈ {8,16,32,64}`  
+2. Magic equals `kAllocMagic`  
+3. Footprint in a plausible range (`header_size ≤ alloc_size ≤ 1_GB + max align`)  
+
+Failures:
+
+| API | Behavior |
+|-----|----------|
+| `Pool::deallocate` | Throws `std::invalid_argument` |
+| `Pool::try_deallocate` | Returns `false` (including after failed slab free) |
+| `PoolDeleter` / `PoolAllocator::deallocate` | `noexcept` → **`std::abort()`** on failure |
+
+Clearing magic on a successful free turns a second free of the same user
+pointer into a magic mismatch (double-free detection at the pool layer). Slab
+interior-pointer checks remain a second line of defense.
+
+Under AddressSanitizer the header region is **poisoned** after free and
+**unpoisoned** when the slot is reused. Free briefly unpoisons a fixed peek
+window so double-free / corrupt-header checks can run without ASan aborting
+first, then re-poisons if the peek path fails.
+
+### Overhead intuition
+
+| User N | Align | Header | Footprint | Typical class | Header / N |
+|--------|-------|--------|-----------|---------------|------------|
+| 128 | 8 | 8 | 136 | 192B | ~6% |
+| 100 | 8 | 8 | 108 | 128B | 8% |
+| 16 | 8 | 8 | 24 | 32B | 50% |
+| 64 | 64 | 64 | 128 | 128B (axis 64) | 100% |
+
+Tiny objects pay a higher relative header tax; that is expected. Bitset and
+class waste are additional — always reason in footprints when estimating.
+
+### Design rationale
+
+Storing size and header width with the pointer matches `delete`, avoids
+size-mismatch bugs, and supports variable alignment without pointer tagging.
+
+| Alternative | Why not (here) |
+|-------------|----------------|
+| Size argument on free | Easy to pass wrong size; diverges from `delete` |
+| Pointer tagging | Steals bits; fights high alignment and sanitizers |
+| Side size table | Extra indirection and lifetime coupling |
+
+---
+
+## Alignment design
+
+Alignment is both a **user contract** (`allocate`’s second argument /
+`alignof(T)` from factories) and a **routing key** into a size-class axis.
+
+| Rule | Detail |
+|------|--------|
+| Default | `alignment = 8` |
+| Allowed | Power of two in `[4, 64]`; else `invalid_argument` in **all** builds (including release) |
+| Header width | `header_size = max(8, alignment)` |
+| Native axis | `nativeAxis`: 4/8/16 → **16**; 32 → 32; 64 → 64 |
+| Storage | `Slab<ElemSize, Alignment>` per axis ladder |
+| Lazy axes | 32/64 slab objects created on first use |
+| Over axis max | `SlabProxy` with `align_val_t{64}` |
+| Factories | `static_assert(alignof(T) ≤ 64)` |
+
+Non-power-of-two values in range (for example 12) are rejected even in release:
+header/axis math assumes power-of-two alignment.
+
+### Why compound keys?
+
+High-align requests must not share a native-16 slot layout with a narrower
+header story. If a 64-align object lived in an axis-16 128B slot with only an
+8-byte header, free could not recover a consistent axis from `header_size`, and
+slot bases would not guarantee the user’s alignment. Separate
+`Slab<ElemSize, Alignment>` specializations keep:
+
+- slot stride = `ElemSize` (multiple of `Alignment`)  
+- freemap bit ↔ exact slot base  
+- `header_size` recoverable as 8/16/32/64 and mapped back to an axis  
+
+### Axis ladders
+
+```
+Axis 16 (eager): 16 … 1024
+Axis 32 (lazy):  32 … 2048
+Axis 64 (lazy):  64 … 4096
+```
+
+Request align 4/8 **over-aligns** into axis 16 (slots are at least 16-aligned).
+That is intentional: one hot ladder for the common case; pay for 32/64 only on
+first use.
+
+**Examples:**
+
+| Call | Header | Footprint | Path |
+|------|--------|-----------|------|
+| `allocate(64)` | 8 | 72 | 96B class, axis 16 |
+| `allocate(64, 16)` | 16 | 80 | 96B class, axis 16 |
+| `allocate(64, 64)` | 64 | 128 | 128B class, axis 64 (lazy) |
+
+---
+
+## Request lifecycle
+
+End-to-end path shows how pool and slab hand off. Locks noted are the *intent*
+of the current code; see [Thread safety](#thread-safety--lock-ordering).
+
+### Allocate — `pool.allocate(100)` (default align 8)
+
+1. **Validate (pool, unlocked):** reject `N > 1_GB`; require power-of-two align
+   in `[4, 64]`  
+2. **Compute (pool):** `header_size = 8`, `alloc_size = 108`  
+3. **Classify (pool):** `nativeAxis(8) → 16`; class **128B** (108 > 96)  
+4. **Resolve backend (pool lock, brief):** `slabs16[index]` or lazy create path  
+5. **Take slot (slab lock):** find free bit, mark freemap / availability; return
+   **slot base**  
+6. **Publish header (pool, after slab returns):** write magic / sizes at base;
+   return `base + header_size` to the caller  
+
+Exclusive ownership of the user pointer begins at step 6.
+
+### Deallocate
+
+1. **Peek (pool):** read header behind user pointer (ASan unpoison peek if needed)  
+2. **Validate (pool):** magic / `header_size` / footprint; else fail per API  
+3. **Recover base (pool):** `base = item - header_size`; clear magic  
+4. **Re-route (pool):** backend from `(alloc_size, axis-from-header_size)`  
+5. **Free slot (slab lock):** `deallocateItem(base)` — exact slot base only  
+6. **Retention:** empty buffers stay mapped until [`trim`](#trim-and-rss)  
+
+Free must re-select the backend from the header rather than trusting the caller
+to pass a size: that is the point of the metadata.
+
+### Footprint → class (align 8 → +8 header)
+
+| User N | Footprint | Size class |
+|--------|-----------|------------|
+| 8 | 16 | 16 |
+| 16 | 24 | 32 |
+| 100 | 108 | 128 |
+| 128 | 136 | 192 |
+
+Always classify by **footprint**, not bare user size. Mis-estimating waste in
+tests or docs almost always means forgetting the header.
+
+---
+
+## Pool routing & registries
+
+`Pool` is the directory of backends for one allocation domain.
+
+| Registry | When built | Contents |
+|----------|------------|----------|
+| `slabs16[12]` | With the pool (eager) | One `unique_ptr<AbstractSlab>` per ladder rung |
+| `slabs32` / `slabs64` | Lazy via `getOrCreateLazy` | Same shape; empty until first use |
+| `large_slab` | With the pool | Single `SlabProxy` instance |
+
+**Routing:** `resolveSlab(alloc_size, axis)` runs `selectClassIndex`. A normal
+index picks a size-class slab; `kSlabIndexNpos` means footprint exceeds that
+axis’s max → `large_slab`.
+
+**Lazy create sequence (intent):**
+
+1. Under `Pool::lock`, if the slot is already populated, return it  
+2. Otherwise take `slab_init_lock` (heavy construction serialized here)  
+3. Double-check under `Pool::lock` (another thread may have won)  
+4. Construct `Slab<…>` **without** holding `Pool::lock`  
+5. Publish under `Pool::lock`  
+
+That keeps ordinary allocate/free routing critical sections short while avoiding
+duplicate lazy slabs under races.
+
+`selectSlab` / `selectClassIndex` are pure classification helpers: usable from
+tests and constexpr-friendly call sites, and shared by allocate and free so both
+paths agree on the ladder.
+
+---
+
+## Slab strategy
+
+Each `Slab<ElemSize, Alignment>` is a **fixed-size recycler** for one rung of
+one axis.
+
+**Owns**
+
+- Zero or more equally sized **buffers** (`slab_alloc_size` — typically 4 KiB
+  when `ElemSize < 1_KB`, otherwise a small multiple of `ElemSize`)  
+- Per-buffer freemap of slots  
+- Growable availability map (`DynBitset`) across buffers  
+- `base_address_map` for free  
+- Its own `SpinLock`  
+
+**Invariants (informal)**
+
+- `ElemSize` is a multiple of `Alignment`; `Alignment ∈ {16,32,64}`  
+- Every in-use freemap bit corresponds to a live user allocation whose slot base
+  the pool wrapped with a header  
+- Buffer count only shrinks via reclaim/trim, not via ordinary free  
+
+**Growth:** if no buffer has a free slot, allocate another buffer, zero/init its
+freemap, register its base, set its availability bit. **Monotonic by default:**
+a fully empty buffer is *not* returned to the OS on the last free — see
+[Trim and RSS](#trim-and-rss).
+
+### `SlabProxy`
+
+Large / overflow path behind the same `AbstractSlab` interface:
+
+- `allocateItem` → aligned `new[]`  
+- `deallocateItem` → `delete[]` (no freemap, no retention)  
+- No address map: each block is standalone  
+
+The pool still attaches the usual header on the returned user pointer so free
+looks the same. Choosing proxy vs size-class is purely a routing decision from
+footprint + axis max.
+
+---
+
+## Bitset tracking
+
+Two levels of bits, both owned by the **slab** (not the pool):
+
+| Structure | Scope | Role |
+|-----------|-------|------|
+| Slot freemap | Per buffer | Bit per slot: free vs in use |
+| `DynBitset` availability | Per `Slab` object | Bit per live buffer: “has free capacity?” |
+
+`DynBitset` grows with live buffer count — empty size classes do not embed a
+fixed ~128 KiB phantom map (an earlier fixed-bitset design paid that tax even
+when idle).
+
+### Alloc path (conceptual)
+
+1. Find a buffer whose availability bit is set (skip full buffers)  
+2. Scan that buffer’s freemap **from bit 0 upward** for a clear bit  
+3. Set the bit; if the buffer is now full, clear its availability bit  
+4. Return `base + bit_index * ElemSize` as the slot base  
+
+### Free path (conceptual)
+
+1. Map slot base → buffer via address lookup  
+2. Compute bit index from offset within the buffer  
+3. Reject if already free or not an exact slot boundary  
+4. Clear freemap bit; set availability bit (buffer has room again)  
+
+### Why scan-from-zero?
+
+Compact metadata, simple invariants, and acceptable cost for 4 KiB buffers
+until profiles say otherwise. A freelist or next-fit cursor can make the hot
+path strictly O(1) at the cost of extra words per free slot and more complex
+coalesce/debug stories — a **slab-local** optimization (Future work), not a
+change to the pool domain model.
+
+---
+
+## Address lookup
+
+On free, the slab must answer: which buffer owns this **slot base**?
+
+Buffers are intervals `[base, base + slab_alloc_size)`. The implementation keeps
+a `std::map` keyed by buffer base and uses interval logic (`upper_bound` then
+step back to the candidate owner). Cost **O(log m)** in the number of buffers
+for that size class.
+
+| Approach | Trade-off |
+|----------|-----------|
+| `std::map` (current) | Clear correctness; flexible growth/trim |
+| Hash of bases | Faster exact-base lookup; awkward if you must prove interval membership |
+| Sorted vector | Better locality; insert/delete under growth/trim more expensive |
+
+Chosen for correctness at typical slab counts; denser structures are a
+profile-driven follow-on if free shows up hot.
+
+### Interior pointers
+
+The freemap bit corresponds to an **exact** slot base. Freeing
+`user_ptr + 1`, a mid-slot address, or a pointer into padding must not clear a
+neighbor’s bit. `deallocateItem` rejects those with `invalid_argument` after
+lookup. Combined with pool header validation, this is how accidental interior
+frees fail loudly instead of corrupting the freemap.
+
+Trim/reclaim updates the map when buffers are destroyed (swap-with-last style
+bookkeeping keeps indices consistent — see code).
+
+---
+
+## Trim and RSS
+
+Ordinary free returns a **slot** to a freemap. It does not shrink the process
+image. Peak RSS after a burst therefore tends to stick until something reclaims
+empty **buffers**.
+
+| Mechanism | Layer | Behavior |
+|-----------|-------|----------|
+| Ordinary free | Slab | Slot free; empty buffer stays mapped |
+| `Slab::reclaimEmptySlabs(keep_min)` | Slab | Deletes fully empty buffers (swap-with-last); retains ≥ `keep_min` |
+| `Pool::trim(keep_min)` | Pool | Walks size-class slabs and asks each to reclaim; domain policy knob |
+| `SlabProxy` free | Proxy | Memory returned immediately every time |
+
+**Why monotonic default?** Alloc/free churn should not mmap/munmap thrash; the
+next burst stays warm. **Why expose trim on the pool?** “This shard is quiet —
+give memory back” is a **domain** decision. The pool knows the registry; each
+slab knows which buffers are empty.
+
+`keep_min` is per size class and clamped to at least 1 so a class does not
+oscillate between “zero buffers” and “allocate a buffer on every hit.”
+
+### Accounting
+
+`getAllocatedMemory()` sums **retained size-class buffer bytes** across the
+pool’s slabs. It is not:
+
+- a live “bytes currently checked out to clients” gauge  
+- inclusive of in-flight `SlabProxy` blocks (those are not retained in the
+  registry the same way)  
+
+Use it to understand high-water retention and the effect of `trim`, not as a
+full heap profiler.
+
+---
+
+## Smart pointers (design)
+
+Factories and deleters are **clients of `Pool&`**. They do not change slab
+internals; they enforce RAII and exception safety on top of the pool domain.
+
+### Roles
+
+| Piece | Design point |
+|-------|----------------|
+| `PoolDeleter` | `~T()` then `try_deallocate`; arrays destroy reverse order; abort on bad free |
+| `make_pool_unique` | Placement new; on ctor throw, return slot to pool (**strong guarantee**) |
+| `make_pool_shared` | `allocate_shared` + `PoolAllocator` (object + control block from pool) |
+| `PoolAllocator` | Stateful `Pool&`; no propagate-on-copy/move/swap; equal iff same pool instance |
+
+### Exception safety
+
+Single-object `make_pool_unique`: allocate bytes → placement `new` → on
+constructor throw, `deallocate` the raw block, rethrow. The caller never sees a
+smart pointer to a half-built object, and the pool does not leak the slot.
+
+Array `make_pool_unique<U[]>`: default-construct elements in order; if element
+*k* throws, destroy `k-1 … 0` in reverse, free the block, rethrow. That matches
+the strong guarantee expected of `std::make_unique`-style helpers.
+
+`PoolDeleter` / `PoolAllocator::deallocate` are `noexcept` and must not throw
+through `unique_ptr` / allocator requirements — hence `try_deallocate` + abort
+on programming errors instead of exceptions.
+
+### Why `allocate_shared` for shared
+
+`make_pool_shared` uses `std::allocate_shared` with `PoolAllocator` so the
+control block and object can share pool storage (same idea as
+`std::make_shared` vs separate `new`). Array overloads rely on `shared_ptr`’s
+built-in size tracking rather than embedding a count in a custom deleter.
+
+### Lifetime coupling
+
+The pool must outlive every smart pointer / container still holding its blocks.
+Destroying the pool first is currently **unsafe** — see
+[Known limits](#known-limits--readiness) and research backlog R3 (detect,
+refcount pool, or document hard).
+
+API: [API.md — Smart pointers](API.md#smart-pointers).  
+Concepts: [CONCEPTS.md — RAII](CONCEPTS.md#raii-on-a-custom-pool).
+
+---
+
+## LifetimeObserver (design)
+
+`LifetimeObserver` is **independent of the allocator**. It solves a different
+problem: deferred callbacks that must know whether an object still exists,
+without forcing full `shared_ptr` ownership. Pool/slab never call into it.
+
+### Control block
+
+Each live observer family shares a heap-allocated `ControlBlock`:
+
+| Field | Role |
+|-------|------|
+| `owner_count` | Atomic strong refs (the object / owner copies) |
+| `observer_count` | Atomic weak refs (`getObserver()` views) |
+| `retired` | Ensures only one releaser `delete`s the block when both counts hit zero |
+
+`addRef` / `releaseRef` adjust the appropriate counter. When a release drives a
+counter to zero *and* the other counter is already zero, the caller tries
+`retired.compare_exchange` — the winner deletes the control block.
+
+### Liveness check
+
+```text
+isAlive()  →  acquire-load owner_count  →  true iff count > 0
+```
+
+A **false** result synchronizes with the release that dropped the last owner
+(`acq_rel` on that `fetch_sub`), so the observer can treat “not alive” as
+happening-after teardown of owner-side control-block state. A **true** result
+means “an owner ref still existed at the load” — it does **not** pin the object
+or extend its lifetime.
+
+### Owner vs observer
+
+| Kind | How you get it | Effect on lifetime |
+|------|----------------|--------------------|
+| Owner | Derived object’s default ctor; certain copies | Keeps `owner_count` > 0 while held |
+| Observer | `getObserver()`, or explicit observer copy | Does **not** keep the object alive |
+
+Callbacks should capture `getObserver()`, not an accidental owner copy (which
+would prevent destruction).
+
+### Move semantics
+
+Move transfers the control-block pointer and ownership kind. The moved-from
+object receives a **fresh** owner control block so its destructor remains
+well-defined (it must still release something). That avoids double-free of the
+shared block and keeps “every `LifetimeObserver` instance has a block” as an
+invariant.
+
+### Thread-safety model
+
+| Situation | Safe? |
+|-----------|--------|
+| Concurrent `isAlive()` / `getCount` / ref adjust | **Yes** — atomics; no data race on counts |
+| Concurrent `isAlive()` while another thread destroys the owner | **Yes** for the liveness bit |
+| Same-thread / single-strand: `isAlive()` then use when destroy cannot overlap | **Yes** — complete pattern; no extra mutex required |
+| Cross-thread: `isAlive()` then use object members while destroy can race | **No** — classic TOCTOU on the object; hold the same mutex/strand that covers destroy, or use `shared_ptr` / `weak_ptr` for upgrade-to-own |
+
+Atomics close the **counter** race. They do not replace a protocol for
+**member access** when use and destroy can race across threads. That is the same
+rule as any shared mutable object — not a deficiency in `isAlive()`.
+
+### Comparison (implementation stance)
+
+| | `weak_ptr::lock()` | `LifetimeObserver::isAlive()` |
+|--|--------------------|------------------------------|
+| Result | Optional strong ownership | Boolean liveness |
+| Pins object | Yes, if lock succeeds | No |
+| Best when | You need to use the object without an external mutex | Strand/mutex already orders use vs destroy, or you only need a skip/go check |
+
+API contracts: [API.md — LifetimeObserver](API.md#lifetimeobserver).  
+Teaching narrative: [CONCEPTS.md](CONCEPTS.md#observing-lifetime-without-owning).
+
+---
+
+## Thread safety & lock ordering
+
+Concurrency is layered the same way as ownership: **pool** locks protect the
+directory of backends; **slab** locks protect slot metadata inside one size
+class. Different classes can run in parallel after routing. Separate `Pool`
+instances share no locks — isolation is free at the domain boundary.
+
+| Lock | Protects | Hold time intent |
+|------|----------|------------------|
+| `Pool::lock` | Registry / routing snapshots | Brief — look up or publish a pointer |
+| `Pool::slab_init_lock` | Lazy slab construction | May cover heavy `Slab` ctor; not on every alloc |
+| Per-`Slab` `SpinLock` | Freemap, availability, address map | Brief — bit ops and map update |
+
+### Ordering intent
+
+Never take locks in opposing orders across threads:
+
+- Common allocate: `Pool::lock` (resolve) → drop → `Slab::lock` (slot)  
+- Lazy publish: `slab_init_lock` → brief `Pool::lock` to install  
+- Avoid: holding `Slab::lock` then blocking on `Pool::lock` while another thread
+  holds pool and waits for that slab  
+
+Exact sequences live in `pool.hpp` / `slab.hpp` — treat those as source of
+truth if this summary drifts.
+
+### Client-facing notes
+
+| Client | Thread notes |
+|--------|----------------|
+| Concurrent `Pool::allocate` / free | Supported on one pool |
+| `unique_pool_ptr` | Unique ownership — cross-thread handoff needs external sync on the pointer |
+| `shared_ptr` from `make_pool_shared` | Standard atomic control-block refcounts |
+| Multiple `Pool` instances | Separate domains; no shared locks between pools |
+| `LifetimeObserver` | Allocator-independent; see its own thread model |
+
+Prefer `std::scoped_lock` around `SpinLock` so exceptions cannot leave a lock
+held. Compile-time swap of the lock type is backlog item R5 on the research
+canvas.
+
+---
+
+## SpinLock (design summary)
+
+`SpinLock` is the mutual-exclusion primitive used today for **short** critical
+sections in `Pool` and `Slab`. It models `BasicLockable` (`lock` / `unlock` /
+`try_lock`) so `std::scoped_lock` / `std::unique_lock` work. Non-copyable,
+non-movable. Full line-by-line analysis:
+[SpinLock_Analysis.md](../spallocator/docs/SpinLock_Analysis.md).
+
+### Why not always `std::mutex`?
+
+Pool/slab critical sections are tiny (route a pointer; flip freemap bits). A
+spinlock that busy-waits briefly often beats sleeping a thread on uncontended or
+lightly contended paths. Under prolonged contention the implementation **stops**
+burning CPU and blocks via `atomic_flag::wait`. Whether a given embed prefers
+`std::mutex` instead is exactly the pluggable-lock backlog item.
+
+### State
+
+One `std::atomic_flag`: clear = unlocked, set = locked. Acquisition uses
+`test_and_set(acquire)`; release uses `clear(release)` plus `notify_one`.
+
+### `lock()` algorithm
+
+```text
+1. Thread-local RNG → initial wait_time (1–100 ns); backoff_count = 0
+2. Loop:
+   a. Spin up to 100×: relaxed test(); yield if held; break if appears free
+   b. test_and_set(acquire); if won → TSan happens-after; return
+   c. If backoff_count < 10: sleep(wait_time); wait_time *= 2; ++backoff_count
+   d. Else: wait(true) until notified; loop back to (a)  // must still TAS
+```
+
+Important correctness detail: after `wait()` returns, the thread **does not**
+assume it owns the lock — it returns to the spin/TAS path. `backoff_count`
+lives across iterations so the wait fallback remains reachable (resetting it
+each loop would livelock in the sleep phase).
+
+| Phase | Purpose |
+|-------|---------|
+| Relaxed TTAS spin | Cheap poll; avoid cache-line writes until a real acquire attempt |
+| Escalating sleep | Desynchronize thundering herds without jumping straight to park |
+| `wait` / `notify` | CPU-efficient block under sustained contention |
+
+`try_lock()` does a relaxed test then a single `test_and_set(acquire)`; it never
+waits.
+
+### Memory ordering (intuition)
+
+```text
+Thread A                          Thread B
+lock() [acquire]
+  // writes protected data
+unlock() [release]  ──happens-before──►  lock() [acquire]
+                                           // sees A's writes
+```
+
+Relaxed loads in the spin/wait paths only decide *whether to try*; they are not
+the synchronization edge. The acquire TAS and release clear are.
+
+### ThreadSanitizer annotations
+
+Custom locks are invisible to TSan unless happens-before is published:
+
+| When | Annotation |
+|------|------------|
+| After successful acquire | `TSAN_ANNOTATE_HAPPENS_AFTER` → `__tsan_acquire` |
+| Before `clear` in unlock | `TSAN_ANNOTATE_HAPPENS_BEFORE` → `__tsan_release` |
+
+Enabled when GCC defines `__SANITIZE_THREAD__` or Clang
+`__has_feature(thread_sanitizer)`. Without them, TSan may false-positive on data
+guarded only by `SpinLock`.
+
+### Usage guidance
+
+- Hold only for brief registry / bitmap work; do not call into user code under
+  the lock  
+- Prefer RAII (`scoped_lock`) over bare `lock`/`unlock`  
+- API surface: [API.md — SpinLock](API.md#spinlock)  
+
+---
+
+## Performance
+
+### Complexity
+
+| Operation | Amortized | Notes |
+|-----------|-----------|-------|
+| Alloc (size class) | O(1) | Worst case: scan all slots in one buffer |
+| Free (size class) | O(log m) | Address map; m = buffers in that slab |
+| `selectSlab` | O(1) | Ladder of compares |
+| `SpinLock` uncontended | O(1) | Single atomic |
+| `SpinLock` contended | depends | Spin → sleep backoff → `wait` |
+| `SlabProxy` alloc/free | OS dependent | No slot freemap |
+| `trim` | O(classes × buffers) | Quiet-path; not on hot alloc |
+
+“Amortized O(1)” alloc assumes the availability map keeps you on a non-full
+buffer and that freemap scans stay short relative to work done with the object.
+A pathological pattern (one free bit at the end of a busy buffer, every time)
+still costs a full scan of that buffer’s bits — hence the freelist/cursor
+follow-on.
+
+### Fragmentation
+
+Always reason about **footprint vs class size**, not bare user size vs class.
+Waste has three buckets:
+
+1. Header bytes (`max(8, alignment)`)  
+2. Internal slack inside the chosen class slot  
+3. Retained empty buffers until `trim` (RSS, not per-object waste)  
+
+### Scalability levers
+
+| Lever | Effect |
+|-------|--------|
+| Per-slab locks | Different size classes proceed in parallel after routing |
+| Multiple pools | Isolate shards / tenants; reduce cross-talk and lock sharing |
+| Lazy 32/64 axes | No metadata cost until high-align traffic appears |
+| `trim` | Reclaim RSS after spikes without changing the hot path |
+| `SlabProxy` | Avoids forcing huge objects through size-class bookkeeping |
+
+Measure before replacing bit scans or the address map — both are deliberate
+simplicity until profiles disagree.
+
+---
+
+## Debugging & sanitizers
+
+| Build | Role |
+|-------|------|
+| `BUILD_TYPE=addrsan` (default) | ASan + LSan + UBSan; header poison on free |
+| `BUILD_TYPE=threadsan` | TSan (+ UBSan); exercises locks / annotations |
+| `BUILD_TYPE=release` | `-O3 -DNDEBUG`; coverage on by default in CI |
+| `BUILD_TYPE=memsan` | Valid locally when host provides instrumented C++ runtime/gtest; **omitted from CI** |
+| `-DVDEBUG` | Verbose `debug_println` (slab create/alloc/free, selection, misses) |
+
+Sanitizer instrumentors are mutually exclusive at configure time (ASan/LSan vs
+MSan vs TSan); UBSan may combine. `BUILD_TYPE` always applies the matching
+`-fsanitize=` flags so a bare `make BUILD_TYPE=threadsan` cannot silently omit
+TSan.
+
+`runtime_assert` is debug-only (`if constexpr`); release compiles it out. Use
+real throws / error returns for caller mistakes that can happen in production
+(bad alignment, huge size, bad free via throwing `deallocate`).
+
+When chasing freemap corruption, prefer addrsan builds: poisoned headers catch
+use-after-free into metadata; interior frees should throw before flipping bits.
+
+---
+
+## Known limits & readiness
+
+Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
+`PoolAllocator`, with the following explicit limits:
+
+| Topic | Status |
+|-------|--------|
+| Pool destroy while clients hold pointers | **Unsafe today** — pool must outlive smart pointers / containers; mitigations in research backlog R3 |
+| Alloc bit scan | Production default; freelist/cursor if profiles demand |
+| Address map | O(log m); denser structures if free is hot |
+| Fixed size-class ladders | Deliberate; shaped buffers are backlog R2 |
+| Lock type | Hard-wired `SpinLock`; pluggable primitive is backlog R5 |
+| MSan in CI | Deferred pending host instrumented runtime |
+| Metrics API | Minimal (`getAllocatedMemory`); richer stats planned |
+| C API | C++ only today; C99 wrapper is backlog R4 |
+
+These are engineering follow-ons, not soft-pedaled “educational” gaps. Document
+contracts in [API.md](API.md); do not rely on “users will be careful” for pool
+lifetime versus smart pointers.
+
+---
+
+## Future work
+
+Near-term / opportunistic:
+
+- Richer allocation / fragmentation metrics API  
+- Freelist or next-fit cursor if scan cost dominates  
+- Thread-local caches; NUMA-aware buffers  
+- Lock-free fast paths for common size classes  
+- Configurable SpinLock backoff parameters  
+
+### Research / design backlog
+
+Also tracked on the
+[research-design-backlog canvas](/home/michaelv/.cursor/projects/home-michaelv-dev-projects-slab-pool-allocator/canvases/research-design-backlog.canvas.tsx)
+(open beside chat):
+
+| Item | Notes |
+|------|--------|
+| Non–fixed-class buffer shaping | Size buffers to `(elem + header) × multiple` instead of discrete ladders |
+| Pool lifetime vs smart pointers | Detect / prevent / mitigate destroy-with-live-clients |
+| C99 wrapper | Opaque pool handle API for C callers |
+| Pluggable lock primitive | Compile-time choice of `SpinLock` vs `std::mutex` (or similar) for Pool/Slab |
+
+---
+
+## Demos & tests
+
+| Artifact | Proves |
+|----------|--------|
+| `test/tester.cpp` | Slab growth/trim/`DynBitset` scaling, pool routing/alignment/header validation, multi-thread pool use, smart-pointer exception safety, SpinLock contention, LifetimeObserver (including concurrent `isAlive`) |
+| `demos/demo_spalloc_shared_ptr.cpp` | Pool as domain + `make_pool_shared` + `PoolAllocator` with STL containers |
+| `demos/demo_lifetime_observer.cpp` | Single-strand vs mutex-guarded cross-thread observer patterns |
+
+Prefer `make test` under `addrsan` for day-to-day; add `threadsan` when touching
+locks or observer atomics. Commands:
+[README — Quick Start](../README.md#quick-start).

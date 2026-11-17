@@ -1,31 +1,33 @@
 # Slab Pool Allocator
 
-A modern C++ implementation of a slab-based memory pool allocator with advanced features for efficient fixed-size memory management.
+A C++ memory **pool** backed by **slab** size-class storage — for production services that need fast, thread-safe allocation, with a clear design that also teaches well.
 
 ## Overview
 
-A slab-based memory pool intended for production services that need fast, thread-safe fixed-size allocation. The same design choices — clear structure, solid defaults, measurable performance — also make the code a strong base for teaching allocator and concurrency fundamentals.
+A memory **pool** (disposable / isolatable allocation domain) backed by **slabs** (fixed-size slot recyclers). Pool and slab are separate ideas — the pool owns lifetime and routing; slabs implement size-class storage.
 
 **Readiness:** The pool, SpinLock, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. `LifetimeObserver` provides race-free atomic liveness checks that are complete for same-thread / single-strand event loops; when callbacks and teardown can race across threads, pair object use with the same mutex/strand that covers destroy (or use `shared_ptr`/`weak_ptr` when you need upgrade-to-own). Known follow-ons (freelist/cursor, richer metrics) are listed under Future Work — they are optimizations, not readiness blockers for typical workloads.
 
 **Directory map:**
 ```
-spallocator/          # header-only library (+ docs/SpinLock_Analysis.md)
+spallocator/          # header-only library
+spallocator/docs/     # SpinLock_Analysis.md (SpinLock deep dive)
+docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md
 test/                 # Google Test suite (tester.cpp)
 demos/                # example programs
-IMPLEMENTATION.md     # design deep-dive and rationale
 README.md             # this overview + build/run
 ```
 
 ## Key Features
 
-- **Compound-key size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB
-- **Thread-safe pool** with two-level locking and large-allocation fallback (>1KB)
+- **Pool as allocation domain** — construct, share a `Pool&`, destroy to dispose; shard pools to isolate or reduce contention
+- **Slab size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB; large fallback via `SlabProxy`
+- **Thread-safe routing** — pool + per-slab locking
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>`
 - **LifetimeObserver** with atomic liveness checks for async callbacks; **SpinLock** (TTAS → backoff → block)
 - **Modern C++20/23** — templates, atomics, ranges, concepts
 
-Deep design notes live in [IMPLEMENTATION.md](IMPLEMENTATION.md), not here.
+Design and API detail live under [`docs/`](docs/), not in this README.
 
 ## Quick Start
 
@@ -126,13 +128,13 @@ int main() {
 
 | Component | File | Description |
 |-----------|------|-------------|
-| **Slab** | `spallocator/slab.hpp` | Template class managing fixed-size allocations with bitset tracking |
-| **Pool** | `spallocator/pool.hpp` | Thread-safe interface routing allocations to appropriate slabs |
-| **SlabProxy** | `spallocator/slab.hpp` | Handles large allocations (>1KB) via standard allocators |
-| **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII memory management |
+| **Pool** | `spallocator/pool.hpp` | Allocation domain: route by footprint/alignment, header protocol, `trim`, dispose as a unit |
+| **Slab** | `spallocator/slab.hpp` | Fixed-size slot recycler for one size class (bitmaps, growth, reclaim) |
+| **SlabProxy** | `spallocator/slab.hpp` | Large / overflow path via system `new[]` / `delete[]` |
+| **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a `Pool&` |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
-| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Intrusive weak liveness tracking; mutex/strand only when use and destroy can race across threads |
-| **SpinLock** | `spallocator/spinlock.hpp` | Production-ready lock with TTAS, backoff, and TSan annotations |
+| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Intrusive weak liveness; extra sync only when use and destroy can race across threads |
+| **SpinLock** | `spallocator/spinlock.hpp` | Short-section lock with TTAS, backoff, and TSan annotations |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
 
 ### Size Classes
@@ -147,7 +149,7 @@ Axis 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 
 Beyond an axis max → `SlabProxy` (always 64-byte aligned `new[]`).
 
-Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs are selected by **total footprint** (requested size + allocation header), not the user size alone — see [IMPLEMENTATION.md](IMPLEMENTATION.md).
+Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs are selected by **total footprint** (requested size + allocation header), not the user size alone — see [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
 ## Performance Characteristics
 
@@ -157,7 +159,7 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 | Deallocation | O(log n) | Address map lookup (n = slabs) |
 | SpinLock lock/unlock | O(1) | No contention case |
 
-**Space Overhead**: Default header is 8 bytes (`header_size = max(8, alignment)`), so ~6% for a 128-byte user request before bitset amortization. Details in [IMPLEMENTATION.md](IMPLEMENTATION.md#memory-layout).
+**Space Overhead**: Default header is 8 bytes (`header_size = max(8, alignment)`), so ~6% for a 128-byte user request before bitset amortization. Details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#memory-layout).
 
 ## Requirements
 
@@ -168,13 +170,18 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 
 ## Documentation
 
-- **[IMPLEMENTATION.md](IMPLEMENTATION.md)** — Design deep-dive: memory layout, size-class selection, smart pointers, concurrency, and trade-offs. Start here after the Quick Start above.
-- **[SpinLock Analysis](spallocator/docs/SpinLock_Analysis.md)** — SpinLock correctness and performance analysis
-- **Source Files** — Inline comments explaining design decisions
+| Doc | Role |
+|-----|------|
+| **[docs/API.md](docs/API.md)** | Public API reference: contracts, thread-safety, short usage snippets (including helpers) |
+| **[docs/CONCEPTS.md](docs/CONCEPTS.md)** | Conceptual / learning-oriented guide (pools, slabs, lifetime patterns, teaching path) |
+| **[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** | Architecture, design trade-offs, and production readiness |
+| **[SpinLock Analysis](spallocator/docs/SpinLock_Analysis.md)** | SpinLock correctness and performance deep dive (linked from IMPLEMENTATION) |
+
+The repo-root [`IMPLEMENTATION.md`](IMPLEMENTATION.md) redirects here. Source headers also carry design comments.
 
 ## Testing
 
-The suite in `test/tester.cpp` covers slab growth, size-class routing, thread safety, smart pointers, destructor invocation, SpinLock contention, and `PoolAllocator` / STL integration.
+The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation, thread safety, smart pointers, SpinLock contention, `PoolAllocator` / STL integration, and `LifetimeObserver` (including concurrent `isAlive`).
 
 ```bash
 make test
@@ -182,18 +189,24 @@ make test
 make && ./obj/addrsan/tester
 ```
 
-## Completed Features
-
-- ✅ SpinLock implementation with TTAS and escalating backoff
-- ✅ Smart pointer support: `make_pool_unique` and `make_pool_shared`
-- ✅ Thread-safe Pool with two-level locking strategy
-- ✅ STL allocator interface: `PoolAllocator<T>`
-- ✅ Object lifetime observer (atomic liveness; optional cross-thread sync for object use)
-
 ## Future Work
 
 - Memory statistics and profiling API
 - Configurable SpinLock parameters
+
+### Research / design backlog
+
+Recorded for later (not scheduled). See also
+[docs/IMPLEMENTATION.md — Research / design backlog](docs/IMPLEMENTATION.md#research--design-backlog).
+
+- Consider dropping fixed size-class slots in favor of shaping buffers to
+  `(element size + header) × N` (or similar multiples)
+- Investigate impacts and mitigations when a `Pool` is destroyed while
+  `unique_ptr` / `shared_ptr` (or other clients) still hold live objects from it
+- Consider a C99-compliant wrapper API for callers that want the pool interface
+  from C
+- Abstract the lock primitive so a build can choose `SpinLock` or another
+  standard lock (e.g. `std::mutex`) at compile time
 
 ## References
 
@@ -211,7 +224,7 @@ See LICENSE section in source files for full text.
 
 Production quality and clarity are the same bar. Contributions should:
 - Prefer simple designs that stay correct under concurrency and failure
-- Avoid obscurely complex micro-optimizations, prefering simplicity and clarity
+- Avoid obscurely complex micro-optimizations, preferring simplicity and clarity
 - Always be mindful of performance impact where it is compatible with simplicity and clarity
 - Explain *why* in comments and docs, not just *what*; keep claims aligned with the code
 - Add or update tests for every behavior change
