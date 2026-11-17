@@ -442,21 +442,12 @@ TEST(PoolTest, MakePoolUniqueFromHandle)
 }
 
 
-// shared_ptr always runs ~T before allocator.deallocate. After arena ~Pool,
-// non-trivial ~T would UAF — so this analog uses trivial int and only checks
-// that deallocate no-ops (no abort) when !alive.
-TEST(PoolTest, ArenaDestroySharedPtrDeallocateNoops)
-{
-    std::shared_ptr<int> ptr;
-    {
-        Pool pool;
-        ptr = make_pool_shared<int>(pool, 7);
-        ASSERT_NE(ptr.get(), nullptr);
-        EXPECT_EQ(*ptr, 7);
-        EXPECT_GE(pool.live_allocation_count(), 1u);
-    }
-    ptr.reset(); // ~int trivial; PoolAllocator::deallocate sees !alive → no-op
-}
+// make_pool_shared uses allocate_shared: object + shared_ptr control block
+// (including the embedded PoolAllocator / PoolBlockToken) live in pool slabs.
+// Arena ~Pool frees that storage while the shared_ptr still holds it — any
+// later use, including reset(), is UAF even for trivial T. Arena bulk reclaim
+// is unique_pool_ptr-only; shared_ptr requires orderly teardown (pool last).
+// Covered by OrderlySharedPtrRunsDestructor / MakePoolSharedFromHandle.
 
 
 TEST(PoolTest, OrderlySharedPtrRunsDestructor)

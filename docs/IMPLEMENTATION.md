@@ -544,8 +544,8 @@ readable after `~Pool`, without pinning an empty heap pool the way
 | Path | Teardown order | `~T()` / free |
 |------|----------------|---------------|
 | **Orderly (primary)** | Smart pointers / containers first, then pool | Normal: `~T()` then return slot |
-| **Arena + `unique_pool_ptr`** | Pool first while `unique_ptr` may still exist | `PoolDeleter` sees `!alive` → skip `~T` and free |
-| **Arena + `shared_ptr` / `PoolAllocator`** | Pool first | `shared_ptr` still runs `~T` on the object, then `deallocate` no-ops if `!alive`. Non-trivial `T` after bulk slab free is unsafe — use orderly teardown for typed `shared_ptr` |
+| **Arena + `unique_pool_ptr`** | Pool first while `unique_ptr` may still exist | `PoolDeleter` (token outside the slab) sees `!alive` → skip `~T` and free |
+| **Arena + `make_pool_shared`** | **Unsupported** | Control block (+ embedded `PoolAllocator`) lives in the slab via `allocate_shared`; arena `~Pool` frees it → UAF on any later `shared_ptr` use, even trivial `T`. Use orderly teardown. |
 
 Arena bulk reclaim is the right tool for byte buffers / trivial payloads (or
 when you accept skipped destructors via `unique_pool_ptr`). Do not park durable

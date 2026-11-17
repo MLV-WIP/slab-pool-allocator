@@ -222,7 +222,7 @@ readable after arena `~Pool` so free paths can no-op when `!alive`.
 ### Lifetime models
 
 There are **two primary ways** to use a `Pool`. Pick one deliberately; mixing
-them without care (especially arena + typed `shared_ptr`) is where trouble
+them without care (especially arena + `make_pool_shared`) is where trouble
 starts. A third, optional pattern — `PoolHandle::create()` — is for heap domains
 that should disappear when idle.
 
@@ -287,9 +287,10 @@ void scratch_phase() {
 
 **Rules of thumb for arena**
 
-- Prefer `unique_pool_ptr` / raw `allocate`+`deallocate`, not typed `shared_ptr`,
-  if the pool may die first (`shared_ptr` still invokes `~T` before
-  `deallocate`, which is unsafe once slabs are gone unless `T` is trivial).
+- Use `unique_pool_ptr` / raw `allocate`+`deallocate` only. Do **not** leave
+  `make_pool_shared` / `PoolAllocator`-backed `shared_ptr` outstanding across
+  arena `~Pool`: `allocate_shared` places the control block in the pool, so
+  even trivial `T` UAFs on later `reset()` / destruction.
 - Do not park durable resources (fds, mutexes, owning pointers to
   non-arena memory) only inside arena-allocated objects you might abandon.
 - Warm empty pools that you want to keep: use a stack/`unique_ptr<Pool>` and
@@ -645,8 +646,9 @@ the object (and control block) come from the pool.
 
 Bounded array overloads are deleted. Array size lives in the `shared_ptr`
 control block (unlike `make_pool_unique`, which stores count in `PoolDeleter`).
-After arena `~Pool`, `shared_ptr` still runs `~T` before `deallocate` no-ops —
-prefer orderly teardown for non-trivial `T`.
+Do not leave these pointers outstanding across arena `~Pool`: the control
+block itself is pool storage, so later `reset()` / destruction is UAF even
+for trivial `T`. Use orderly teardown (destroy `shared_ptr` first).
 
 ```cpp
 auto s = spallocator::make_pool_shared<Widget>(pool, arg1);

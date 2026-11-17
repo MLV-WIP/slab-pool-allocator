@@ -368,6 +368,9 @@ namespace spallocator
     // Single object: like std::make_shared, but storage comes from the pool.
     // Benefits vs make_pool_unique: shared ownership, weak_ptr, one allocation
     // for object + shared_ptr control block.
+    // Not arena-safe: control block lives in the pool; outstanding shared_ptr
+    // across ~Pool is UAF (even trivial T). Use orderly teardown, or
+    // unique_pool_ptr for arena bulk reclaim.
     template<typename T, typename... Args>
         requires (!std::is_array_v<T>)
     std::shared_ptr<T> make_pool_shared(PoolBlockToken token, Args&&... args)
