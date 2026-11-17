@@ -4,14 +4,16 @@ A modern C++ implementation of a slab-based memory pool allocator with advanced 
 
 ## Overview
 
-This project demonstrates high-performance memory allocation using the slab allocator pattern, featuring multiple size classes, automatic slab management, and a production-quality spinlock implementation. Designed to be both educational and production-ready, showcasing advanced C++ techniques and memory management concepts.
+A slab-based memory pool intended for production services that need fast, thread-safe fixed-size allocation. The same design choices — clear structure, solid defaults, measurable performance — also make the code a strong base for teaching allocator and concurrency fundamentals.
+
+**Readiness:** The pool, SpinLock, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. `LifetimeObserver` provides race-free atomic liveness checks that are complete for same-thread / single-strand event loops; when callbacks and teardown can race across threads, pair object use with the same mutex/strand that covers destroy (or use `shared_ptr`/`weak_ptr` when you need upgrade-to-own). Known follow-ons (freelist/cursor, richer metrics) are listed under Future Work — they are optimizations, not readiness blockers for typical workloads.
 
 **Directory map:**
 ```
 spallocator/          # header-only library (+ docs/SpinLock_Analysis.md)
 test/                 # Google Test suite (tester.cpp)
 demos/                # example programs
-IMPLEMENTATION.md     # deep design and learning guide
+IMPLEMENTATION.md     # design deep-dive and rationale
 README.md             # this overview + build/run
 ```
 
@@ -20,7 +22,7 @@ README.md             # this overview + build/run
 - **Compound-key size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB
 - **Thread-safe pool** with two-level locking and large-allocation fallback (>1KB)
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>`
-- **LifetimeObserver** with atomic liveness checks for async callbacks (object use still needs sync); **SpinLock** (TTAS → backoff → block)
+- **LifetimeObserver** with atomic liveness checks for async callbacks; **SpinLock** (TTAS → backoff → block)
 - **Modern C++20/23** — templates, atomics, ranges, concepts
 
 Deep design notes live in [IMPLEMENTATION.md](IMPLEMENTATION.md), not here.
@@ -129,7 +131,7 @@ int main() {
 | **SlabProxy** | `spallocator/slab.hpp` | Handles large allocations (>1KB) via standard allocators |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII memory management |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
-| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Intrusive weak liveness tracking; pair `isAlive()` with a mutex/strand for object use |
+| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Intrusive weak liveness tracking; mutex/strand only when use and destroy can race across threads |
 | **SpinLock** | `spallocator/spinlock.hpp` | Production-ready lock with TTAS, backoff, and TSan annotations |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
 
@@ -166,7 +168,7 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 
 ## Documentation
 
-- **[IMPLEMENTATION.md](IMPLEMENTATION.md)** — Detailed implementation guide: memory layout, size-class selection, smart pointers, concurrency, and educational notes. Start here after the Quick Start above.
+- **[IMPLEMENTATION.md](IMPLEMENTATION.md)** — Design deep-dive: memory layout, size-class selection, smart pointers, concurrency, and trade-offs. Start here after the Quick Start above.
 - **[SpinLock Analysis](spallocator/docs/SpinLock_Analysis.md)** — SpinLock correctness and performance analysis
 - **Source Files** — Inline comments explaining design decisions
 
@@ -186,7 +188,7 @@ make && ./obj/addrsan/tester
 - ✅ Smart pointer support: `make_pool_unique` and `make_pool_shared`
 - ✅ Thread-safe Pool with two-level locking strategy
 - ✅ STL allocator interface: `PoolAllocator<T>`
-- ✅ Object lifetime observer (atomic liveness; synchronize object use)
+- ✅ Object lifetime observer (atomic liveness; optional cross-thread sync for object use)
 
 ## Future Work
 
@@ -207,11 +209,13 @@ See LICENSE section in source files for full text.
 
 ## Contributing
 
-This is an educational project. Contributions should:
-- Maintain code clarity over micro-optimizations
-- Add comments explaining "why" not just "what"
-- Include comprehensive test cases
-- Update documentation with insights
+Production quality and clarity are the same bar. Contributions should:
+- Prefer simple designs that stay correct under concurrency and failure
+- Avoid obscurely complex micro-optimizations, prefering simplicity and clarity
+- Always be mindful of performance impact where it is compatible with simplicity and clarity
+- Explain *why* in comments and docs, not just *what*; keep claims aligned with the code
+- Add or update tests for every behavior change
+- Document design, intention, and tradeoffs
 
 ## AI Assistance Declaration
 

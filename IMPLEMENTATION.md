@@ -1,8 +1,8 @@
 # Implementation Guide
 
-This document provides an in-depth analysis of the slab pool allocator implementation, design decisions, and educational insights. For build/test/demo instructions and a project overview, see [README.md](README.md).
+This document is the design deep-dive for the slab pool allocator: architecture, invariants, and the trade-offs behind production choices. For build/test/demo instructions and a project overview, see [README.md](README.md).
 
-**Educational Focus**: This guide teaches advanced C++ techniques, memory management concepts, and concurrent programming patterns through detailed explanations and real-world examples.
+**Audience**: Engineers integrating or extending the allocator in a service, and readers who want a clear walkthrough of allocator and concurrency patterns. Production correctness comes first; the explanations are written so the same code also illustrates the underlying concepts.
 
 ---
 
@@ -56,7 +56,7 @@ Build, test, and demo commands stay in the README so this file can stay focused 
 - [SpinLock Design](#spinlock-design)
 - [Performance Analysis](#performance-analysis)
 - [Advanced Topics](#advanced-topics)
-- [Learning Objectives](#learning-objectives)
+- [Concepts Illustrated](#concepts-illustrated)
 - [Further Reading](#further-reading)
 - [Debugging and Instrumentation](#debugging-and-instrumentation)
 - [Future Enhancements](#future-enhancements)
@@ -86,7 +86,7 @@ class Slab: public AbstractSlab
 - Stores base address mappings in `std::map` for O(log n) deallocation lookup
 - Template parameter `ElemSize` allows compile-time optimization
 
-**Educational Highlights**:
+**Design notes**:
 
 **Why bitsets?** Bitsets provide extremely compact memory tracking (1 bit per slot vs 1 byte for bool arrays). For a 4KB slab with 16-byte elements (256 slots), this means 32 bytes vs 256 bytes - an 87.5% reduction in tracking overhead.
 
@@ -118,7 +118,7 @@ constexpr std::size_t Pool::selectSlab(std::size_t size) const
 - Allocation header stores size for O(1) slab routing during deallocation (no size argument)
 - Non-copyable and non-moveable (proper resource management semantics)
 
-**Educational Highlights**:
+**Design notes**:
 
 **Allocation metadata trick**: A small prefix before the user pointer stores the total footprint and header length, so `deallocate()` needs no size argument. This matches the standard `delete` interface and prevents size-mismatch bugs. See [Memory Layout](#memory-layout).
 
@@ -152,7 +152,7 @@ Handles large allocations by delegating to the system allocator (`::operator new
 | Growth | More 4KB (etc.) slabs | N/A — one system allocation per request |
 | Best for | Hot size classes ≤ 1KB | Occasional large buffers |
 
-**Educational Highlights**:
+**Design notes**:
 
 **When NOT to pool**: Large allocations are infrequent and don't benefit from pre-allocation overhead. The bookkeeping cost of maintaining a pool for large objects often exceeds the allocation cost itself.
 
@@ -184,7 +184,7 @@ class SpinLock {
 - Doubles wait time on each failed acquisition (escalating backoff: `wait_time += wait_time`)
 - Uses memory order acquire/release semantics for proper synchronization
 
-**Educational Highlights**:
+**Design notes**:
 
 **TTAS optimization**: First checks lock state with relaxed ordering (cheaper) before attempting acquisition. This reduces cache line bouncing between cores:
 - Simple test-and-set: Every thread continuously writes to the cache line
@@ -222,7 +222,7 @@ constexpr std::size_t operator""_KB(unsigned long long value) {
 }
 ```
 
-**Educational Highlights**:
+**Design notes**:
 
 **User-defined literals**: Enable `4_KB` instead of `4096` for better readability. This is a powerful C++ feature that allows domain-specific syntax while maintaining type safety.
 
@@ -500,7 +500,7 @@ The map is keyed by slab start addresses. For any **valid** pool pointer:
 | **Linear search** | O(n) | O(n) | Simplest code | Too slow for many slabs |
 | **Binary search on vector** | O(log n) | O(n) | Better cache locality | Insert/delete expensive |
 
-The map approach balances performance with code clarity, making it ideal for an educational implementation.
+The map approach favors clear correctness and flexible slab growth over a custom denser lookup. That is a deliberate production trade-off: O(log n) free stays fine for typical slab counts; a hash or denser table is a follow-on if profiling shows lookup cost dominating.
 
 ---
 
@@ -571,7 +571,7 @@ struct PoolDeleter<T[]> {
 };
 ```
 
-**Educational Highlights**:
+**Design notes**:
 
 **Why reverse order?** This mirrors how stack-allocated arrays work. If objects depend on each other, reverse destruction order prevents use-after-destruction bugs:
 
@@ -645,7 +645,7 @@ constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, Args&&...
 }
 ```
 
-**Educational Highlights**:
+**Design notes**:
 
 **Concepts constraint**: `requires (!std::is_array_v<T>)` ensures this overload only applies to non-array types. This is cleaner than SFINAE and produces better error messages.
 
@@ -695,7 +695,7 @@ constexpr unique_pool_ptr<T> make_pool_unique(spallocator::Pool& pool, std::size
 }
 ```
 
-**Educational Highlights**:
+**Design notes**:
 
 **Type extraction**: `std::remove_extent_t<T>` extracts element type from array type:
 - Input: `int[]` → Output: `int`
@@ -840,23 +840,23 @@ auto arr2 = make_pool_shared<int[]>(pool, 100, 42);   // Value init
 
 Unlike `make_pool_unique` (which stores the element count in `PoolDeleter`), `shared_ptr` tracks array size internally in the control block.
 
-### Learning Value
+### Concepts illustrated
 
-This implementation teaches:
+The smart-pointer and allocator layer surfaces:
 
-1. **Custom deleters**: How to extend standard library smart pointers (`unique_ptr`)
+1. **Custom deleters**: Extending `unique_ptr` for pool-backed storage
 2. **Standard allocators**: C++ allocator requirements for `shared_ptr` integration
-3. **Template specialization**: Providing different behavior for related types (arrays vs single objects)
-4. **Concepts and constraints**: Modern C++ type restrictions with clear errors
+3. **Template specialization**: Different behavior for arrays vs single objects
+4. **Concepts and constraints**: Type restrictions with clear errors
 5. **Perfect forwarding**: Preserving value categories through forwarding references
 6. **Placement new/explicit destructors**: Manual object lifetime management
 7. **C++20 ranges**: Composable, lazy view transformations (reverse iteration)
-8. **RAII principles**: Automatic resource management through scope
-9. **Type traits**: Compile-time type introspection and manipulation
-10. **Memory alignment**: Hardware requirements for safe memory access
-11. **Stateful allocators**: `PoolAllocator` stores reference to pool, demonstrating stateful design
-12. **Allocator rebind**: Supporting container node allocations (e.g., `std::map` nodes)
-13. **Exception safety**: Resource leak prevention during unwinding
+8. **RAII**: Automatic resource management through scope
+9. **Type traits**: Compile-time type introspection
+10. **Memory alignment**: Hardware requirements for safe access
+11. **Stateful allocators**: `PoolAllocator` holds a `Pool&`
+12. **Allocator rebind**: Container node allocations (e.g., `std::map` nodes)
+13. **Exception safety**: No leaked pool blocks when construction throws
 
 ---
 
@@ -910,7 +910,7 @@ This creates a use-after-free vulnerability: the callback invokes a method on a 
 | Check `isAlive()` then use the object on another thread with no lock / ownership handoff | **No** — classic TOCTOU; atomics do not fix this |
 | Prefer `shared_ptr` / `weak_ptr` when you need lock-style upgrade to a strong ref | Often yes — `weak_ptr::lock()` is the closer production pattern for “use if still alive” |
 
-Liveness is race-free; **object access** after a true `isAlive()` still needs an external protocol (mutex, strand, or upgrade to shared ownership). See [pitfalls](#common-pitfalls).
+Liveness is race-free and sufficient on a single thread or event strand where callback and destroy cannot overlap. When use and destroy can race across threads, serialize them with a mutex/strand (or upgrade to shared ownership). See [pitfalls](#common-pitfalls).
 
 ### Design Architecture
 
@@ -990,7 +990,7 @@ struct ControlBlock {
 LifetimeObserver observer = obj.getObserver();
 ```
 
-**Educational Highlights**:
+**Design notes**:
 
 **Why separate method?** Creates a new `LifetimeObserver` with weak reference semantics:
 ```cpp
@@ -1071,7 +1071,7 @@ LifetimeObserver(LifetimeObserver&& other) noexcept
 }
 ```
 
-**Educational highlights**:
+**Design notes**:
 
 **Why new control block?** Moved-from object must still be valid:
 - Old `control_block` transfers to new object
@@ -1140,25 +1140,25 @@ LifetimeObserver& operator=(const LifetimeObserver& other) {
 | Feature | `shared_ptr` / `weak_ptr` | `enable_shared_from_this` | `LifetimeObserver` |
 |---------|---------------------------|---------------------------|------------------|
 | **Purpose** | Shared ownership | Intrusive weak-from-`this` | Lightweight liveness tracking |
-| **Thread safety** | Atomic refcounts | Same as `shared_ptr` | Atomic refcounts; object use after `isAlive` still needs sync |
+| **Thread safety** | Atomic refcounts | Same as `shared_ptr` | Atomic refcounts; cross-thread use/destroy needs the same sync any shared object would |
 | **Weak view** | `weak_ptr(shared)` | `weak_from_this()` | `getObserver()` |
 | **Requires** | External `shared_ptr` | Object already owned by `shared_ptr` | Derive from `LifetimeObserver` |
-| **Use case** | Production sharing | Callbacks needing weak `this` with `shared_ptr` | Teaching async checks without full sharing |
+| **Use case** | Shared ownership | Callbacks needing weak `this` with `shared_ptr` | Intrusive weak liveness without full shared ownership |
 
 `enable_shared_from_this` is the closer cousin: both are intrusive “object exposes a weak self.” Prefer it (or plain `weak_ptr`) when you already use `shared_ptr` and need `lock()`-style upgrade; use `LifetimeObserver` for an intrusive owner/observer split without full shared ownership.
 
-### Learning Value
+### Concepts illustrated
 
-This implementation teaches:
+`LifetimeObserver` surfaces:
 
-1. **Observer Pattern**: Loose coupling between object and lifetime observers
-2. **Mediator Pattern**: Control block mediates strong/weak reference operations
-3. **Reference Counting**: Manual lifetime management without garbage collection
-4. **Move Semantics**: Efficient ownership transfer and moved-from object validity
-5. **Copy Assignment**: Exception-safe assignment with reference swapping
+1. **Observer pattern**: Loose coupling between object and lifetime observers
+2. **Mediator pattern**: Control block mediates strong/weak reference operations
+3. **Reference counting**: Manual lifetime management without garbage collection
+4. **Move semantics**: Ownership transfer and valid moved-from state
+5. **Copy assignment**: Exception-safe assignment with reference swapping
 6. **RAII**: Automatic cleanup through scope (destructor calls release)
-7. **Async Safety**: Liveness checks plus an external sync protocol (mutex/strand)
-8. **Control Flow**: Checking preconditions before accessing objects; liveness ≠ ownership
+7. **Async safety**: Atomic liveness for callbacks; mutex/strand when use and destroy can race
+8. **Preconditions**: Liveness ≠ ownership; cross-thread check-then-use needs a shared protocol
 
 ### Common Pitfalls
 
@@ -1325,7 +1325,7 @@ Uses `std::scoped_lock` (C++17) for exception-safe lock management:
 - Automatically released in destructor (even during exceptions)
 - Works seamlessly with our `SpinLock` (BasicLockable concept)
 
-**Educational value**: Demonstrates proper RAII patterns for resource management and why manual lock/unlock is error-prone.
+Prefer `scoped_lock` / `unique_lock` over manual `lock()`/`unlock()` so exceptions cannot leave the SpinLock held.
 
 ### Smart Pointer Thread Safety
 
@@ -1536,13 +1536,13 @@ The claim requires careful explanation:
 
 **Worst case**: Must scan all slots in a slab to find a free one → O(slots_per_slab). The implementation scans **from bit 0 upward** with no freelist cursor, so a single free bit at the end of a busy slab costs a full scan of that slab’s bitset.
 
-**Real-world behavior**: The availability map provides coarse filtering, so we only scan slabs that are known to have free slots. Bitset ops are cheap on modern CPUs, so the educational “scan from zero” choice stays practical for 4KB slabs.
+**Real-world behavior**: The availability map provides coarse filtering, so we only scan slabs that are known to have free slots. Bitset ops are cheap on modern CPUs; for 4KB slabs, scan-from-zero is a solid default until profiling says otherwise.
 
 **Scan-from-zero vs free list** (see also Future Enhancements):
-- **Bitset scan** — compact metadata, simple correctness, worse-case linear in slots per slab
-- **Free list / bump cursor** — O(1) alloc when a free slot is known, extra storage and more complex free/coalesce logic
+- **Bitset scan** — compact metadata, simple correctness, worst-case linear in slots per slab
+- **Free list / bump cursor** — O(1) alloc when a free slot is known; extra storage and more complex free/coalesce logic
 
-This project favors bitsets for clarity; a freelist would be the usual next optimization if profiling showed scan cost dominating.
+Bitsets are the production default here (compact, easy to validate). A freelist or next-fit cursor is the usual next step if hot-path scan cost shows up in profiles.
 
 **Why it works in practice:**
 1. Temporal locality: Allocations and deallocations tend to cluster
@@ -1639,9 +1639,9 @@ While Jeff Bonwick introduced the slab allocator concept for the Solaris kernel 
 
 ---
 
-## Learning Objectives
+## Concepts Illustrated
 
-This codebase teaches several important concepts across multiple domains:
+Clear production code also surfaces these concepts across several domains:
 
 ### 1. Template Metaprogramming
 
@@ -1780,7 +1780,7 @@ make BUILD_TYPE=threadsan test        # data races / lock misuse
 
 **What's logged** (when verbose debug is on): slab create/destroy, alloc/free addresses, bitset snapshots, slab selection, unknown-pointer misses in `findSlabForItem`.
 
-**Educational value:** Instrument low-level code with `if constexpr` gates so release builds pay zero cost for debug paths.
+Verbose paths are gated with `if constexpr` so release builds pay zero cost for debug logging.
 
 ---
 
@@ -1794,7 +1794,6 @@ make BUILD_TYPE=threadsan test        # data races / lock misuse
 - ✅ `std::shared_ptr` support via `make_pool_shared` (COMPLETED)
 - ✅ `PoolAllocator<T>` for STL integration (COMPLETED)
 - ✅ Object lifetime observer for async callbacks (COMPLETED)
-- Educational value: Integrating custom allocators with STL, safe async patterns
 
 **Thread-Safe Pool**
 - ✅ SpinLock integration with Pool for concurrent allocations (COMPLETED)
@@ -1802,46 +1801,38 @@ make BUILD_TYPE=threadsan test        # data races / lock misuse
 - ✅ Parallel allocations from different size classes (COMPLETED)
 - ✅ Zero-deadlock design through lock ordering (COMPLETED)
 - Lock-free allocation paths for common cases (future)
-- Educational value: Concurrent data structure design, lock granularity trade-offs, and deadlock prevention
 
 **Statistics and Profiling**
 - Allocation count, peak usage, fragmentation ratio
 - Per-size-class metrics
 - Real-time monitoring capabilities
-- Educational value: Performance analysis techniques
 
 **Memory Alignment**
 - ✅ Power-of-two alignments 4…64 via `allocate(size, alignment)` (COMPLETED; see [Memory Layout](#memory-layout))
 - ✅ Compound-key `Slab<ElemSize, Alignment>` ladders (16 eager; 32/64 lazy); `SlabProxy` always 64-align
-- Educational value: Hardware-aware programming
 
 **STL Allocator Interface**
 - ✅ C++ standard library allocator compatibility via `PoolAllocator<T>` (COMPLETED)
 - ✅ Use with `std::vector`, `std::list`, `std::map`, etc. (COMPLETED)
 - ✅ Proper rebind support for container node allocations (COMPLETED)
-- Educational value: Allocator requirements, concepts, and stateful allocator design
 
 ### Optimization Opportunities
 
 **Custom Bitset Implementation**
 - 64-bit atomic operations for lock-free slot allocation
 - SIMD-based scanning for free slots
-- Learning: Atomics, vectorization, lock-free programming
 
-**Free Lists as Alternative**
-- Compare performance vs. bitsets
-- Trade-offs: O(1) guaranteed vs. memory overhead
-- Learning: Different allocation tracking strategies
+**Free Lists / Next-Fit Cursor**
+- O(1) alloc when a free slot is known vs compact bitset metadata
+- Candidate when hot-path scan cost shows up in profiles
 
 **Thread-Local Caching**
 - Small per-thread cache of pre-allocated objects
 - Reduces contention on shared data structures
-- Learning: Thread-local storage, cache locality
 
 **NUMA Awareness**
 - Allocate from local memory node when possible
 - Platform-specific optimizations
-- Learning: Hardware architecture impact on software design
 
 ---
 
@@ -1966,14 +1957,13 @@ make test
 ./obj/addrsan/demo_lifetime_observer
 ```
 
-### Educational Value
+### What the demos show
 
-These demo programs teach:
-- **Integration**: How components work together
-- **Patterns**: Real-world usage patterns and idioms
-- **Safety**: Correct usage of smart pointers and lifetime tracking
-- **Performance**: When and how to use each feature
-- **Debugging**: Output traces showing internal behavior
+- **Integration**: How pool, smart pointers, and observers work together
+- **Patterns**: Service-oriented usage idioms
+- **Safety**: Correct smart-pointer and lifetime protocols (single-strand and cross-thread)
+- **Performance**: When each feature fits a workload
+- **Debugging**: Verbose traces of internal behavior when enabled
 
 ---
 
