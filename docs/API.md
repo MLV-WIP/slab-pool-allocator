@@ -18,11 +18,14 @@ Unless noted, types are in namespace `spallocator`. `SpinLock` and
 - [Pool](#pool)
   - [Constants](#constants)
   - [Construction](#construction)
+  - [`PoolHandle`](#poolhandle)
+  - [`PoolBlockToken`](#poolblocktoken)
   - [`allocate`](#allocate)
   - [`deallocate` / `try_deallocate`](#deallocate--try_deallocate)
   - [`trim`](#trim)
   - [`getAllocatedMemory`](#getallocatedmemory)
   - [`selectSlab`](#selectslab)
+  - [Lifetime models](#lifetime-models)
 - [Slab & SlabProxy](#slab--slabproxy)
   - [`AbstractSlab`](#abstractslab)
   - [`Slab`](#slab)
@@ -47,7 +50,7 @@ Unless noted, types are in namespace `spallocator`. `SpinLock` and
 
 | Header | Primary contents |
 |--------|------------------|
-| `spallocator/pool.hpp` | `Pool`, alignment constants, size-class ladders |
+| `spallocator/pool.hpp` | `Pool`, `PoolHandle`, `PoolBlockToken`, `PoolControlBlock`, ladders |
 | `spallocator/slab.hpp` | `AbstractSlab`, `Slab`, `SlabProxy`, `DynBitset` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
 | `spallocator/lifetimeobserver.hpp` | `LifetimeObserver` |
@@ -61,7 +64,7 @@ Unless noted, types are in namespace `spallocator`. `SpinLock` and
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                    ▼
      Slab<…> (fixed-size slots)          SlabProxy (large new[])
-  Smart pointers / PoolAllocator ──► clients of Pool&
+  Smart pointers / PoolAllocator ──► PoolBlockToken / PoolHandle
   LifetimeObserver                 (stand-alone utility)
 ```
 
@@ -103,7 +106,11 @@ writes a small hidden header, and returns a pointer to the user payload.
   the same pointer twice, or write into the hidden bytes *before* the user
   pointer.
 - The pool is non-copyable and non-movable (it owns slab registries and locks).
-- Destroying the pool destroys its slabs; do not use pointers from it afterward.
+- Prefer **orderly** teardown: destroy smart pointers / containers first, then
+  the pool (normal `~T()` + return slots). **Arena** teardown (destroy pool
+  first) is supported for bulk reclaim — `unique_pool_ptr` deleters no-op when
+  the pool is already dead; typed `shared_ptr` still runs `~T` (prefer orderly
+  for non-trivial `T`). See [Lifetime models](#lifetime-models).
 
 Routing uses **footprint** `size + header_size` where
 `header_size = max(8, alignment)`, not the bare user size. Layout details:
@@ -143,18 +150,172 @@ Helpers you may see in headers (usually not called directly from apps):
 
 ```cpp
 Pool();
-~Pool() = default;
+~Pool();
+PoolHandle handle();
+PoolBlockToken block_token();
+std::uint64_t live_allocation_count() const noexcept;
+PoolControlBlock* control() const noexcept;  // diagnostics
 ```
 
 | | |
 |--|--|
-| **Effects** | Constructs an empty pool: axis-16 slabs are prepared; axis 32/64 slabs are created lazily on first use. |
+| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); axis-16 slabs prepared; axis 32/64 lazy. |
+| **`~Pool`** | Marks the control block dead, then destroys slabs. Safe with outstanding `PoolBlockToken`s (arena observers). |
 | **Thread safety** | Construct/destroy from one thread; do not use the pool concurrently with its destructor. |
 | **Copy / move** | Deleted. |
 
 ```cpp
 spallocator::Pool pool;  // ready to allocate
+auto h = pool.handle();  // optional handle pin (does not make stack pool heap-owned)
 ```
+
+### `PoolHandle`
+
+```cpp
+class PoolHandle {
+public:
+    PoolHandle() noexcept;
+    PoolHandle(const PoolHandle&) noexcept;
+    PoolHandle(PoolHandle&&) noexcept;
+    static PoolHandle create();
+    Pool* get() const noexcept;
+    explicit operator bool() const noexcept;
+    PoolControlBlock* control() const noexcept;
+    PoolBlockToken block_token() const noexcept;
+};
+```
+
+| | |
+|--|--|
+| **`create()`** | `new Pool` + mark **heap-owned**; returns a handle (`handle_refs ≥ 1`). When `handle_refs == 0` and `live_allocs == 0`, the runtime may `delete` that pool. |
+| **`pool.handle()`** | Shares the existing control block; does **not** set heap-owned (stack / caller-owned pools stay caller-destroyed). |
+| **`get()`** | Live `Pool*`, or `nullptr` if empty / pool already dead. |
+
+```cpp
+auto h = spallocator::PoolHandle::create();
+std::byte* p = h.get()->allocate(64);
+h.get()->deallocate(p);
+// drop last handle with no live allocs → heap Pool retired
+```
+
+### `PoolBlockToken`
+
+```cpp
+class PoolBlockToken {
+public:
+    Pool* get() const noexcept;
+    bool alive() const noexcept;
+    explicit operator bool() const noexcept;
+    PoolControlBlock* control() const noexcept;
+};
+```
+
+Deleter/allocator pin: bumps **`block_refs` only** (not `handle_refs`). Obtained
+via `pool.block_token()` or `handle.block_token()`. Keeps the control block
+readable after arena `~Pool` so free paths can no-op when `!alive`.
+
+### Lifetime models
+
+There are **two primary ways** to use a `Pool`. Pick one deliberately; mixing
+them without care (especially arena + typed `shared_ptr`) is where trouble
+starts. A third, optional pattern — `PoolHandle::create()` — is for heap domains
+that should disappear when idle.
+
+| Model | Teardown order | When to use |
+|-------|----------------|-------------|
+| **Orderly (primary)** | Free / destroy smart pointers **first**, then destroy the pool | Default for service objects, STL containers, anything with a non-trivial destructor or owned resources |
+| **Arena bulk** | Destroy the **pool first**; leftover `unique_pool_ptr`s no-op | Request/job scratch: many allocations, one fast reclaim; trivial or “don’t care about `~T()`” payloads |
+| **Heap handle** (optional) | `PoolHandle::create()`; pool auto-`delete`s when handles and live allocs are both zero | Long-lived shared domain without a stack `Pool`; pass handles into workers |
+
+Design depth: [IMPLEMENTATION.md — Pool lifetime](IMPLEMENTATION.md#pool-lifetime-controlblock--poolhandle).
+
+#### Orderly mode (recommended default)
+
+The pool **outlives** everything allocated from it. Destructors run, slots
+return to freemaps, then `~Pool` tears down slabs. This is ordinary RAII —
+same mental model as “`unique_ptr` before the allocator goes away.”
+
+```cpp
+void handle_request() {
+    spallocator::Pool pool;
+
+    auto widget = spallocator::make_pool_unique<Widget>(pool, /* args */);
+    auto buf = spallocator::make_pool_shared<std::byte[]>(pool, 4096);
+
+    spallocator::PoolAllocator<int> alloc(pool);
+    std::vector<int, spallocator::PoolAllocator<int>> nums(alloc);
+    nums.push_back(42);
+
+    use(widget.get(), buf.get(), nums);
+    // widget / buf / nums destroy here → ~T() + return slots
+}   // ~pool last → slabs freed; nothing left outstanding
+```
+
+Use orderly mode whenever `Widget` (or container elements) must run real
+destructors — file handles, locks, nested owning pointers, etc.
+
+#### Arena mode (bulk reclaim)
+
+Destroy the pool while some `unique_pool_ptr`s may still exist. `~Pool` marks
+the control block dead and frees slab storage in one shot. When those
+`unique_ptr`s later run their deleters, they see `!alive` and **no-op**: no
+`~T()`, no `try_deallocate`. That is intentional for APR-style “throw away the
+region” speed — and it means **destructors do not run** for those objects.
+
+```cpp
+void scratch_phase() {
+    std::optional<spallocator::unique_pool_ptr<ScratchNode>> leak_into_outer;
+    {
+        spallocator::Pool arena;
+
+        auto a = spallocator::make_pool_unique<ScratchNode>(arena);
+        auto b = spallocator::make_pool_unique<ScratchNode>(arena);
+        // … build a large graph in `arena` …
+
+        leak_into_outer = std::move(a);  // still holds a PoolBlockToken
+        // b destroyed here while arena is alive → normal ~ScratchNode + free
+    }   // ~arena: mark dead, free all slabs (including storage for *leak_into_outer)
+
+    leak_into_outer.reset();  // deleter: !alive → skip ~ScratchNode and free
+}
+```
+
+**Rules of thumb for arena**
+
+- Prefer `unique_pool_ptr` / raw `allocate`+`deallocate`, not typed `shared_ptr`,
+  if the pool may die first (`shared_ptr` still invokes `~T` before
+  `deallocate`, which is unsafe once slabs are gone unless `T` is trivial).
+- Do not park durable resources (fds, mutexes, owning pointers to
+  non-arena memory) only inside arena-allocated objects you might abandon.
+- Warm empty pools that you want to keep: use a stack/`unique_ptr<Pool>` and
+  orderly frees — arena is “dispose the whole domain,” not “trim RSS.”
+
+#### Heap handle domain (optional)
+
+When there is no natural stack owner, `PoolHandle::create()` heap-allocates a
+pool, marks it **heap-owned**, and retires it automatically when the last handle
+is dropped **and** `live_allocation_count() == 0`.
+
+```cpp
+spallocator::PoolHandle make_shard() {
+    return spallocator::PoolHandle::create();
+}
+
+void worker(spallocator::PoolHandle h) {
+    auto p = spallocator::make_pool_unique<JobState>(h);
+    run(*p);
+    p.reset();  // live_allocs → 0; pool stays while `h` (or copies) exist
+}
+
+void run_shard() {
+    auto h = make_shard();
+    worker(h);           // copy bumps handle_refs
+    // drop h → handle_refs 0, live_allocs 0 → delete heap Pool
+}
+```
+
+`pool.handle()` on a stack pool also returns a `PoolHandle`, but does **not**
+set heap-owned: dropping those handles never `delete`s the stack object.
 
 ### `allocate`
 
@@ -379,13 +540,13 @@ using unique_pool_ptr = std::unique_ptr<T, PoolDeleter<T>>;
 
 template<typename T>
 struct PoolDeleter {
-    Pool& pool;
-    void operator()(T* p) const noexcept;   // ~T() then try_deallocate
+    PoolBlockToken token;
+    void operator()(T* p) const noexcept;   // if alive: ~T() then try_deallocate
 };
 
 template<typename T>
 struct PoolDeleter<T[]> {
-    Pool& pool;
+    PoolBlockToken token;
     const std::size_t size;                 // element count
     void operator()(T* p) const noexcept;   // reverse-order dtors, then free
 };
@@ -393,9 +554,9 @@ struct PoolDeleter<T[]> {
 
 | Piece | Description |
 |-------|-------------|
-| `pool` | Pool that owns the block; must outlive the smart pointer. |
+| `token` | `PoolBlockToken` for the domain (from `Pool&` / `PoolHandle` / token ctors). |
 | `size` (array) | Number of elements to destroy; stored in the deleter when the array was created. |
-| `operator()` | If `p` is non-null: run destructor(s), then `try_deallocate`. On free failure, **`std::abort()`** (must not throw through `noexcept`). |
+| `operator()` | If `p` is null or `!token.alive()`: no-op (arena). Else: destructor(s), then `try_deallocate`. On free failure while alive, **`std::abort()`**. |
 
 Array destruction order matches stack arrays (last constructed → first
 destroyed).
@@ -405,11 +566,13 @@ destroyed).
 ```cpp
 template<typename T, typename... Args>
     requires (!std::is_array_v<T>)
-unique_pool_ptr<T> make_pool_unique(Pool& pool, Args&&... args);
+unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, Args&&... args);
+// also: Pool&, PoolHandle const&
 
 template<typename T>  // T = U[]
     requires std::is_unbounded_array_v<T>
-unique_pool_ptr<T> make_pool_unique(Pool& pool, std::size_t size);
+unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, std::size_t size);
+// also: Pool&, PoolHandle const&
 
 // Bounded array forms are deleted — use std::array or U[].
 ```
@@ -418,7 +581,7 @@ unique_pool_ptr<T> make_pool_unique(Pool& pool, std::size_t size);
 
 | Parameter | Description |
 |-----------|-------------|
-| `pool` | Pool used for the underlying `allocate` / free. |
+| `token` / `pool` / `handle` | Live domain used for `allocate` / free. |
 | `args...` | Forwarded to `T`’s constructor via placement new. |
 
 | | |
@@ -431,7 +594,7 @@ unique_pool_ptr<T> make_pool_unique(Pool& pool, std::size_t size);
 
 | Parameter | Description |
 |-----------|-------------|
-| `pool` | Pool for the block. |
+| `token` / `pool` / `handle` | Live domain for the block. |
 | `size` | Number of default-constructed `U` elements. |
 
 | | |
@@ -442,6 +605,8 @@ unique_pool_ptr<T> make_pool_unique(Pool& pool, std::size_t size);
 ```cpp
 auto u = spallocator::make_pool_unique<Widget>(pool, arg1, arg2);
 auto a = spallocator::make_pool_unique<int[]>(pool, 100);
+auto h = spallocator::PoolHandle::create();
+auto u2 = spallocator::make_pool_unique<Widget>(h, arg1);
 ```
 
 ### `make_pool_shared`
@@ -449,16 +614,19 @@ auto a = spallocator::make_pool_unique<int[]>(pool, 100);
 ```cpp
 template<typename T, typename... Args>
     requires (!std::is_array_v<T>)
-std::shared_ptr<T> make_pool_shared(Pool& pool, Args&&... args);
+std::shared_ptr<T> make_pool_shared(PoolBlockToken token, Args&&... args);
+// also: Pool&, PoolHandle const&
 
 template<typename T>
     requires std::is_unbounded_array_v<T>
-std::shared_ptr<T> make_pool_shared(Pool& pool, std::size_t size);
+std::shared_ptr<T> make_pool_shared(PoolBlockToken token, std::size_t size);
+// also: Pool&, PoolHandle const&
 
 template<typename T>
     requires std::is_unbounded_array_v<T>
-std::shared_ptr<T> make_pool_shared(Pool& pool, std::size_t size,
+std::shared_ptr<T> make_pool_shared(PoolBlockToken token, std::size_t size,
                                     const std::remove_extent_t<T>& init_value);
+// also: Pool&, PoolHandle const&
 ```
 
 Builds a `std::shared_ptr` via `std::allocate_shared` and `PoolAllocator`, so
@@ -466,12 +634,14 @@ the object (and control block) come from the pool.
 
 | Overload | Parameters | Behavior |
 |----------|------------|----------|
-| Single object | `pool`, ctor `args...` | `allocate_shared<T>(PoolAllocator<T>{pool}, args...)` |
-| Array | `pool`, `size` | `size` default-initialized elements |
-| Array + value | `pool`, `size`, `init_value` | `size` elements copy-initialized from `init_value` |
+| Single object | domain, ctor `args...` | `allocate_shared<T>(PoolAllocator<T>{…}, args...)` |
+| Array | domain, `size` | `size` default-initialized elements |
+| Array + value | domain, `size`, `init_value` | `size` elements copy-initialized from `init_value` |
 
 Bounded array overloads are deleted. Array size lives in the `shared_ptr`
 control block (unlike `make_pool_unique`, which stores count in `PoolDeleter`).
+After arena `~Pool`, `shared_ptr` still runs `~T` before `deallocate` no-ops —
+prefer orderly teardown for non-trivial `T`.
 
 ```cpp
 auto s = spallocator::make_pool_shared<Widget>(pool, arg1);
@@ -486,8 +656,9 @@ std::weak_ptr<Widget> w = s;
 
 **Header:** `spallocator/spallocator.hpp`
 
-Standard-library-style allocator that obtains storage from a `Pool`. Enables
-`std::vector`, `std::allocate_shared`, and other allocator-aware facilities.
+Standard-library-style allocator that obtains storage from a pool domain.
+Enables `std::vector`, `std::allocate_shared`, and other allocator-aware
+facilities.
 
 ```cpp
 template<typename T>
@@ -496,7 +667,9 @@ public:
     using value_type = T;
     // POCCA / POCMA / POCS = false_type; is_always_equal = false_type
 
+    explicit PoolAllocator(PoolBlockToken token) noexcept;
     explicit PoolAllocator(Pool& pool) noexcept;
+    explicit PoolAllocator(PoolHandle const& handle) noexcept;
     PoolAllocator(const PoolAllocator&) noexcept = default;
     template<typename U>
     PoolAllocator(const PoolAllocator<U>& other) noexcept;  // rebind
@@ -508,14 +681,14 @@ public:
 
 | Member / parameter | Description |
 |--------------------|-------------|
-| Constructor `pool` | Reference to the pool; **not owned**. The pool must outlive this allocator and every container/object still using it. |
-| Rebind ctor | Shares the same `Pool&` when containers rebind to node types. |
-| `allocate(n)` | Allocates space for `n` objects of type `T` (`n * sizeof(T)` bytes at `alignof(T)`). Throws `std::bad_array_new_length` on overflow; otherwise same failures as `Pool::allocate`. |
-| `deallocate(p, n)` | Returns storage for `p`. `n` is ignored (pool headers carry footprint). `noexcept`; bad pointers **abort** via `try_deallocate`. |
-| Equality | `operator==` is true only when both allocators refer to the **same** `Pool` instance. |
+| Constructor | Takes `PoolBlockToken`, `Pool&`, or `PoolHandle` (token = `block_refs` pin). |
+| Rebind ctor | Shares the same control block when containers rebind to node types. |
+| `allocate(n)` | Space for `n` × `T` at `alignof(T)`. Throws `bad_array_new_length` on overflow; **`bad_alloc`** if the pool is already dead; otherwise same as `Pool::allocate`. |
+| `deallocate(p, n)` | Returns storage for `p`. `n` ignored. `noexcept`; bad pointers **abort** while alive; **no-op** if `!alive` (arena). |
+| Equality | True iff both allocators share the same `PoolControlBlock*`. |
 
-Propagation traits are false because the pool is external and must not silently
-move to another container’s allocator state.
+Propagation traits are false because the domain is external and must not
+silently move to another container’s allocator state.
 
 ```cpp
 spallocator::Pool pool;
@@ -758,7 +931,8 @@ void runtime_assert(bool condition, const std::string& message,
 | `Pool::deallocate` | throws | Same |
 | `Pool::try_deallocate` | `false` | Same |
 | `Pool::trim` / `getAllocatedMemory` | — | Safe |
-| `PoolDeleter` / `PoolAllocator::deallocate` | `abort` on bad pointer | Pool operations are safe; pointer handoff is the caller’s protocol |
+| `PoolDeleter` / `PoolAllocator::deallocate` | `abort` on bad pointer if alive; no-op if dead | Pool-safe; pointer handoff is the caller’s protocol |
+| `PoolHandle::create` / handle drop | may `delete` heap pool when idle | Destroy/create from one thread |
 | `make_pool_unique` construction | throw; slot returned | Pool-safe |
 | `LifetimeObserver::isAlive` | — | Race-free liveness bit |
 | Object members after `isAlive` | — | Complete on one strand; cross-thread needs shared sync with destroy |

@@ -6,7 +6,7 @@ A C++ memory **pool** backed by **slab** size-class storage — for production s
 
 A memory **pool** (disposable / isolatable allocation domain) backed by **slabs** (fixed-size slot recyclers). Pool and slab are separate ideas — the pool owns lifetime and routing; slabs implement size-class storage.
 
-**Readiness:** The pool, SpinLock, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. `LifetimeObserver` provides race-free atomic liveness checks that are complete for same-thread / single-strand event loops; when callbacks and teardown can race across threads, pair object use with the same mutex/strand that covers destroy (or use `shared_ptr`/`weak_ptr` when you need upgrade-to-own). Known follow-ons (freelist/cursor, richer metrics) are listed under Future Work — they are optimizations, not readiness blockers for typical workloads.
+**Readiness:** The pool, SpinLock, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. Pool lifetime vs clients is defined: orderly RAII (pointers first), optional arena bulk reclaim (`unique_pool_ptr` no-ops when the pool is already dead), and `PoolHandle::create()` for heap domains that retire when idle. `LifetimeObserver` provides race-free atomic liveness checks that are complete for same-thread / single-strand event loops; when callbacks and teardown can race across threads, pair object use with the same mutex/strand that covers destroy (or use `shared_ptr`/`weak_ptr` when you need upgrade-to-own). Known follow-ons (metrics, freelist) are listed under Future Work.
 
 **Directory map:**
 ```
@@ -20,10 +20,11 @@ README.md             # this overview + build/run
 
 ## Key Features
 
-- **Pool as allocation domain** — construct, share a `Pool&`, destroy to dispose; shard pools to isolate or reduce contention
+- **Pool as allocation domain** — construct, share `Pool&` / `PoolHandle`, destroy to dispose; shard pools to isolate or reduce contention
 - **Slab size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB; large fallback via `SlabProxy`
 - **Thread-safe routing** — pool + per-slab locking
-- **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>`
+- **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolBlockToken`)
+- **Defined pool lifetime** — orderly RAII, arena bulk reclaim, or `PoolHandle::create()` auto-retire
 - **LifetimeObserver** with atomic liveness checks for async callbacks; **SpinLock** (TTAS → backoff → block)
 - **Modern C++20/23** — templates, atomics, ranges, concepts
 
@@ -131,8 +132,9 @@ int main() {
 | **Pool** | `spallocator/pool.hpp` | Allocation domain: route by footprint/alignment, header protocol, `trim`, dispose as a unit |
 | **Slab** | `spallocator/slab.hpp` | Fixed-size slot recycler for one size class (bitmaps, growth, reclaim) |
 | **SlabProxy** | `spallocator/slab.hpp` | Large / overflow path via system `new[]` / `delete[]` |
-| **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a `Pool&` |
+| **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a pool domain |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
+| **PoolHandle** | `spallocator/pool.hpp` | Heap domain handle; `create()` retires when idle |
 | **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Intrusive weak liveness; extra sync only when use and destroy can race across threads |
 | **SpinLock** | `spallocator/spinlock.hpp` | Short-section lock with TTAS, backoff, and TSan annotations |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
@@ -201,10 +203,8 @@ Recorded for later (not scheduled). See also
 
 - Consider dropping fixed size-class slots in favor of shaping buffers to
   `(element size + header) × N` (or similar multiples)
-- Investigate impacts and mitigations when a `Pool` is destroyed while
-  `unique_ptr` / `shared_ptr` (or other clients) still hold live objects from it
 - Consider a C99-compliant wrapper API for callers that want the pool interface
-  from C
+  from C (opaque handle ≈ `PoolHandle`)
 - Abstract the lock primitive so a build can choose `SpinLock` or another
   standard lock (e.g. `std::mutex`) at compile time
 

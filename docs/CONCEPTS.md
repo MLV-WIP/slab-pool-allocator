@@ -76,7 +76,10 @@ unit of work runs; destroy the pool and reclaim everything without chasing each
 pointer. Apache’s APR pools popularized this model for decades: pools nested by
 lifetime, cleared or destroyed when the request or process phase ended. The win
 is operational — bulk reclaim and fewer leaked “forgot to free” paths — not
-necessarily faster individual `malloc`s.
+necessarily faster individual `malloc`s. In this library that is the **arena**
+path: `~Pool` frees slabs while `unique_pool_ptr` deleters no-op (and skip
+`~T()`). Prefer **orderly** teardown (destroy smart pointers first) whenever
+objects need real destructors.
 
 **Isolation.**  
 Separate pools keep one subsystem’s memory (and failures) from silently sharing
@@ -102,15 +105,17 @@ individual allocation site.
   teardown or a named owner for all related buffers  
 - You want multiple independent allocators (shards) rather than one process-wide
   heap  
-- You need a handle to pass into factories / STL allocators (`Pool&`)  
+- You need a handle to pass into factories / STL allocators (`Pool&`,
+  `PoolHandle`, or `PoolBlockToken`)  
 
 ### When you may not need a named pool
 
 - A single global heap with careful unique/shared ownership is enough  
 - Objects outlive any convenient “phase” and must be freed individually forever  
 
-In this library, `spallocator::Pool` is that named boundary: construct it, hand
-it to `allocate` / `make_pool_*` / `PoolAllocator`, destroy it when the unit of
+In this library, `spallocator::Pool` is that named boundary: construct it (or
+`PoolHandle::create()` for a heap domain that auto-retires when idle), hand it
+to `allocate` / `make_pool_*` / `PoolAllocator`, destroy it when the unit of
 work (or the service component) is done. What happens *inside* each size class
 is the slab story below.
 
@@ -469,12 +474,18 @@ resource lifetime.
 
 | Helper | Role |
 |--------|------|
-| `make_pool_unique` | Exclusive ownership; deleter runs `~T()` and returns memory to the pool |
+| `make_pool_unique` | Exclusive ownership; `PoolDeleter` runs `~T()` and returns memory (or no-ops if the pool already died — arena) |
 | `make_pool_shared` | Shared ownership; `allocate_shared` + `PoolAllocator` |
 | `PoolAllocator<T>` | Lets STL containers (`vector`, maps’ nodes, etc.) draw from the pool |
+| `PoolHandle` | Optional heap domain pin; `create()` auto-retires the pool when handles and live allocs are both zero |
 
 Arrays destroy elements in **reverse** construction order — the same rule as
 stack arrays and `delete[]`, so dependents tear down safely.
+
+**Two teardown stories:** orderly (pointers first — primary, full RAII) vs
+arena (pool first — bulk reclaim; documented destructor-skip for
+`unique_pool_ptr`). Details:
+[IMPLEMENTATION.md — Pool lifetime](IMPLEMENTATION.md#pool-lifetime-controlblock--poolhandle).
 
 ### Exception safety (the strong guarantee)
 

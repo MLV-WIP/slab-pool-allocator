@@ -903,7 +903,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 
 | Topic | Status |
 |-------|--------|
-| Pool destroy while clients hold pointers | **P18 in progress** — ControlBlock / Handle / BlockToken + arena deleter no-op; docs polish pending |
+| Pool destroy while clients hold pointers | **Addressed (P18)** — ControlBlock / Handle / BlockToken; orderly + arena + heap auto-retire |
 | Alloc bit scan | Next-fit + CTZ word search (production); freelist if still hot |
 | Address map | O(log m); denser structures if free is hot |
 | Fixed size-class ladders | Deliberate; shaped buffers are backlog R2 |
@@ -912,9 +912,9 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 | Metrics API | Minimal (`getAllocatedMemory`); richer stats planned |
 | C API | C++ only today; C99 wrapper is backlog R4 |
 
-These are engineering follow-ons, not soft-pedaled “educational” gaps. Document
-contracts in [API.md](API.md); do not rely on “users will be careful” for pool
-lifetime versus smart pointers.
+These are engineering follow-ons, not soft-pedaled “educational” gaps. Pool
+lifetime vs clients is covered under [Pool lifetime](#pool-lifetime-controlblock--poolhandle)
+and [API.md](API.md); remaining rows are scale/API surface, not silent UB.
 
 ---
 
@@ -938,7 +938,7 @@ Also tracked on the
 | Item | Notes |
 |------|--------|
 | Non–fixed-class buffer shaping | Size buffers to `(elem + header) × multiple` instead of discrete ladders |
-| Pool lifetime vs smart pointers | Detect / prevent / mitigate destroy-with-live-clients |
+| Pool lifetime vs smart pointers | **Done (P18)** — ControlBlock / Handle / BlockToken; orderly + arena + heap retire |
 | C99 wrapper | Opaque pool handle API for C callers |
 | Pluggable lock primitive | Compile-time choice of `SpinLock` vs `std::mutex` (or similar) for Pool/Slab |
 
@@ -948,7 +948,7 @@ Also tracked on the
 
 | Artifact | Proves |
 |----------|--------|
-| `test/tester.cpp` | Slab growth/trim/`DynBitset` scaling, pool routing/alignment/header validation, multi-thread pool use, smart-pointer exception safety, SpinLock contention, LifetimeObserver (including concurrent `isAlive`) |
+| `test/tester.cpp` | Slab growth/trim/`DynBitset` scaling, pool routing/alignment/header validation, multi-thread pool use, smart-pointer exception safety, PoolHandle/BlockToken lifetime, SpinLock contention, LifetimeObserver (including concurrent `isAlive`) |
 | `demos/demo_spalloc_shared_ptr.cpp` | Pool as domain + `make_pool_shared` + `PoolAllocator` with STL containers |
 | `demos/demo_lifetime_observer.cpp` | Single-strand vs mutex-guarded cross-thread observer patterns |
 
