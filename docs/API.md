@@ -222,14 +222,14 @@ readable after arena `~Pool` so free paths can no-op when `!alive`.
 ### Lifetime models
 
 There are **two primary ways** to use a `Pool`. Pick one deliberately; mixing
-them without care (especially arena + `make_pool_shared`) is where trouble
-starts. A third, optional pattern — `PoolHandle::create()` — is for heap domains
-that should disappear when idle.
+them without care (especially arena + `PoolAllocator` containers that still
+run element dtors) is where trouble starts. A third, optional pattern —
+`PoolHandle::create()` — is for heap domains that should disappear when idle.
 
 | Model | Teardown order | When to use |
 |-------|----------------|-------------|
 | **Orderly (primary)** | Free / destroy smart pointers **first**, then destroy the pool | Default for service objects, STL containers, anything with a non-trivial destructor or owned resources |
-| **Arena bulk** | Destroy the **pool first**; leftover `unique_pool_ptr`s no-op | Request/job scratch: many allocations, one fast reclaim; trivial or “don’t care about `~T()`” payloads |
+| **Arena bulk** | Destroy the **pool first**; leftover `unique_pool_ptr` / `make_pool_shared` no-op | Request/job scratch: many allocations, one fast reclaim; trivial or “don’t care about `~T()`” payloads |
 | **Heap handle** (optional) | `PoolHandle::create()`; pool auto-`delete`s when handles and live allocs are both zero | Long-lived shared domain without a stack `Pool`; pass handles into workers |
 
 Design depth: [IMPLEMENTATION.md — Pool lifetime](IMPLEMENTATION.md#pool-lifetime-controlblock--poolhandle).
@@ -261,11 +261,12 @@ destructors — file handles, locks, nested owning pointers, etc.
 
 #### Arena mode (bulk reclaim)
 
-Destroy the pool while some `unique_pool_ptr`s may still exist. `~Pool` marks
-the control block dead and frees slab storage in one shot. When those
-`unique_ptr`s later run their deleters, they see `!alive` and **no-op**: no
-`~T()`, no `try_deallocate`. That is intentional for APR-style “throw away the
-region” speed — and it means **destructors do not run** for those objects.
+Destroy the pool while some `unique_pool_ptr` / `make_pool_shared` owners may
+still exist. `~Pool` marks the control block dead and frees slab storage in one
+shot. When those smart pointers later run `PoolDeleter`, they see `!alive` and
+**no-op**: no `~T()`, no `try_deallocate`. That is intentional for APR-style
+“throw away the region” speed — and it means **destructors do not run** for
+those objects. (`shared_ptr` control blocks stay on the ordinary heap.)
 
 ```cpp
 void scratch_phase() {
@@ -287,10 +288,12 @@ void scratch_phase() {
 
 **Rules of thumb for arena**
 
-- Use `unique_pool_ptr` / raw `allocate`+`deallocate` only. Do **not** leave
-  `make_pool_shared` / `PoolAllocator`-backed `shared_ptr` outstanding across
-  arena `~Pool`: `allocate_shared` places the control block in the pool, so
-  even trivial `T` UAFs on later `reset()` / destruction.
+- Prefer `unique_pool_ptr` / `make_pool_shared` / raw `allocate`+`deallocate`.
+  Both smart-pointer factories use `PoolDeleter` (token outside the slab).
+- Do **not** leave `PoolAllocator`-backed containers (or raw
+  `std::allocate_shared` with `PoolAllocator`) outstanding across arena
+  `~Pool`: element/`allocate_shared` storage is in the pool, and standard
+  teardown still runs `~T` / touches a pool-resident control block.
 - Do not park durable resources (fds, mutexes, owning pointers to
   non-arena memory) only inside arena-allocated objects you might abandon.
 - Warm empty pools that you want to keep: use a stack/`unique_ptr<Pool>` and
@@ -635,20 +638,20 @@ std::shared_ptr<T> make_pool_shared(PoolBlockToken token, std::size_t size,
 // also: Pool&, PoolHandle const&
 ```
 
-Builds a `std::shared_ptr` via `std::allocate_shared` and `PoolAllocator`, so
-the object (and control block) come from the pool.
+Builds a `std::shared_ptr` with object storage from the pool and a
+**heap-allocated control block**. Teardown uses `PoolDeleter` (same arena
+no-op model as `make_pool_unique`). Tradeoff vs `allocate_shared`: two
+allocations (pool object + heap CB).
 
 | Overload | Parameters | Behavior |
 |----------|------------|----------|
-| Single object | domain, ctor `args...` | `allocate_shared<T>(PoolAllocator<T>{…}, args...)` |
-| Array | domain, `size` | `size` default-initialized elements |
+| Single object | domain, ctor `args...` | placement `new` + `shared_ptr(p, PoolDeleter)` |
+| Array | domain, `size` | `size` default-initialized elements; count in `PoolDeleter` |
 | Array + value | domain, `size`, `init_value` | `size` elements copy-initialized from `init_value` |
 
-Bounded array overloads are deleted. Array size lives in the `shared_ptr`
-control block (unlike `make_pool_unique`, which stores count in `PoolDeleter`).
-Do not leave these pointers outstanding across arena `~Pool`: the control
-block itself is pool storage, so later `reset()` / destruction is UAF even
-for trivial `T`. Use orderly teardown (destroy `shared_ptr` first).
+Bounded array overloads are deleted. Array size lives in `PoolDeleter` (same
+as `make_pool_unique`). Safe to leave outstanding across arena `~Pool` when
+you accept skipped destructors.
 
 ```cpp
 auto s = spallocator::make_pool_shared<Widget>(pool, arg1);
@@ -664,8 +667,9 @@ std::weak_ptr<Widget> w = s;
 **Header:** `spallocator/spallocator.hpp`
 
 Standard-library-style allocator that obtains storage from a pool domain.
-Enables `std::vector`, `std::allocate_shared`, and other allocator-aware
-facilities.
+Enables `std::vector` and other allocator-aware facilities. Prefer
+`make_pool_shared` over `std::allocate_shared` with this allocator if the
+pool may die first (allocate_shared places the control block in the pool).
 
 ```cpp
 template<typename T>

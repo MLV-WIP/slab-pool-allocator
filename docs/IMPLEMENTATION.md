@@ -487,7 +487,7 @@ not change slab internals; they enforce RAII and exception safety on top.
 | `PoolBlockToken` | `block_refs` pin on `PoolControlBlock`; observes `alive`; not a handle pin |
 | `PoolDeleter` | Placement-new counterpart: `~T()` then `try_deallocate`; arrays destroy **reverse** order; if `!alive`, **no-op** (arena); abort on bad free while alive |
 | `make_pool_unique` | Placement `new`; on ctor throw, return slot (**strong guarantee**); overloads for `Pool&` / `PoolHandle` / token |
-| `make_pool_shared` | `allocate_shared` + `PoolAllocator` (object + control block from pool) |
+| `make_pool_shared` | Placement `new` + `shared_ptr(p, PoolDeleter)`; object in pool, CB on heap |
 | `PoolAllocator` | Stateful token; no POCCA/POCMA/POCS; equal iff **same control block**; allocate throws `bad_alloc` if `!alive`; deallocate no-ops if dead |
 
 ### `PoolAllocator` design decisions
@@ -521,18 +521,21 @@ through `unique_ptr` / allocator requirements — hence `try_deallocate` +
 **`std::abort()`** on programming errors (bad pointer) while the pool is alive.
 If the pool is already dead, free is a deliberate no-op (arena), not abort.
 
-### Why `allocate_shared` for shared
+### Why not `allocate_shared` for shared
 
-`make_pool_shared` uses `std::allocate_shared` with `PoolAllocator` so the
-`shared_ptr` control block and object can share pool storage (same idea as
-`std::make_shared` vs separate `new`). Benefits vs `make_pool_unique`: shared
-ownership, thread-safe refcounts, `weak_ptr`, single allocation for object +
-control block.
+`std::allocate_shared` co-locates object and control block. With
+`PoolAllocator`, that puts the CB in a slab — arena `~Pool` then UAFs on any
+later `shared_ptr` use. The standard type cannot combine that single-alloc
+layout with a `unique_ptr`-style deleter whose state lives outside the block.
 
-Unbounded array overloads (`shared_ptr<T[]>`) rely on `shared_ptr`’s built-in
-size tracking in its control block — unlike `make_pool_unique<T[]>`, which
-stores the element count in `PoolDeleter`. Bounded array overloads are deleted
-(use `std::array`).
+So `make_pool_shared` mirrors `make_pool_unique`: placement `new` into the
+pool, then `std::shared_ptr(p, PoolDeleter{token})`. The CB (and deleter/token)
+are heap-allocated; arena no-op works the same as for `unique_pool_ptr`.
+Cost: two allocations instead of one.
+
+Unbounded array overloads store the element count in `PoolDeleter` (same as
+`make_pool_unique<T[]>`). Bounded array overloads are deleted (use
+`std::array`).
 
 ### Lifetime coupling
 
@@ -544,11 +547,11 @@ readable after `~Pool`, without pinning an empty heap pool the way
 | Path | Teardown order | `~T()` / free |
 |------|----------------|---------------|
 | **Orderly (primary)** | Smart pointers / containers first, then pool | Normal: `~T()` then return slot |
-| **Arena + `unique_pool_ptr`** | Pool first while `unique_ptr` may still exist | `PoolDeleter` (token outside the slab) sees `!alive` → skip `~T` and free |
-| **Arena + `make_pool_shared`** | **Unsupported** | Control block (+ embedded `PoolAllocator`) lives in the slab via `allocate_shared`; arena `~Pool` frees it → UAF on any later `shared_ptr` use, even trivial `T`. Use orderly teardown. |
+| **Arena + `unique_pool_ptr` / `make_pool_shared`** | Pool first while owners may still exist | `PoolDeleter` (token outside the slab; CB on heap for `shared_ptr`) sees `!alive` → skip `~T` and free |
+| **Arena + `PoolAllocator` / raw `allocate_shared`** | **Unsafe** if storage outlives `~Pool` | Standard `~T` / pool-resident CB can UAF — use orderly teardown |
 
 Arena bulk reclaim is the right tool for byte buffers / trivial payloads (or
-when you accept skipped destructors via `unique_pool_ptr`). Do not park durable
+when you accept skipped destructors via `PoolDeleter`). Do not park durable
 resources only in pooled objects if you might destroy the pool first.
 
 Factories accept `Pool&`, `PoolHandle`, or `PoolBlockToken`. Prefer

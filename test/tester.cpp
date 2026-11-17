@@ -442,12 +442,36 @@ TEST(PoolTest, MakePoolUniqueFromHandle)
 }
 
 
-// make_pool_shared uses allocate_shared: object + shared_ptr control block
-// (including the embedded PoolAllocator / PoolBlockToken) live in pool slabs.
-// Arena ~Pool frees that storage while the shared_ptr still holds it — any
-// later use, including reset(), is UAF even for trivial T. Arena bulk reclaim
-// is unique_pool_ptr-only; shared_ptr requires orderly teardown (pool last).
-// Covered by OrderlySharedPtrRunsDestructor / MakePoolSharedFromHandle.
+// Arena + make_pool_shared: control block is heap-allocated; PoolDeleter token
+// outlives slabs. Same no-op model as unique_pool_ptr when !alive.
+TEST(PoolTest, ArenaDestroySharedPtrSkipsTypedDestructor)
+{
+    ArenaDtorProbe::destructions = 0;
+    std::shared_ptr<ArenaDtorProbe> ptr;
+    {
+        Pool pool;
+        ptr = make_pool_shared<ArenaDtorProbe>(pool);
+        ASSERT_NE(ptr.get(), nullptr);
+        EXPECT_EQ(pool.live_allocation_count(), 1u);
+    } // ~Pool: mark_dead + free slabs; ~T not run by pool
+    EXPECT_EQ(ArenaDtorProbe::destructions, 0);
+    ptr.reset(); // deleter sees !alive → no-op (still no ~T)
+    EXPECT_EQ(ArenaDtorProbe::destructions, 0);
+}
+
+
+TEST(PoolTest, ArenaDestroySharedPtrDeallocateNoops)
+{
+    std::shared_ptr<int> ptr;
+    {
+        Pool pool;
+        ptr = make_pool_shared<int>(pool, 7);
+        ASSERT_NE(ptr.get(), nullptr);
+        EXPECT_EQ(*ptr, 7);
+        EXPECT_EQ(pool.live_allocation_count(), 1u);
+    }
+    ptr.reset(); // ~int trivial; PoolDeleter sees !alive → no-op
+}
 
 
 TEST(PoolTest, OrderlySharedPtrRunsDestructor)

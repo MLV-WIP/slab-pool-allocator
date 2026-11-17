@@ -221,6 +221,10 @@ $(OBJDIR)/$(TESTER_TARGET): $(TESTER_SRC) $(HEADERS) | $(OBJDIR)
 	$(Q)$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET)
 	$(Q)ln -s $(OBJDIRNAME)/$(TESTER_TARGET) $(BASEOBJDIR)/$(TESTER_TARGET)
+ifeq ($(ENABLE_COVERAGE),yes)
+	# Stale .gcda cannot merge after instrumentation changes (corrupt arc tag).
+	$(Q)rm -f $(OBJDIR)/*.gcda $(OBJDIR)/*.gcov
+endif
 
 # Build demo
 $(OBJDIR)/$(DEMO_TARGET): $(DEMO_SRC) $(HEADERS) | $(OBJDIR)
@@ -238,11 +242,16 @@ $(OBJDIR)/$(DEMO_LIFETIME_TARGET): $(DEMO_LIFETIME_SRC) $(HEADERS) | $(OBJDIR)
 
 # Run tests
 test: $(OBJDIR)/$(TESTER_TARGET)
+ifeq ($(ENABLE_COVERAGE),yes)
+	# Fresh counters for this run (avoids merge with older .gcda after edits).
+	$(Q)rm -f $(OBJDIR)/*.gcda
+endif
 	$(ECHO) "  RUN     $(TESTER_TARGET)"
 	$(Q)$(OBJDIR)/$(TESTER_TARGET)
 
 # Coverage summary (ENABLE_COVERAGE=yes). Clang → llvm-cov; GCC → gcov.
 # Tool versions come from PATH / update-alternatives — no version probing here.
+# `test` already clears .gcda before the run when coverage is enabled.
 coverage: test
 ifeq ($(ENABLE_COVERAGE),yes)
 	$(ECHO) "  COVERAGE $(OBJDIR)"
@@ -257,6 +266,7 @@ ifeq ($(ENABLE_COVERAGE),yes)
 		echo "No coverage data in $(OBJDIR) — rebuild with ENABLE_COVERAGE=yes"; \
 		exit 1; \
 	fi; \
+	rm -f "$(OBJDIR)"/*.gcov; \
 	cd $(OBJDIR); \
 	if [ "$$is_clang" = "yes" ]; then \
 		llvm-cov gcov -o . "$$stem"; \

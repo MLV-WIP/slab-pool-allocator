@@ -267,13 +267,15 @@ namespace spallocator
     // PoolAllocator - C++ Standard Allocator using Pool
     // =========================================================================
 
-    // C++17-compliant allocator for STL containers and allocate_shared.
+    // C++17-compliant allocator for STL containers (and optional allocate_shared).
     // Design decisions (see also IMPLEMENTATION.md — Smart pointers):
     // 1. Holds PoolBlockToken (block_refs) — survives arena ~Pool; not handle_refs
     // 2. Stateful — unequal when control blocks differ
     // 3. Alignment-aware via Pool::allocate(bytes, alignof(T))
     // 4. POCCA/POCMA/POCS false — token is not transferred by container assign
     // 5. Equal iff same PoolControlBlock*; allocate throws if !alive; free no-ops if dead
+    // Note: allocate_shared with PoolAllocator puts the control block in the pool
+    // (not arena-safe). make_pool_shared does not use this path.
 
     template<typename T>
     class PoolAllocator
@@ -362,21 +364,31 @@ namespace spallocator
     };
 
     // =========================================================================
-    // make_pool_shared — allocate_shared + PoolAllocator (object + control block)
+    // make_pool_shared — placement new + PoolDeleter (heap control block)
     // =========================================================================
 
-    // Single object: like std::make_shared, but storage comes from the pool.
-    // Benefits vs make_pool_unique: shared ownership, weak_ptr, one allocation
-    // for object + shared_ptr control block.
-    // Not arena-safe: control block lives in the pool; outstanding shared_ptr
-    // across ~Pool is UAF (even trivial T). Use orderly teardown, or
-    // unique_pool_ptr for arena bulk reclaim.
+    // Object storage from the pool; shared_ptr control block from the ordinary
+    // heap (std::allocator). Same arena model as unique_pool_ptr: PoolDeleter
+    // holds a PoolBlockToken outside the slab and no-ops when !alive.
+    // Tradeoff vs allocate_shared: two allocations (pool object + heap CB).
     template<typename T, typename... Args>
         requires (!std::is_array_v<T>)
     std::shared_ptr<T> make_pool_shared(PoolBlockToken token, Args&&... args)
     {
-        PoolAllocator<T> alloc(std::move(token));
-        return std::allocate_shared<T>(alloc, std::forward<Args>(args)...);
+        static_assert(alignof(T) <= kMaxAlignment,
+            "make_pool_shared: alignof(T) exceeds Pool max alignment (64)");
+        Pool* pool = detail::require_live_pool(token);
+        void* mem = pool->allocate(sizeof(T), alignof(T));
+        try
+        {
+            T* obj = new (mem) T(std::forward<Args>(args)...);
+            return std::shared_ptr<T>(obj, PoolDeleter<T>{std::move(token)});
+        }
+        catch (...)
+        {
+            pool->deallocate(reinterpret_cast<std::byte*>(mem));
+            throw;
+        }
     }
 
     template<typename T, typename... Args>
@@ -393,15 +405,42 @@ namespace spallocator
         return make_pool_shared<T>(handle.block_token(), std::forward<Args>(args)...);
     }
 
-    // Unbounded array (C++20): shared_ptr tracks length in its control block
-    // (unlike make_pool_unique<T[]>, which stores size in PoolDeleter).
+    // Unbounded array: element count lives in PoolDeleter (same as unique).
     template<typename T>
         requires std::is_unbounded_array_v<T>
     std::shared_ptr<T> make_pool_shared(PoolBlockToken token, std::size_t size)
     {
         using ElementType = std::remove_extent_t<T>;
-        PoolAllocator<ElementType> alloc(std::move(token));
-        return std::allocate_shared<T>(alloc, size);
+        static_assert(alignof(ElementType) <= kMaxAlignment,
+            "make_pool_shared: alignof(element) exceeds Pool max alignment (64)");
+
+        Pool* pool = detail::require_live_pool(token);
+        std::size_t array_size = sizeof(ElementType) * size;
+        std::size_t alignment = alignof(ElementType) > alignof(std::size_t) ?
+                                alignof(ElementType) : alignof(std::size_t);
+
+        std::byte* mem = pool->allocate(array_size, alignment);
+        ElementType* array_ptr = reinterpret_cast<ElementType*>(mem);
+
+        std::size_t constructed = 0;
+        try
+        {
+            for (; constructed < size; ++constructed)
+            {
+                new (&array_ptr[constructed]) ElementType();
+            }
+        }
+        catch (...)
+        {
+            while (constructed > 0)
+            {
+                array_ptr[--constructed].~ElementType();
+            }
+            pool->deallocate(mem);
+            throw;
+        }
+
+        return std::shared_ptr<T>(array_ptr, PoolDeleter<T>{std::move(token), size});
     }
 
     template<typename T>
@@ -418,15 +457,43 @@ namespace spallocator
         return make_pool_shared<T>(handle.block_token(), size);
     }
 
-    // Unbounded array with fill value (C++20).
+    // Unbounded array with fill value.
     template<typename T>
         requires std::is_unbounded_array_v<T>
     std::shared_ptr<T> make_pool_shared(PoolBlockToken token, std::size_t size,
                                         const std::remove_extent_t<T>& init_value)
     {
         using ElementType = std::remove_extent_t<T>;
-        PoolAllocator<ElementType> alloc(std::move(token));
-        return std::allocate_shared<T>(alloc, size, init_value);
+        static_assert(alignof(ElementType) <= kMaxAlignment,
+            "make_pool_shared: alignof(element) exceeds Pool max alignment (64)");
+
+        Pool* pool = detail::require_live_pool(token);
+        std::size_t array_size = sizeof(ElementType) * size;
+        std::size_t alignment = alignof(ElementType) > alignof(std::size_t) ?
+                                alignof(ElementType) : alignof(std::size_t);
+
+        std::byte* mem = pool->allocate(array_size, alignment);
+        ElementType* array_ptr = reinterpret_cast<ElementType*>(mem);
+
+        std::size_t constructed = 0;
+        try
+        {
+            for (; constructed < size; ++constructed)
+            {
+                new (&array_ptr[constructed]) ElementType(init_value);
+            }
+        }
+        catch (...)
+        {
+            while (constructed > 0)
+            {
+                array_ptr[--constructed].~ElementType();
+            }
+            pool->deallocate(mem);
+            throw;
+        }
+
+        return std::shared_ptr<T>(array_ptr, PoolDeleter<T>{std::move(token), size});
     }
 
     template<typename T>

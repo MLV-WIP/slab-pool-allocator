@@ -475,7 +475,7 @@ resource lifetime.
 | Helper | Role |
 |--------|------|
 | `make_pool_unique` | Exclusive ownership; `PoolDeleter` runs `~T()` and returns memory (or no-ops if the pool already died — arena) |
-| `make_pool_shared` | Shared ownership; `allocate_shared` + `PoolAllocator` |
+| `make_pool_shared` | Shared ownership; pool object + heap CB via `PoolDeleter` |
 | `PoolAllocator<T>` | Lets STL containers (`vector`, maps’ nodes, etc.) draw from the pool |
 | `PoolHandle` | Optional heap domain pin; `create()` auto-retires the pool when handles and live allocs are both zero |
 
