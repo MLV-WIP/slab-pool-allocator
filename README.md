@@ -130,11 +130,12 @@ int main() {
 | Component | File | Description |
 |-----------|------|-------------|
 | **Pool** | `spallocator/pool.hpp` | Allocation domain: route by footprint/alignment, header protocol, `trim`, dispose as a unit |
+| **Pool lifetime** | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolBlockToken`, `PoolControlBlock` (also via `pool.hpp`) |
 | **Slab** | `spallocator/slab.hpp` | Fixed-size slot recycler for one size class (bitmaps, growth, reclaim) |
 | **SlabProxy** | `spallocator/slab.hpp` | Large / overflow path via system `new[]` / `delete[]` |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a pool domain |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
-| **PoolHandle** | `spallocator/pool.hpp` | Heap domain handle; `create()` retires when idle |
+| **PoolHandle** | `spallocator/pool_lifetime.hpp` | Heap domain handle; `create()` retires when idle |
 | **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Intrusive weak liveness; extra sync only when use and destroy can race across threads |
 | **SpinLock** | `spallocator/spinlock.hpp` | Short-section lock with TTAS, backoff, and TSan annotations |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |

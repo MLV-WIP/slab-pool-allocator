@@ -562,6 +562,10 @@ Concepts: [CONCEPTS.md — RAII](CONCEPTS.md#raii-on-a-custom-pool).
 
 ## Pool lifetime (ControlBlock & PoolHandle)
 
+Types live in `pool_lifetime.hpp` (pulled in by `pool.hpp`). Methods that
+`delete` a heap `Pool` (`PoolHandle::create`, `release_handle_ref`) are defined
+in `pool.hpp` after `class Pool` is complete.
+
 Every `Pool` is paired with a heap-allocated **`PoolControlBlock`**: alive flag,
 `live_allocs`, `handle_refs`, `block_refs`, and a back-pointer to the `Pool`.
 The control block can outlive the `Pool` (e.g. a `PoolHandle` still held after
@@ -715,7 +719,7 @@ Never take locks in opposing orders across threads:
 - Avoid: holding `Slab::lock` then blocking on `Pool::lock` while another thread
   holds pool and waits for that slab  
 
-Exact sequences live in `pool.hpp` / `slab.hpp` — treat those as source of
+Exact sequences live in `pool.hpp` / `pool_lifetime.hpp` / `slab.hpp` — treat those as source of
 truth if this summary drifts.
 
 ### Client-facing notes

@@ -50,7 +50,8 @@ Unless noted, types are in namespace `spallocator`. `SpinLock` and
 
 | Header | Primary contents |
 |--------|------------------|
-| `spallocator/pool.hpp` | `Pool`, `PoolHandle`, `PoolBlockToken`, `PoolControlBlock`, ladders |
+| `spallocator/pool.hpp` | `Pool`, ladders (includes `pool_lifetime.hpp`) |
+| `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolBlockToken`, `PoolControlBlock` |
 | `spallocator/slab.hpp` | `AbstractSlab`, `Slab`, `SlabProxy`, `DynBitset` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
 | `spallocator/lifetimeobserver.hpp` | `LifetimeObserver` |
@@ -171,6 +172,8 @@ auto h = pool.handle();  // optional handle pin (does not make stack pool heap-o
 
 ### `PoolHandle`
 
+**Header:** `spallocator/pool_lifetime.hpp` (also via `pool.hpp`)
+
 ```cpp
 class PoolHandle {
 public:
@@ -199,6 +202,8 @@ h.get()->deallocate(p);
 ```
 
 ### `PoolBlockToken`
+
+**Header:** `spallocator/pool_lifetime.hpp` (also via `pool.hpp`)
 
 ```cpp
 class PoolBlockToken {
