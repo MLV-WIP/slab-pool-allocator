@@ -150,6 +150,40 @@ namespace spallocator
     class PoolControlBlock;
 
 
+    // Deleter/allocator pin: block_refs only (does not keep empty heap pools
+    // alive). Outlives Pool on the arena path so !alive can be observed.
+    // Before Pool/PoolHandle because both return it by value.
+    class PoolBlockToken
+    {
+    public: // methods
+        PoolBlockToken() noexcept = default;
+        PoolBlockToken(const PoolBlockToken& other) noexcept;
+        PoolBlockToken(PoolBlockToken&& other) noexcept;
+        ~PoolBlockToken();
+
+        PoolBlockToken& operator=(const PoolBlockToken& other) noexcept;
+        PoolBlockToken& operator=(PoolBlockToken&& other) noexcept;
+
+        // nullptr if empty token or pool already marked dead.
+        Pool* get() const noexcept;
+        bool alive() const noexcept;
+        explicit operator bool() const noexcept;
+
+        PoolControlBlock* control() const noexcept { return block_; }
+
+    private: // methods
+        friend class Pool;
+        friend class PoolHandle;
+        explicit PoolBlockToken(PoolControlBlock* block) noexcept;
+
+        void retain() noexcept;
+        void release() noexcept;
+
+    private: // data members
+        PoolControlBlock* block_{nullptr};
+    };
+
+
     // Share of a PoolControlBlock that pins handle_refs (keeps empty heap pools
     // alive). From Pool::handle() or PoolHandle::create(). Declared before Pool
     // because Pool::handle() returns PoolHandle by value.
@@ -173,6 +207,9 @@ namespace spallocator
         explicit operator bool() const noexcept;
 
         PoolControlBlock* control() const noexcept { return block_; }
+
+        // Deleter/allocator pin (block_refs only; does not bump handle_refs).
+        PoolBlockToken block_token() const noexcept;
 
     private: // methods
         friend class Pool;
@@ -212,6 +249,9 @@ namespace spallocator
 
         // Handle sharing this pool's control block (bumps handle_refs + block_refs).
         PoolHandle handle();
+
+        // Deleter/allocator token (block_refs only).
+        PoolBlockToken block_token();
 
         PoolControlBlock* control() const noexcept { return control_; }
 
@@ -451,6 +491,102 @@ namespace spallocator
 
 
     // ---------------------------------------------------------------------------
+    // PoolBlockToken
+    // ---------------------------------------------------------------------------
+
+    inline PoolBlockToken::PoolBlockToken(PoolControlBlock* block) noexcept
+        : block_(block)
+    {
+        retain();
+    }
+
+
+    inline PoolBlockToken::PoolBlockToken(const PoolBlockToken& other) noexcept
+        : block_(other.block_)
+    {
+        retain();
+    }
+
+
+    inline PoolBlockToken::PoolBlockToken(PoolBlockToken&& other) noexcept
+        : block_(other.block_)
+    {
+        other.block_ = nullptr;
+    }
+
+
+    inline PoolBlockToken::~PoolBlockToken()
+    {
+        release();
+    }
+
+
+    inline PoolBlockToken& PoolBlockToken::operator=(const PoolBlockToken& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            block_ = other.block_;
+            retain();
+        }
+        return *this;
+    }
+
+
+    inline PoolBlockToken& PoolBlockToken::operator=(PoolBlockToken&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            block_ = other.block_;
+            other.block_ = nullptr;
+        }
+        return *this;
+    }
+
+
+    inline Pool* PoolBlockToken::get() const noexcept
+    {
+        if (!block_ || !block_->is_alive())
+        {
+            return nullptr;
+        }
+        return block_->pool();
+    }
+
+
+    inline bool PoolBlockToken::alive() const noexcept
+    {
+        return block_ && block_->is_alive();
+    }
+
+
+    inline PoolBlockToken::operator bool() const noexcept
+    {
+        return alive();
+    }
+
+
+    inline void PoolBlockToken::retain() noexcept
+    {
+        if (block_)
+        {
+            block_->add_block_ref();
+        }
+    }
+
+
+    inline void PoolBlockToken::release() noexcept
+    {
+        if (block_)
+        {
+            block_->release_block_ref();
+            block_ = nullptr;
+        }
+    }
+
+
+    // ---------------------------------------------------------------------------
     // PoolHandle
     // ---------------------------------------------------------------------------
 
@@ -459,6 +595,12 @@ namespace spallocator
         Pool* pool = new Pool();
         pool->control()->set_heap_owned();
         return PoolHandle(pool->control());
+    }
+
+
+    inline PoolBlockToken PoolHandle::block_token() const noexcept
+    {
+        return PoolBlockToken(block_);
     }
 
 
@@ -900,6 +1042,12 @@ namespace spallocator
     inline PoolHandle Pool::handle()
     {
         return PoolHandle(control_);
+    }
+
+
+    inline PoolBlockToken Pool::block_token()
+    {
+        return PoolBlockToken(control_);
     }
 
 

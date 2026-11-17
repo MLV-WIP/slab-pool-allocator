@@ -74,7 +74,7 @@ you need the “why pools / why slabs” story without code structure.
               │
               └── per-slab SpinLock, bitsets, base_address_map
 
-  Smart pointers / PoolAllocator ──► clients of Pool&
+  Smart pointers / PoolAllocator ──► clients via PoolBlockToken / PoolHandle
   LifetimeObserver                 (stand-alone; not part of Pool)
 ```
 
@@ -83,7 +83,7 @@ you need the “why pools / why slabs” story without code structure.
 | **`Pool`** | Allocation *domain*: construct/destroy as a unit, isolate shards, route by footprint + alignment, write/validate the allocation header, `trim` / accounting, pool-level locks |
 | **`Slab`** | Fixed-size *storage*: buffers, freemap, address map, growth/reclaim of empty buffers, per-slab lock |
 | **`SlabProxy`** | Same backend interface; system `new[]` / `delete[]` for oversized requests |
-| **Smart pointers** | Clients of `Pool&` (typed RAII) |
+| **Smart pointers** | Clients via `PoolBlockToken` / `PoolHandle` (typed RAII) |
 | **`LifetimeObserver`** | Independent of pool/slab |
 
 Destroying a `Pool` destroys its slab backends. Speeding up 64-byte churn is
@@ -476,45 +476,84 @@ full heap profiler.
 
 ## Smart pointers (design)
 
-Factories and deleters are **clients of `Pool&`**. They do not change slab
-internals; they enforce RAII and exception safety on top of the pool domain.
+Factories and deleters are **clients of the pool domain** via
+`PoolBlockToken` (and convenience overloads on `Pool&` / `PoolHandle`). They do
+not change slab internals; they enforce RAII and exception safety on top.
 
 ### Roles
 
 | Piece | Design point |
 |-------|----------------|
-| `PoolDeleter` | `~T()` then `try_deallocate`; arrays destroy reverse order; abort on bad free |
-| `make_pool_unique` | Placement new; on ctor throw, return slot to pool (**strong guarantee**) |
+| `PoolBlockToken` | `block_refs` pin on `PoolControlBlock`; observes `alive`; not a handle pin |
+| `PoolDeleter` | Placement-new counterpart: `~T()` then `try_deallocate`; arrays destroy **reverse** order; if `!alive`, **no-op** (arena); abort on bad free while alive |
+| `make_pool_unique` | Placement `new`; on ctor throw, return slot (**strong guarantee**); overloads for `Pool&` / `PoolHandle` / token |
 | `make_pool_shared` | `allocate_shared` + `PoolAllocator` (object + control block from pool) |
-| `PoolAllocator` | Stateful `Pool&`; no propagate-on-copy/move/swap; equal iff same pool instance |
+| `PoolAllocator` | Stateful token; no POCCA/POCMA/POCS; equal iff **same control block**; allocate throws `bad_alloc` if `!alive`; deallocate no-ops if dead |
+
+### `PoolAllocator` design decisions
+
+1. Holds a **`PoolBlockToken`**, not a raw `Pool&` — survives arena `~Pool` so
+   deallocate can no-op instead of UAF.  
+2. Stateful — different control blocks compare unequal.  
+3. Uses the pool’s alignment-aware `allocate` for proper object placement
+   (`alignof(T)` ≤ `kMaxAlignment`).  
+4. Does **not** propagate on container copy/move/swap (POCCA/POCMA/POCS false)
+   — the token is not “owned” by the container in a transferable sense; rebound
+   allocators share the same control block.  
+5. Equality is by `token.control()` identity (not `Pool*` address), so two
+   tokens for the same live/dead domain still compare equal.
 
 ### Exception safety
 
 Single-object `make_pool_unique`: allocate bytes → placement `new` → on
-constructor throw, `deallocate` the raw block, rethrow. The caller never sees a
-smart pointer to a half-built object, and the pool does not leak the slot.
+constructor throw, `deallocate` the raw block, rethrow. The object was never
+constructed; the caller never sees a smart pointer to a half-built object, and
+the pool does not leak the slot.
 
-Array `make_pool_unique<U[]>`: default-construct elements in order; if element
-*k* throws, destroy `k-1 … 0` in reverse, free the block, rethrow. That matches
-the strong guarantee expected of `std::make_unique`-style helpers.
+Array `make_pool_unique<U[]>`: `Pool::allocate` returns the **user pointer**
+(header already written). Default-construct elements in order; if element *k*
+throws, destroy `k-1 … 0` in reverse, free the block, rethrow — same strong
+guarantee as `std::make_unique`-style helpers. Bounded arrays are deleted
+(use `std::array`).
 
 `PoolDeleter` / `PoolAllocator::deallocate` are `noexcept` and must not throw
-through `unique_ptr` / allocator requirements — hence `try_deallocate` + abort
-on programming errors instead of exceptions.
+through `unique_ptr` / allocator requirements — hence `try_deallocate` +
+**`std::abort()`** on programming errors (bad pointer) while the pool is alive.
+If the pool is already dead, free is a deliberate no-op (arena), not abort.
 
 ### Why `allocate_shared` for shared
 
 `make_pool_shared` uses `std::allocate_shared` with `PoolAllocator` so the
-control block and object can share pool storage (same idea as
-`std::make_shared` vs separate `new`). Array overloads rely on `shared_ptr`’s
-built-in size tracking rather than embedding a count in a custom deleter.
+`shared_ptr` control block and object can share pool storage (same idea as
+`std::make_shared` vs separate `new`). Benefits vs `make_pool_unique`: shared
+ownership, thread-safe refcounts, `weak_ptr`, single allocation for object +
+control block.
+
+Unbounded array overloads (`shared_ptr<T[]>`) rely on `shared_ptr`’s built-in
+size tracking in its control block — unlike `make_pool_unique<T[]>`, which
+stores the element count in `PoolDeleter`. Bounded array overloads are deleted
+(use `std::array`).
 
 ### Lifetime coupling
 
-Smart pointers and `PoolAllocator` still store a raw `Pool&` today (deleter
-token / `!alive` no-op is the next P18 step). Prefer orderly teardown: destroy
-pointers before the pool. Heap domains should use `PoolHandle::create()` — see
-[Pool lifetime](#pool-lifetime-controlblock--poolhandle).
+`PoolDeleter` / `PoolAllocator` hold a **`PoolBlockToken`** (`block_refs` only —
+not `handle_refs`). That keeps the control block alive so `alive` remains
+readable after `~Pool`, without pinning an empty heap pool the way
+`PoolHandle` does.
+
+| Path | Teardown order | `~T()` / free |
+|------|----------------|---------------|
+| **Orderly (primary)** | Smart pointers / containers first, then pool | Normal: `~T()` then return slot |
+| **Arena + `unique_pool_ptr`** | Pool first while `unique_ptr` may still exist | `PoolDeleter` sees `!alive` → skip `~T` and free |
+| **Arena + `shared_ptr` / `PoolAllocator`** | Pool first | `shared_ptr` still runs `~T` on the object, then `deallocate` no-ops if `!alive`. Non-trivial `T` after bulk slab free is unsafe — use orderly teardown for typed `shared_ptr` |
+
+Arena bulk reclaim is the right tool for byte buffers / trivial payloads (or
+when you accept skipped destructors via `unique_pool_ptr`). Do not park durable
+resources only in pooled objects if you might destroy the pool first.
+
+Factories accept `Pool&`, `PoolHandle`, or `PoolBlockToken`. Prefer
+`PoolHandle::create()` for heap domains that should auto-retire when idle —
+see [Pool lifetime](#pool-lifetime-controlblock--poolhandle).
 
 API: [API.md — Smart pointers](API.md#smart-pointers).  
 Concepts: [CONCEPTS.md — RAII](CONCEPTS.md#raii-on-a-custom-pool).
@@ -864,7 +903,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 
 | Topic | Status |
 |-------|--------|
-| Pool destroy while clients hold pointers | **P18 in progress** — `PoolControlBlock` + `PoolHandle::create` retire; deleter `!alive` no-op still pending |
+| Pool destroy while clients hold pointers | **P18 in progress** — ControlBlock / Handle / BlockToken + arena deleter no-op; docs polish pending |
 | Alloc bit scan | Next-fit + CTZ word search (production); freelist if still hot |
 | Address map | O(log m); denser structures if free is hot |
 | Fixed size-class ladders | Deliberate; shaped buffers are backlog R2 |

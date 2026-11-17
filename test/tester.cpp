@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -386,6 +387,99 @@ TEST(PoolTest, StackPoolHandleDoesNotHeapRetireOnLastFree)
     EXPECT_EQ(pool.live_allocation_count(), 0u);
     EXPECT_TRUE(pool.control()->is_alive());
     EXPECT_FALSE(pool.control()->is_heap_owned());
+}
+
+
+namespace
+{
+struct alignas(8) ArenaDtorProbe
+{
+    static int destructions;
+    ~ArenaDtorProbe() { ++destructions; }
+};
+int ArenaDtorProbe::destructions = 0;
+} // namespace
+
+
+// P18 step 3: deleter token + arena no-op (skip ~T when pool already dead).
+TEST(PoolTest, ArenaDestroySkipsTypedDestructorInDeleter)
+{
+    ArenaDtorProbe::destructions = 0;
+    std::optional<unique_pool_ptr<ArenaDtorProbe>> ptr;
+    {
+        Pool pool;
+        ptr.emplace(make_pool_unique<ArenaDtorProbe>(pool));
+        ASSERT_NE(ptr->get(), nullptr);
+        EXPECT_EQ(pool.live_allocation_count(), 1u);
+    } // ~Pool: arena mark_dead + free slabs; ~T not run by pool
+    EXPECT_EQ(ArenaDtorProbe::destructions, 0);
+    ptr.reset(); // deleter sees !alive → no-op (still no ~T)
+    EXPECT_EQ(ArenaDtorProbe::destructions, 0);
+}
+
+
+TEST(PoolTest, OrderlyUniquePtrRunsDestructor)
+{
+    ArenaDtorProbe::destructions = 0;
+    Pool pool;
+    {
+        auto ptr = make_pool_unique<ArenaDtorProbe>(pool);
+        ASSERT_NE(ptr.get(), nullptr);
+    }
+    EXPECT_EQ(ArenaDtorProbe::destructions, 1);
+    EXPECT_EQ(pool.live_allocation_count(), 0u);
+}
+
+
+TEST(PoolTest, MakePoolUniqueFromHandle)
+{
+    auto h = PoolHandle::create();
+    auto ptr = make_pool_unique<int>(h, 42);
+    ASSERT_NE(ptr.get(), nullptr);
+    EXPECT_EQ(*ptr, 42);
+    ptr.reset();
+    EXPECT_EQ(h.get()->live_allocation_count(), 0u);
+}
+
+
+// shared_ptr always runs ~T before allocator.deallocate. After arena ~Pool,
+// non-trivial ~T would UAF — so this analog uses trivial int and only checks
+// that deallocate no-ops (no abort) when !alive.
+TEST(PoolTest, ArenaDestroySharedPtrDeallocateNoops)
+{
+    std::shared_ptr<int> ptr;
+    {
+        Pool pool;
+        ptr = make_pool_shared<int>(pool, 7);
+        ASSERT_NE(ptr.get(), nullptr);
+        EXPECT_EQ(*ptr, 7);
+        EXPECT_GE(pool.live_allocation_count(), 1u);
+    }
+    ptr.reset(); // ~int trivial; PoolAllocator::deallocate sees !alive → no-op
+}
+
+
+TEST(PoolTest, OrderlySharedPtrRunsDestructor)
+{
+    ArenaDtorProbe::destructions = 0;
+    Pool pool;
+    {
+        auto ptr = make_pool_shared<ArenaDtorProbe>(pool);
+        ASSERT_NE(ptr.get(), nullptr);
+    }
+    EXPECT_EQ(ArenaDtorProbe::destructions, 1);
+    EXPECT_EQ(pool.live_allocation_count(), 0u);
+}
+
+
+TEST(PoolTest, MakePoolSharedFromHandle)
+{
+    auto h = PoolHandle::create();
+    auto ptr = make_pool_shared<int>(h, 42);
+    ASSERT_NE(ptr.get(), nullptr);
+    EXPECT_EQ(*ptr, 42);
+    ptr.reset();
+    EXPECT_EQ(h.get()->live_allocation_count(), 0u);
 }
 
 
