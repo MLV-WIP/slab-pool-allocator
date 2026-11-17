@@ -650,13 +650,13 @@ public:
 |--------|-------------|
 | `lock()` | Blocks until the lock is acquired (spin → backoff → wait). |
 | `try_lock()` | Attempts acquisition without blocking. Returns `true` if acquired, `false` if another holder exists. |
-| `unlock()` | Releases the lock and wakes one waiter. Caller must hold the lock. Undefined if unlocking a lock you do not own. |
+| `unlock()` | Releases the lock and wakes one waiter. Caller must hold the lock. Unlocking a lock you do not own (or double-unlock) is undefined in release builds; debug builds abort via an owner-thread assert. |
 
 | | |
 |--|--|
-| **Thread safety** | Synchronizes threads that use the same `SpinLock` instance around the critical section. |
+| **Thread safety** | Synchronizes threads that use the same `SpinLock` instance around the critical section. Non-recursive: the owning thread must not call `lock()` again until `unlock()`. |
 | **Exceptions** | These methods do not throw. |
-| **Recommendation** | Prefer RAII (`std::scoped_lock`) so exceptions cannot leave the lock held. |
+| **Recommendation** | Prefer RAII — `std::scoped_lock` for scope-bound holds, `std::unique_lock` when you need deferred lock, adopt, or early `unlock()` — so exceptions and mismatched pairs cannot leave the lock held. |
 
 ```cpp
 SpinLock mu;
@@ -664,7 +664,14 @@ SpinLock mu;
     std::scoped_lock guard(mu);
     // critical section
 }
+{
+    std::unique_lock guard(mu); // early unlock / re-lock when needed
+    // ...
+    guard.unlock();
+}
 ```
+
+In non-`NDEBUG` builds, successful `lock` / `try_lock` record `std::this_thread::get_id()`; `unlock` asserts that id matches before clearing the flag. Release builds keep a flag-only object (no owner member).
 
 Algorithm and correctness deep dive:
 [SpinLock Analysis](../spallocator/docs/SpinLock_Analysis.md).

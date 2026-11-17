@@ -442,8 +442,10 @@ Correctness deep dive: [SpinLock Analysis](../spallocator/docs/SpinLock_Analysis
 When thread A unlocks and thread B later locks the same mutex, B must *see*
 A’s writes inside the critical section. Languages and CPUs need acquire/release
 semantics (and, for custom locks under TSan, explicit annotations) to make that
-guarantee real. You do not need the full memory model to use `scoped_lock`
-correctly — but it is why unlock-before-lock is not “just a flag.”
+guarantee real. You do not need the full memory model to use `scoped_lock` /
+`unique_lock` correctly — but it is why unlock-before-lock is not “just a flag.”
+Debug builds also record the owning thread id so a mismatched `unlock` aborts
+early instead of corrupting waiters.
 
 ---
 

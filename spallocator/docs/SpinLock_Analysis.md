@@ -974,6 +974,7 @@ wait_time = std::min(wait_time * 2, max_backoff);
 | **Spurious Wakeup** | ✅ HANDLED | Infinite loop re-checks after spurious wake |
 | **Lost Wakeup** | ✅ PREVENTED | wait() checks flag immediately |
 | **BasicLockable** | ✅ SATISFIED | Compatible with std::scoped_lock, std::unique_lock |
+| **Debug owner check** | ✅ (non-NDEBUG) | Abort on unlock-by-non-owner / unlock-while-free |
 
 ### Performance Summary
 
@@ -1010,7 +1011,7 @@ This SpinLock implementation is **correct, efficient, and well-designed** for it
 2. ⚠️ Not a reader-writer lock (no concurrent reads)
 3. ⚠️ No priority inheritance (can cause priority inversion)
 4. ⚠️ Tuning parameters are hardcoded (100 spins, 10 backoffs)
-5. ⚠️ No built-in debugging/statistics
+5. ⚠️ No runtime statistics; debug builds do track owner thread id (assert on bad unlock)
 
 ### Recommended Use Cases
 

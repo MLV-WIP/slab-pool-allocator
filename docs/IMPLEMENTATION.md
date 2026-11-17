@@ -631,8 +631,9 @@ truth if this summary drifts.
 | Multiple `Pool` instances | Separate domains; no shared locks between pools |
 | `LifetimeObserver` | Allocator-independent; see its own thread model |
 
-Prefer `std::scoped_lock` around `SpinLock` so exceptions cannot leave a lock
-held. Compile-time swap of the lock type is backlog item R5 on the research
+Prefer `std::scoped_lock` or `std::unique_lock` around `SpinLock` so exceptions
+cannot leave a lock held (`unique_lock` when early unlock / deferred lock is
+needed). Compile-time swap of the lock type is backlog item R5 on the research
 canvas.
 
 ---
@@ -709,11 +710,19 @@ Enabled when GCC defines `__SANITIZE_THREAD__` or Clang
 `__has_feature(thread_sanitizer)`. Without them, TSan may false-positive on data
 guarded only by `SpinLock`.
 
+### Debug owner tracking
+
+In non-`NDEBUG` builds, `SpinLock` stores the owning `std::thread::id` after a
+successful acquire and asserts on `unlock` that the caller is that owner (then
+clears the id before the release `clear`). That catches double-unlock and
+unlock-by-non-owner during development. Release builds omit the member and the
+checks — do not mix debug and release TUs against the same `SpinLock` layout.
+
 ### Usage guidance
 
 - Hold only for brief registry / bitmap work; do not call into user code under
   the lock  
-- Prefer RAII (`scoped_lock`) over bare `lock`/`unlock`  
+- Prefer RAII (`std::scoped_lock` / `std::unique_lock`) over bare `lock`/`unlock`  
 - API surface: [API.md — SpinLock](API.md#spinlock)  
 
 ---

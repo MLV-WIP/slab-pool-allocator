@@ -1287,6 +1287,29 @@ TEST(SpinLockTest, stdLock)
 }
 
 
+#ifndef NDEBUG
+// Owner tracking is debug-only; release builds omit these asserts.
+TEST(SpinLockTest, UnlockWithoutHoldAborts)
+{
+    SpinLock lock;
+    EXPECT_DEATH(lock.unlock(), "SpinLock");
+}
+
+
+TEST(SpinLockTest, UnlockByNonOwnerAborts)
+{
+    EXPECT_DEATH(
+        {
+            SpinLock lock;
+            lock.lock();
+            std::thread thief([&lock]() { lock.unlock(); });
+            thief.join();
+        },
+        "SpinLock");
+}
+#endif // NDEBUG
+
+
 TEST(SpinLockTest, ManyThreads)
 {
     std::size_t const num_cores = std::thread::hardware_concurrency();

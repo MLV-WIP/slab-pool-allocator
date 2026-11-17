@@ -34,9 +34,10 @@
 #define SPINLOCK_HPP_
 
 #include <atomic>
-#include <thread>
-#include <random>
+#include <cassert>
 #include <chrono>
+#include <random>
+#include <thread>
 
 
 // ThreadSanitizer annotations for custom synchronization primitives
@@ -69,86 +70,9 @@ public:
     SpinLock() = default;
     ~SpinLock() = default;
 
-    void lock()
-    {
-        // Single static instance per thread; efficient and thread safe
-        // without requiring additional costly synchronization
-        thread_local static std::minstd_rand gen{std::random_device{}()};
-        thread_local static std::uniform_int_distribution<int> dist{1, 100};
-
-        // Incrementing time to wait if we get contention. This is an
-        // escalating backoff strategy to avoid the thundering herd problem
-        // when the resource becomes available. This doesn't have to be highly
-        // random, and it doesn't even have to be highly accurate on the wait;
-        // the more important attribute is that it differentiates the wait
-        // times between different threads to encourage ordered acquisition
-        // attempts.
-        std::chrono::nanoseconds wait_time{dist(gen)};
-
-        // Must live across loop iterations; resetting inside the loop
-        // would make the wait() fallback unreachable.
-        int backoff_count = 0;
-
-        // Test-and-Test-and-set (TTAS) spin lock with escalating backoff
-        while (true)
-        {
-            // First, spin while the lock appears to be held
-            for (int i = 0; i < 100; ++i)
-            {
-                if (!lock_flag.test(std::memory_order_relaxed))
-                {
-                    // Lock appears free, try to acquire
-                    break;
-                }
-                std::this_thread::yield();
-            }
-
-            // Then, attempt to acquire the lock
-            if (!lock_flag.test_and_set(std::memory_order_acquire))
-            {
-                TSAN_ANNOTATE_HAPPENS_AFTER(this);
-                return; // Lock acquired
-            }
-
-            // Failed to acquire - use escalating backoff
-            if (backoff_count < 10)
-            {
-                std::this_thread::sleep_for(wait_time);
-                wait_time += wait_time;
-                ++backoff_count;
-            }
-            else
-            {
-                // After 10 attempts, use efficient blocking
-                lock_flag.wait(true, std::memory_order_relaxed);
-                // Loop back to try acquiring again
-            }
-        }
-    }
-
-    bool try_lock()
-    {
-        if (lock_flag.test(std::memory_order_relaxed))
-        {
-            return false; // Lock is already held elsewhere
-        }
-
-        // Attempt to acquire the lock without blocking
-        if (!lock_flag.test_and_set(std::memory_order_acquire))
-        {
-            TSAN_ANNOTATE_HAPPENS_AFTER(this);
-            return true; // Lock acquired
-        }
-        // Lock not acquired; return immediately
-        return false;
-    }
-
-    void unlock()
-    {
-        TSAN_ANNOTATE_HAPPENS_BEFORE(this);
-        lock_flag.clear(std::memory_order_release);
-        lock_flag.notify_one();
-    }
+    void lock();
+    bool try_lock();
+    void unlock();
 
 private: // methods
     SpinLock(const SpinLock&) = delete;
@@ -156,9 +80,124 @@ private: // methods
     SpinLock(SpinLock&&) = delete;
     SpinLock& operator=(SpinLock&&) = delete;
 
+    // Debug-only owner tracking: catch unlock-by-non-owner / double-unlock.
+    // Release builds omit these members and checks (flag-only SpinLock).
+    void mark_locked();
+    void mark_unlocked();
+
 private: // data members
     std::atomic_flag lock_flag = ATOMIC_FLAG_INIT;
+#ifndef NDEBUG
+    std::thread::id owner_{};
+#endif
 };
+
+
+inline void SpinLock::lock()
+{
+    // Single static instance per thread; efficient and thread safe
+    // without requiring additional costly synchronization
+    thread_local static std::minstd_rand gen{std::random_device{}()};
+    thread_local static std::uniform_int_distribution<int> dist{1, 100};
+
+    // Incrementing time to wait if we get contention. This is an
+    // escalating backoff strategy to avoid the thundering herd problem
+    // when the resource becomes available. This doesn't have to be highly
+    // random, and it doesn't even have to be highly accurate on the wait;
+    // the more important attribute is that it differentiates the wait
+    // times between different threads to encourage ordered acquisition
+    // attempts.
+    std::chrono::nanoseconds wait_time{dist(gen)};
+
+    // Must live across loop iterations; resetting inside the loop
+    // would make the wait() fallback unreachable.
+    int backoff_count = 0;
+
+    // Test-and-Test-and-set (TTAS) spin lock with escalating backoff
+    while (true)
+    {
+        // First, spin while the lock appears to be held
+        for (int i = 0; i < 100; ++i)
+        {
+            if (!lock_flag.test(std::memory_order_relaxed))
+            {
+                // Lock appears free, try to acquire
+                break;
+            }
+            std::this_thread::yield();
+        }
+
+        // Then, attempt to acquire the lock
+        if (!lock_flag.test_and_set(std::memory_order_acquire))
+        {
+            TSAN_ANNOTATE_HAPPENS_AFTER(this);
+            mark_locked();
+            return; // Lock acquired
+        }
+
+        // Failed to acquire - use escalating backoff
+        if (backoff_count < 10)
+        {
+            std::this_thread::sleep_for(wait_time);
+            wait_time += wait_time;
+            ++backoff_count;
+        }
+        else
+        {
+            // After 10 attempts, use efficient blocking
+            lock_flag.wait(true, std::memory_order_relaxed);
+            // Loop back to try acquiring again
+        }
+    }
+}
+
+
+inline bool SpinLock::try_lock()
+{
+    if (lock_flag.test(std::memory_order_relaxed))
+    {
+        return false; // Lock is already held elsewhere
+    }
+
+    // Attempt to acquire the lock without blocking
+    if (!lock_flag.test_and_set(std::memory_order_acquire))
+    {
+        TSAN_ANNOTATE_HAPPENS_AFTER(this);
+        mark_locked();
+        return true; // Lock acquired
+    }
+    // Lock not acquired; return immediately
+    return false;
+}
+
+
+inline void SpinLock::unlock()
+{
+    mark_unlocked();
+    TSAN_ANNOTATE_HAPPENS_BEFORE(this);
+    lock_flag.clear(std::memory_order_release);
+    lock_flag.notify_one();
+}
+
+
+inline void SpinLock::mark_locked()
+{
+#ifndef NDEBUG
+    assert(owner_ == std::thread::id{} &&
+           "SpinLock acquired while owner id still set");
+    owner_ = std::this_thread::get_id();
+#endif
+}
+
+
+inline void SpinLock::mark_unlocked()
+{
+#ifndef NDEBUG
+    assert(owner_ == std::this_thread::get_id() &&
+           "SpinLock::unlock by non-owner or while not held");
+    owner_ = std::thread::id{};
+#endif
+}
 
 
 #endif // SPINLOCK_HPP_
