@@ -314,6 +314,81 @@ TEST(PoolTest, ControlBlockSurvivesPoolWhenHandleRemains)
 }
 
 
+// P18 step 2: heap PoolHandle::create + retire when handles and allocs are 0.
+TEST(PoolTest, PoolHandleCreateRetiresWhenEmptyHandleDropped)
+{
+    PoolControlBlock* block = nullptr;
+    {
+        PoolHandle h = PoolHandle::create();
+        ASSERT_TRUE(static_cast<bool>(h));
+        block = h.control();
+        ASSERT_NE(block, nullptr);
+        EXPECT_TRUE(block->is_heap_owned());
+        EXPECT_TRUE(block->is_alive());
+        EXPECT_EQ(block->live_allocation_count(), 0u);
+        EXPECT_EQ(block->handle_ref_count(), 1u);
+        EXPECT_NE(h.get(), nullptr);
+    } // last handle drop → retire heap Pool → control block gone with last block_ref
+    // Cannot touch `block` here — it was deleted.
+}
+
+
+TEST(PoolTest, PoolHandleRetiresOnLastFreeAfterHandlesDropped)
+{
+    PoolHandle h = PoolHandle::create();
+    Pool* pool = h.get();
+    ASSERT_NE(pool, nullptr);
+    PoolControlBlock* block = h.control();
+
+    auto* p = pool->allocate(64);
+    EXPECT_EQ(block->live_allocation_count(), 1u);
+
+    // Drop all handles while an allocation remains — pool must stay alive.
+    h = PoolHandle{};
+    EXPECT_EQ(block->handle_ref_count(), 0u);
+    EXPECT_TRUE(block->is_alive());
+    EXPECT_EQ(block->pool(), pool);
+
+    // Last free retires the heap pool (and may delete `this` inside try_deallocate).
+    EXPECT_TRUE(pool->try_deallocate(p));
+    // Pool and its control block are gone; do not touch pool/block.
+}
+
+
+TEST(PoolTest, PoolHandleKeepsEmptyPoolAliveUntilLastHandleDropped)
+{
+    PoolHandle h1 = PoolHandle::create();
+    PoolControlBlock* block = h1.control();
+    PoolHandle h2 = h1;
+    EXPECT_EQ(block->handle_ref_count(), 2u);
+
+    auto* p = h1.get()->allocate(16);
+    h1.get()->deallocate(p);
+    EXPECT_EQ(block->live_allocation_count(), 0u);
+    EXPECT_TRUE(block->is_alive()); // handles still pin empty heap pool
+
+    h1 = PoolHandle{};
+    EXPECT_EQ(block->handle_ref_count(), 1u);
+    EXPECT_TRUE(block->is_alive());
+
+    h2 = PoolHandle{};
+    // retired — block deleted with last handle
+}
+
+
+TEST(PoolTest, StackPoolHandleDoesNotHeapRetireOnLastFree)
+{
+    Pool pool;
+    auto* p = pool.allocate(32);
+    PoolHandle h = pool.handle();
+    h = PoolHandle{}; // handle_refs → 0; stack pool must not be delete'd
+    pool.deallocate(p);
+    EXPECT_EQ(pool.live_allocation_count(), 0u);
+    EXPECT_TRUE(pool.control()->is_alive());
+    EXPECT_FALSE(pool.control()->is_heap_owned());
+}
+
+
 TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
 {
     Pool pool;

@@ -151,8 +151,8 @@ namespace spallocator
 
 
     // Share of a PoolControlBlock that pins handle_refs (keeps empty heap pools
-    // alive once PoolHandle::create lands). Obtained via Pool::handle() for now.
-    // Declared before Pool because Pool::handle() returns PoolHandle by value.
+    // alive). From Pool::handle() or PoolHandle::create(). Declared before Pool
+    // because Pool::handle() returns PoolHandle by value.
     class PoolHandle
     {
     public: // methods
@@ -163,6 +163,10 @@ namespace spallocator
 
         PoolHandle& operator=(const PoolHandle& other) noexcept;
         PoolHandle& operator=(PoolHandle&& other) noexcept;
+
+        // Heap domain: new Pool marked heap-owned; retired when handle_refs and
+        // live_allocs are both zero.
+        static PoolHandle create();
 
         // nullptr if empty handle or pool already marked dead.
         Pool* get() const noexcept;
@@ -255,18 +259,23 @@ namespace spallocator
         void release_block_ref() noexcept;
 
         void add_handle_ref() noexcept;
+        // Drops handle_refs; may delete heap-owned Pool if also idle.
         void release_handle_ref() noexcept;
 
         void note_alloc() noexcept;
-        void note_free() noexcept;
+        // Drops live_allocs; returns heap Pool to delete if handles also idle
+        // (caller must delete — may be `this` of an in-progress free).
+        Pool* note_free() noexcept;
 
         bool is_alive() const noexcept;
+        bool is_heap_owned() const noexcept;
+        void set_heap_owned() noexcept;
         Pool* pool() const noexcept;
         std::uint64_t live_allocation_count() const noexcept;
         std::uint64_t handle_ref_count() const noexcept;
         std::uint64_t block_ref_count() const noexcept;
 
-        // ~Pool / heap retire: publish dead, drop Pool*.
+        // ~Pool / successful retire: publish dead, drop Pool*.
         void mark_dead() noexcept;
 
     private: // methods
@@ -278,11 +287,15 @@ namespace spallocator
         PoolControlBlock(PoolControlBlock&&) = delete;
         PoolControlBlock& operator=(PoolControlBlock&&) = delete;
 
+        // If heap-owned, alive, and both counts zero: claim death and return Pool*.
+        Pool* try_retire() noexcept;
+
     private: // data members
         std::atomic<std::uint64_t> block_refs_{0};
         std::atomic<std::uint64_t> handle_refs_{0};
         std::atomic<std::uint64_t> live_allocs_{0};
         std::atomic<bool> alive_{false};
+        bool heap_owned_{false};
         Pool* pool_{nullptr};
     };
 
@@ -325,8 +338,13 @@ namespace spallocator
 
     inline void PoolControlBlock::release_handle_ref() noexcept
     {
-        handle_refs_.fetch_sub(1, std::memory_order_acq_rel);
-        // Heap Pool retirement when handles+allocs hit zero: step 2 (PoolHandle::create).
+        if (handle_refs_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            if (Pool* doomed = try_retire())
+            {
+                delete doomed;
+            }
+        }
     }
 
 
@@ -336,16 +354,31 @@ namespace spallocator
     }
 
 
-    inline void PoolControlBlock::note_free() noexcept
+    inline Pool* PoolControlBlock::note_free() noexcept
     {
-        live_allocs_.fetch_sub(1, std::memory_order_acq_rel);
-        // maybe_retire_pool: step 2.
+        if (live_allocs_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            return try_retire();
+        }
+        return nullptr;
     }
 
 
     inline bool PoolControlBlock::is_alive() const noexcept
     {
         return alive_.load(std::memory_order_acquire);
+    }
+
+
+    inline bool PoolControlBlock::is_heap_owned() const noexcept
+    {
+        return heap_owned_;
+    }
+
+
+    inline void PoolControlBlock::set_heap_owned() noexcept
+    {
+        heap_owned_ = true;
     }
 
 
@@ -380,9 +413,54 @@ namespace spallocator
     }
 
 
+    inline Pool* PoolControlBlock::try_retire() noexcept
+    {
+        if (!heap_owned_)
+        {
+            return nullptr;
+        }
+        if (handle_refs_.load(std::memory_order_acquire) != 0)
+        {
+            return nullptr;
+        }
+        if (live_allocs_.load(std::memory_order_acquire) != 0)
+        {
+            return nullptr;
+        }
+
+        bool expected = true;
+        if (!alive_.compare_exchange_strong(
+                expected, false,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            return nullptr;
+        }
+
+        // Lost a race with a new handle or alloc — undo and abort retire.
+        if (handle_refs_.load(std::memory_order_acquire) != 0 ||
+            live_allocs_.load(std::memory_order_acquire) != 0)
+        {
+            alive_.store(true, std::memory_order_release);
+            return nullptr;
+        }
+
+        Pool* doomed = pool_;
+        pool_ = nullptr;
+        return doomed;
+    }
+
+
     // ---------------------------------------------------------------------------
     // PoolHandle
     // ---------------------------------------------------------------------------
+
+    inline PoolHandle PoolHandle::create()
+    {
+        Pool* pool = new Pool();
+        pool->control()->set_heap_owned();
+        return PoolHandle(pool->control());
+    }
+
 
     inline PoolHandle::PoolHandle(PoolControlBlock* block) noexcept
         : block_(block)
@@ -727,7 +805,13 @@ namespace spallocator
                           alloc_size, static_cast<void*>(original_ptr), axis,
                           (slab == &large_slab) ? "large_slab" : "size_class");
             slab->deallocateItem(original_ptr);
-            control_->note_free();
+            // May return `this` for heap-owned idle pools — delete only after
+            // this method is done touching members.
+            Pool* doomed = control_->note_free();
+            if (doomed)
+            {
+                delete doomed;
+            }
             return true;
         }
         catch (...)

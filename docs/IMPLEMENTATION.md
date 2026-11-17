@@ -33,6 +33,7 @@ those responsibilities distinct while reading below.
 - [Address lookup](#address-lookup)
 - [Trim and RSS](#trim-and-rss)
 - [Smart pointers (design)](#smart-pointers-design)
+- [Pool lifetime (ControlBlock & PoolHandle)](#pool-lifetime-controlblock--poolhandle)
 - [LifetimeObserver (design)](#lifetimeobserver-design)
 - [Thread safety & lock ordering](#thread-safety--lock-ordering)
 - [SpinLock (design summary)](#spinlock-design-summary)
@@ -510,13 +511,70 @@ built-in size tracking rather than embedding a count in a custom deleter.
 
 ### Lifetime coupling
 
-The pool must outlive every smart pointer / container still holding its blocks.
-Destroying the pool first is currently **unsafe** — see
-[Known limits](#known-limits--readiness) and research backlog R3 (detect,
-refcount pool, or document hard).
+Smart pointers and `PoolAllocator` still store a raw `Pool&` today (deleter
+token / `!alive` no-op is the next P18 step). Prefer orderly teardown: destroy
+pointers before the pool. Heap domains should use `PoolHandle::create()` — see
+[Pool lifetime](#pool-lifetime-controlblock--poolhandle).
 
 API: [API.md — Smart pointers](API.md#smart-pointers).  
 Concepts: [CONCEPTS.md — RAII](CONCEPTS.md#raii-on-a-custom-pool).
+
+---
+
+## Pool lifetime (ControlBlock & PoolHandle)
+
+Every `Pool` is paired with a heap-allocated **`PoolControlBlock`**: alive flag,
+`live_allocs`, `handle_refs`, `block_refs`, and a back-pointer to the `Pool`.
+The control block can outlive the `Pool` (e.g. a `PoolHandle` still held after
+arena `~Pool`) so observers can see `!alive` safely.
+
+### Heap-owned vs not
+
+The control block carries a **`heap_owned_`** flag (not an atomic). It answers
+one question only: *may this runtime automatically `delete` the `Pool` object?*
+
+| How the `Pool` was born | `heap_owned_` | Who destroys the `Pool`? |
+|-------------------------|---------------|---------------------------|
+| Stack / `unique_ptr<Pool>` / `new Pool` without `create` | **false** (default) | Caller: `~Pool` on scope exit, `delete`, etc. |
+| `PoolHandle::create()` | **true** | Runtime: when `handle_refs == 0` **and** `live_allocs == 0` |
+
+`Pool`’s constructor always builds a control block with `heap_owned_ == false`.
+Only `PoolHandle::create()` flips the flag:
+
+1. `new Pool()` — ordinary ctor (control block exists, not heap-owned).  
+2. `control()->set_heap_owned()` — mark this domain eligible for auto-retire.  
+3. Return a `PoolHandle` sharing that control block (`handle_refs` / `block_refs` bumped).
+
+`Pool::handle()` on a stack (or otherwise non-`create`) pool also returns a
+`PoolHandle` and bumps `handle_refs`, but it **does not** set `heap_owned_`.
+Dropping those handles never `delete`s the stack object.
+
+### Retirement gate (`try_retire`)
+
+Last handle drop and last successful free both call `try_retire()`:
+
+1. If `!heap_owned_` → return immediately (stack / caller-owned pools).  
+2. If `handle_refs != 0` or `live_allocs != 0` → not idle.  
+3. Else CAS `alive` true→false, re-check counts, then return the `Pool*` for
+   `delete` (caller deletes; on the free path that may be `delete this` after
+   `try_deallocate` finishes touching members).
+
+So the distinction is **not** “was the `Pool` allocated with `new`?” (a raw
+`new Pool` is still not heap-owned for auto-retire). It is **explicitly
+opt-in** via `PoolHandle::create()`, which both heap-allocates and sets the
+flag. That keeps arena-style stack `~Pool` (bulk reclaim while handles may
+still observe the control block) separate from handle-tied heap domains that
+self-delete when idle.
+
+```text
+Pool pool;                 // heap_owned_ = false
+auto h = pool.handle();    // pins handle_refs; drop never delete's pool
+~pool / leave scope        // mark_dead; caller-driven destruction
+
+auto h = PoolHandle::create();  // new Pool + set_heap_owned()
+// … allocate / free / copy handles …
+// when last handle gone AND live_allocs == 0 → delete Pool
+```
 
 ---
 
@@ -806,7 +864,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 
 | Topic | Status |
 |-------|--------|
-| Pool destroy while clients hold pointers | **Unsafe today** — pool must outlive smart pointers / containers; mitigations in research backlog R3 |
+| Pool destroy while clients hold pointers | **P18 in progress** — `PoolControlBlock` + `PoolHandle::create` retire; deleter `!alive` no-op still pending |
 | Alloc bit scan | Next-fit + CTZ word search (production); freelist if still hot |
 | Address map | O(log m); denser structures if free is hot |
 | Fixed size-class ladders | Deliberate; shaped buffers are backlog R2 |
