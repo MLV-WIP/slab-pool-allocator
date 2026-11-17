@@ -1510,7 +1510,7 @@ TSAN_ANNOTATE_HAPPENS_AFTER(this);   // → __tsan_acquire
 TSAN_ANNOTATE_HAPPENS_BEFORE(this);  // → __tsan_release
 ```
 
-Without these, TSan may report false races on data protected only by `SpinLock`. The macros are no-ops unless `TSAN_ENABLED` is set (today via Clang `__has_feature(thread_sanitizer)`). Full correctness write-up: [`spallocator/docs/SpinLock_Analysis.md`](spallocator/docs/SpinLock_Analysis.md).
+Without these, TSan may report false races on data protected only by `SpinLock`. The macros are no-ops unless `TSAN_ENABLED` is set (GCC `__SANITIZE_THREAD__` or Clang `__has_feature(thread_sanitizer)`). Full correctness write-up: [`spallocator/docs/SpinLock_Analysis.md`](spallocator/docs/SpinLock_Analysis.md).
 
 ---
 

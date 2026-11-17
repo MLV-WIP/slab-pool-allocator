@@ -40,8 +40,11 @@
 
 
 // ThreadSanitizer annotations for custom synchronization primitives
-// These tell TSan about happens-before relationships in our SpinLock
-#ifdef __has_feature
+// These tell TSan about happens-before relationships in our SpinLock.
+// GCC defines __SANITIZE_THREAD__; Clang uses __has_feature(thread_sanitizer).
+#if defined(__SANITIZE_THREAD__)
+  #define TSAN_ENABLED 1
+#elif defined(__has_feature)
   #if __has_feature(thread_sanitizer)
     #define TSAN_ENABLED 1
   #endif

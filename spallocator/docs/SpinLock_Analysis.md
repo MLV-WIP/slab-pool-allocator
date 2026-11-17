@@ -722,8 +722,7 @@ extern "C" {
 
 **Design notes**:
 - Annotations compile to nothing when TSan is disabled (zero overhead in production)
-- Enabled today when Clang `__has_feature(thread_sanitizer)` is true (`TSAN_ENABLED`)
-- **Caveat**: GCC typically defines `__SANITIZE_THREAD__` instead; under GCC `-fsanitize=thread` these macros may still be no-ops unless the gate is extended
+- Enabled when GCC `__SANITIZE_THREAD__` or Clang `__has_feature(thread_sanitizer)` is true (`TSAN_ENABLED`)
 - Uses TSan's internal `__tsan_acquire` and `__tsan_release` functions
 - The naming is a bit confusing: `__tsan_release` corresponds to HAPPENS_BEFORE
 
