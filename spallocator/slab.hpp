@@ -33,11 +33,13 @@
 #ifndef SLAP_HPP_
 #define SLAP_HPP_
 
+#include <bit>
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <format>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -167,11 +169,17 @@ namespace spallocator
 
         std::vector<std::byte*> slab_data;
         // Per-slab slot maps stay std::bitset (compile-time slot count).
+        // Convention: bit set ⇒ slot occupied; clear ⇒ free.
         std::vector<std::bitset<slab_alloc_size / ElemSize>> slab_map;
         static constexpr std::size_t max_slabs{4_GB / slab_alloc_size};
         DynBitset slab_available_map;
 
         std::map<std::byte*, std::size_t> base_address_map;
+
+        // Next-fit cursors for allocateItem (indices into slab_data / freemap).
+        // Reset when reclaim/swap-with-last invalidates buffer indices.
+        std::size_t alloc_cursor_slab_{0};
+        std::size_t alloc_cursor_slot_{0};
 
         SpinLock slab_lock;
     };
@@ -313,6 +321,58 @@ namespace spallocator
     }
 
 
+    // Next clear bit (free slot) at or after `start`. Returns N if none.
+    // Word walk + std::countr_zero — same CTZ hardware as libstdc++
+    // bitset::_Find_next, without relying on that GNU extension.
+    // Freemap convention: set ⇒ occupied, clear ⇒ free.
+    template<std::size_t N>
+    std::size_t find_next_clear_bit(const std::bitset<N>& occupied, std::size_t start)
+    {
+        if (start >= N)
+        {
+            return N;
+        }
+
+        using word_t = unsigned long long;
+        constexpr std::size_t kWordBits = std::numeric_limits<word_t>::digits; // 64
+        // Low-kWordBits mask in an N-bit bitset (for to_ullong extraction).
+        constexpr std::bitset<N> kLowWordMask = []() constexpr {
+            std::bitset<N> m;
+            const std::size_t bits = N < kWordBits ? N : kWordBits;
+            for (std::size_t i = 0; i < bits; ++i)
+            {
+                m.set(i);
+            }
+            return m;
+        }();
+
+        for (std::size_t base = (start / kWordBits) * kWordBits; base < N;
+             base += kWordBits)
+        {
+            const std::size_t bits_in_word =
+                (base + kWordBits <= N) ? kWordBits : (N - base);
+            const word_t width_mask =
+                (bits_in_word == kWordBits)
+                    ? ~word_t{0}
+                    : ((word_t{1} << bits_in_word) - word_t{1});
+
+            // Extract occupied bits [base, base+bits_in_word) as a machine word.
+            const word_t occupied_word =
+                ((occupied >> base) & kLowWordMask).to_ullong() & width_mask;
+
+            const std::size_t bit0 = (base < start) ? (start - base) : 0;
+            const word_t skip_mask =
+                (bit0 == 0) ? ~word_t{0} : (~word_t{0} << bit0);
+            const word_t free_word = (~occupied_word) & width_mask & skip_mask;
+            if (free_word != 0)
+            {
+                return base + static_cast<std::size_t>(std::countr_zero(free_word));
+            }
+        }
+        return N;
+    }
+
+
     // ---------------------------------------------------------------------------
     // Slab
     // ---------------------------------------------------------------------------
@@ -330,37 +390,84 @@ namespace spallocator
 
         std::scoped_lock<SpinLock> guard(slab_lock);
 
-        // Scan live slabs only. When every live slab is full, grow then retry
-        // (no phantom availability bits past slab_data.size()).
+        // Next-fit: resume at (alloc_cursor_slab_, alloc_cursor_slot_). When every
+        // live buffer is full, grow then retry.
         for (;;)
         {
-            for (std::size_t slab_index = 0; slab_index < slab_data.size(); ++slab_index)
+            const std::size_t nslabs = slab_data.size();
+            if (nslabs == 0)
             {
-                if (!slab_available_map.test(slab_index))
-                {
-                    continue;
-                }
+                allocateNewSlab();
+                alloc_cursor_slab_ = 0;
+                alloc_cursor_slot_ = 0;
+                continue;
+            }
 
-                auto& slab_slots = slab_map[slab_index];
-                for (std::size_t item_index = 0; item_index < slab_slots.size(); ++item_index)
+            if (alloc_cursor_slab_ >= nslabs)
+            {
+                alloc_cursor_slab_ = 0;
+                alloc_cursor_slot_ = 0;
+            }
+
+            std::size_t slab_index = alloc_cursor_slab_;
+            std::size_t slot_start = alloc_cursor_slot_;
+            for (std::size_t visited = 0; visited < nslabs; ++visited)
+            {
+                if (slab_available_map.test(slab_index))
                 {
-                    if (!slab_slots.test(item_index))
+                    auto& slab_slots = slab_map[slab_index];
+                    // Forward from the cursor; if that misses and the cursor was
+                    // mid-buffer, wrap within this buffer before leaving it.
+                    std::size_t item_index =
+                        find_next_clear_bit(slab_slots, slot_start);
+                    if (item_index >= slab_slots.size() && slot_start > 0)
+                    {
+                        item_index = find_next_clear_bit(slab_slots, 0);
+                        if (item_index >= slot_start)
+                        {
+                            item_index = slab_slots.size(); // already scanned
+                        }
+                    }
+                    if (item_index < slab_slots.size())
                     {
                         slab_slots.set(item_index);
                         if (slab_slots.all())
                         {
                             slab_available_map.reset(slab_index);
                         }
+
+                        // Advance cursor past this slot (next-fit).
+                        alloc_cursor_slab_ = slab_index;
+                        alloc_cursor_slot_ = item_index + 1;
+                        if (alloc_cursor_slot_ >= slab_slots.size())
+                        {
+                            alloc_cursor_slot_ = 0;
+                            alloc_cursor_slab_ = slab_index + 1;
+                            if (alloc_cursor_slab_ >= nslabs)
+                            {
+                                alloc_cursor_slab_ = 0;
+                            }
+                        }
+
                         debug_println("Item allocated ({}/{}), slab_map<{},{}>: {}",
                                       slab_index, item_index, ElemSize, Alignment,
                                       printHex(slab_slots));
                         return slab_data[slab_index] + item_index * ElemSize;
                     }
                 }
+
+                slab_index = slab_index + 1;
+                if (slab_index >= nslabs)
+                {
+                    slab_index = 0;
+                }
+                slot_start = 0; // only the first buffer uses the saved slot cursor
             }
 
             // allocateNewSlab throws when max_slabs is reached.
             allocateNewSlab();
+            alloc_cursor_slab_ = slab_data.size() - 1;
+            alloc_cursor_slot_ = 0;
             debug_println("New slab<{},{}> allocated, total slabs: {}",
                           ElemSize, Alignment, slab_data.size());
         }
@@ -538,6 +645,10 @@ namespace spallocator
         slab_data.pop_back();
         slab_map.pop_back();
         slab_available_map.pop_back();
+
+        // Buffer indices may have been swapped; drop the next-fit hint.
+        alloc_cursor_slab_ = 0;
+        alloc_cursor_slot_ = 0;
 
         ::operator delete[](doomed, std::align_val_t{Alignment});
     }

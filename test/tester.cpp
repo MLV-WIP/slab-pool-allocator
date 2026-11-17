@@ -50,6 +50,169 @@ using namespace std::literals;
 using namespace spallocator;
 
 
+TEST(BitsetSearchTest, FindNextClearBit)
+{
+    constexpr std::size_t N = 256;
+    std::bitset<N> bits;
+
+    EXPECT_EQ(find_next_clear_bit(bits, 0), 0u);
+    EXPECT_EQ(find_next_clear_bit(bits, 63), 63u);
+    EXPECT_EQ(find_next_clear_bit(bits, 64), 64u);
+    EXPECT_EQ(find_next_clear_bit(bits, N), N);
+
+    bits.set();
+    EXPECT_EQ(find_next_clear_bit(bits, 0), N);
+
+    bits.reset(0);
+    bits.reset(63);
+    bits.reset(64);
+    bits.reset(200);
+    EXPECT_EQ(find_next_clear_bit(bits, 0), 0u);
+    EXPECT_EQ(find_next_clear_bit(bits, 1), 63u);
+    EXPECT_EQ(find_next_clear_bit(bits, 63), 63u);
+    EXPECT_EQ(find_next_clear_bit(bits, 64), 64u);
+    EXPECT_EQ(find_next_clear_bit(bits, 65), 200u);
+    EXPECT_EQ(find_next_clear_bit(bits, 201), N);
+}
+
+
+TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
+{
+    // After filling slots [0, cursor), a free bit below the cursor must not
+    // steal the next alloc — next-fit continues forward.
+    Slab<16, 16> slab;
+    constexpr std::size_t kSlots = 4_KB / 16;
+    std::vector<std::byte*> items;
+    items.reserve(kSlots);
+
+    constexpr std::size_t kCursor = 200;
+    for (std::size_t i = 0; i < kCursor; ++i)
+    {
+        items.push_back(slab.allocateItem(16));
+    }
+    std::byte* const base = items.front();
+    slab.deallocateItem(items[50]);
+    items[50] = nullptr;
+
+    std::byte* next = slab.allocateItem(16);
+    EXPECT_EQ(next, base + kCursor * 16);
+    items.push_back(next);
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+
+    for (auto* p : items)
+    {
+        if (p)
+        {
+            slab.deallocateItem(p);
+        }
+    }
+}
+
+
+TEST(SlabTest, NextFitWrapsWithinBuffer)
+{
+    // Cursor past the only free slot → wrap within the same buffer (no grow).
+    Slab<16, 16> slab;
+    constexpr std::size_t kSlots = 4_KB / 16;
+    std::vector<std::byte*> items;
+    items.reserve(kSlots);
+    for (std::size_t i = 0; i < kSlots; ++i)
+    {
+        items.push_back(slab.allocateItem(16));
+    }
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+    std::byte* const base = items.front();
+
+    // Move cursor just past a high slot, then free a low slot only.
+    slab.deallocateItem(items[250]);
+    items[250] = slab.allocateItem(16); // cursor now at 251
+    EXPECT_EQ(items[250], base + 250 * 16);
+
+    slab.deallocateItem(items[10]);
+    items[10] = nullptr;
+
+    std::byte* wrapped = slab.allocateItem(16);
+    EXPECT_EQ(wrapped, base + 10 * 16);
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+    items[10] = wrapped;
+
+    for (auto* p : items)
+    {
+        slab.deallocateItem(p);
+    }
+}
+
+
+TEST(SlabTest, NextFitSurvivesReclaim)
+{
+    Slab<16, 16> slab;
+    constexpr std::size_t kSlots = 4_KB / 16;
+    std::vector<std::byte*> items;
+    items.reserve(kSlots + 1);
+    for (std::size_t i = 0; i < kSlots + 1; ++i)
+    {
+        items.push_back(slab.allocateItem(16));
+    }
+    EXPECT_EQ(slab.getSlabCount(), 2u);
+
+    for (auto* p : items)
+    {
+        slab.deallocateItem(p);
+    }
+    EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+
+    // Cursor was reset on reclaim; alloc/free still works on the survivor.
+    auto* p = slab.allocateItem(16);
+    ASSERT_NE(p, nullptr);
+    slab.deallocateItem(p);
+}
+
+
+// Microbench evidence for P16 (next-fit + CTZ). Not a pass/fail gate on time —
+// records ns/op via RecordProperty; prefer BUILD_TYPE=release for numbers.
+TEST(SlabTest, AllocFreeChurnMicrobench)
+{
+    Slab<16, 16> slab;
+    constexpr std::size_t kSlots = 4_KB / 16;
+#if defined(NDEBUG)
+    constexpr int kIters = 500000;
+#else
+    constexpr int kIters = 20000; // keep sanitizer/debug suites snappy
+#endif
+
+    // Warm: fill then free so the freemap is dense and the cursor is live.
+    std::vector<std::byte*> warm;
+    warm.reserve(kSlots);
+    for (std::size_t i = 0; i < kSlots; ++i)
+    {
+        warm.push_back(slab.allocateItem(16));
+    }
+    for (auto* p : warm)
+    {
+        slab.deallocateItem(p);
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kIters; ++i)
+    {
+        std::byte* p = slab.allocateItem(16);
+        slab.deallocateItem(p);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    const double ns_per_op = static_cast<double>(ns) / static_cast<double>(kIters);
+    RecordProperty("alloc_free_pairs", kIters);
+    // RecordProperty is int-sized; store ms total to avoid overflow.
+    RecordProperty("total_ms", static_cast<int>(ns / 1'000'000));
+    RecordProperty("ns_per_alloc_free", static_cast<int>(ns_per_op));
+    // Sanity: churn must complete and stay on the warmed single buffer.
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_GT(ns, 0);
+}
+
+
 TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
 {
     Slab<16, 16> slab;

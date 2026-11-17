@@ -323,15 +323,16 @@ Compare metadata cost for a 4 KiB buffer of 16-byte slots (256 cells):
 | `bool` array | 256 bytes |
 | Intrusive freelist of pointers | Often 8 bytes × free slots, plus poorer locality |
 
-Bits are tiny and scan well on modern CPUs. The trade-off is that “find a free
-slot” may scan bits instead of popping an O(1) freelist node.
+Bits are tiny and scan well on modern CPUs. “Find a free slot” walks those bits
+(with a next-fit cursor and word/CTZ search in this project) instead of popping
+an O(1) freelist node.
 
 ### Two-level filtering
 
 Naïvely scanning every slot in every buffer would be wasteful. A coarse
 **availability map** answers: “does this buffer still have *any* free slot?”
-Fully full buffers are skipped. Only then does the allocator scan bits inside a
-candidate buffer.
+Fully full buffers are skipped. Only then does the allocator search bits inside
+a candidate buffer.
 
 That pattern — coarse filter, then fine structure — shows up often (page tables,
 OS allocators, databases).
@@ -349,16 +350,16 @@ Reclaim is exposed on the **pool** as `Pool::trim()`, which asks each size-class
 slab to drop empty buffers — a pool-level policy knob over slab-level storage.
 Large (`SlabProxy`) allocations already return memory on each free.
 
-### Scan-from-zero vs freelist
+### Next-fit cursor vs freelist
 
 | Strategy | Idea | Cost |
 |----------|------|------|
-| **Bitset scan** (this project) | Find first free bit (here: from index 0) | Compact; worst case linear in slots per buffer |
-| **Freelist / next-fit cursor** | Explicit list or cursor of free slots | O(1) hot path; more metadata / complexity |
+| **Next-fit + bitset** (this project) | Resume near the last alloc; word/CTZ find clear bits | Compact metadata; amortized O(1) under local churn |
+| **Intrusive freelist** | Explicit list of free slots | Strict O(1) pop; more metadata / trim complexity |
 
-For 4 KiB slabs, scan-from-zero is a solid production default until profiles say
-otherwise. A freelist is both a classic homework contrast and a real follow-on
-optimization — see IMPLEMENTATION Future Work.
+Bitsets remain the occupancy source of truth; the cursor only changes where the
+search starts. A freelist is the usual next step if profiles still show scan
+cost — see IMPLEMENTATION Future Work.
 
 ---
 

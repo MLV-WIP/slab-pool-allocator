@@ -371,10 +371,21 @@ when idle).
 
 ### Alloc path (conceptual)
 
-1. Find a buffer whose availability bit is set (skip full buffers)  
-2. Scan that buffer’s freemap **from bit 0 upward** for a clear bit  
-3. Set the bit; if the buffer is now full, clear its availability bit  
-4. Return `base + bit_index * ElemSize` as the slot base  
+1. Resume at the slab’s **next-fit cursor** `(buffer_index, slot_index)`  
+2. Skip buffers whose availability bit is clear (full)  
+3. Find the next clear freemap bit at or after the cursor via **word scan +
+   `std::countr_zero`** (portable CTZ; same hardware class as libstdc++
+   `bitset::_Find_next`, without relying on that GNU extension). If the forward
+   scan misses and the cursor was mid-buffer, **wrap once within that buffer**
+   before moving on  
+4. Set the bit; if the buffer is now full, clear its availability bit  
+5. Advance the cursor past the taken slot; return
+   `base + bit_index * ElemSize` as the slot base  
+6. If a full wrap of live buffers finds nothing: grow (`allocateNewSlab`), point
+   the cursor at the new buffer, retry  
+
+`reclaimEmptySlabs` / `destroySlabAt` **reset** the cursor to `(0,0)` because
+swap-with-last can invalidate buffer indices.
 
 ### Free path (conceptual)
 
@@ -383,13 +394,16 @@ when idle).
 3. Reject if already free or not an exact slot boundary  
 4. Clear freemap bit; set availability bit (buffer has room again)  
 
-### Why scan-from-zero?
+Free does **not** move the alloc cursor (next-fit does not require it).
 
-Compact metadata, simple invariants, and acceptable cost for 4 KiB buffers
-until profiles say otherwise. A freelist or next-fit cursor can make the hot
-path strictly O(1) at the cost of extra words per free slot and more complex
-coalesce/debug stories — a **slab-local** optimization (Future work), not a
-change to the pool domain model.
+### Why next-fit + CTZ (not freelist)?
+
+Bitsets stay the single source of truth for occupancy and “is full?”.
+Next-fit removes repeated re-scans of already-occupied low bits under typical
+LIFO/local churn; word/CTZ search makes a cold scan **O(slots / word_bits)**
+instead of one `test()` per slot. An intrusive freelist can make alloc strictly
+O(1) but duplicates free-set state and complicates trim’s swap-with-last — keep
+it as a profile-driven follow-on if cursors are not enough.
 
 ---
 
@@ -710,19 +724,19 @@ guarded only by `SpinLock`.
 
 | Operation | Amortized | Notes |
 |-----------|-----------|-------|
-| Alloc (size class) | O(1) | Worst case: scan all slots in one buffer |
+| Alloc (size class) | O(1) | Next-fit cursor; cold scan O(slots / 64) via CTZ |
 | Free (size class) | O(log m) | Address map; m = buffers in that slab |
 | `selectSlab` | O(1) | Ladder of compares |
 | `SpinLock` uncontended | O(1) | Single atomic |
 | `SpinLock` contended | depends | Spin → sleep backoff → `wait` |
 | `SlabProxy` alloc/free | OS dependent | No slot freemap |
-| `trim` | O(classes × buffers) | Quiet-path; not on hot alloc |
+| `trim` | O(classes × buffers) | Quiet-path; resets next-fit cursors |
 
 “Amortized O(1)” alloc assumes the availability map keeps you on a non-full
-buffer and that freemap scans stay short relative to work done with the object.
-A pathological pattern (one free bit at the end of a busy buffer, every time)
-still costs a full scan of that buffer’s bits — hence the freelist/cursor
-follow-on.
+buffer and that the next-fit cursor stays near free slots (typical local
+churn). A pathological pattern (one free bit far from the cursor every time)
+still walks words across the buffer — freelist remains the follow-on if that
+shows up hot.
 
 ### Fragmentation
 
@@ -743,8 +757,12 @@ Waste has three buckets:
 | `trim` | Reclaim RSS after spikes without changing the hot path |
 | `SlabProxy` | Avoids forcing huge objects through size-class bookkeeping |
 
-Measure before replacing bit scans or the address map — both are deliberate
-simplicity until profiles disagree.
+Measure before replacing the address map or moving to a freelist — both are
+deliberate simplicity until profiles disagree. `SlabTest.AllocFreeChurnMicrobench`
+records ns/op for 16B alloc/free pairs. Snapshot on this host after P16
+(`BUILD_TYPE=release ENABLE_COVERAGE=no`): ~3.8 µs per warmed alloc+free pair
+(500k iters). Use that test to compare hosts/commits; do not treat the absolute
+number as portable.
 
 ---
 
@@ -780,7 +798,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 | Topic | Status |
 |-------|--------|
 | Pool destroy while clients hold pointers | **Unsafe today** — pool must outlive smart pointers / containers; mitigations in research backlog R3 |
-| Alloc bit scan | Production default; freelist/cursor if profiles demand |
+| Alloc bit scan | Next-fit + CTZ word search (production); freelist if still hot |
 | Address map | O(log m); denser structures if free is hot |
 | Fixed size-class ladders | Deliberate; shaped buffers are backlog R2 |
 | Lock type | Hard-wired `SpinLock`; pluggable primitive is backlog R5 |
@@ -799,7 +817,8 @@ lifetime versus smart pointers.
 Near-term / opportunistic:
 
 - Richer allocation / fragmentation metrics API  
-- Freelist or next-fit cursor if scan cost dominates  
+- Intrusive freelist if next-fit + CTZ still dominate profiles  
+- Denser free address lookup if `std::map` shows hot at large `m`  
 - Thread-local caches; NUMA-aware buffers  
 - Lock-free fast paths for common size classes  
 - Configurable SpinLock backoff parameters  
