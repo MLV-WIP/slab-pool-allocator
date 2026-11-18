@@ -167,7 +167,9 @@ namespace spallocator
     // Single object: placement new; on ctor throw, return the slot (strong guarantee).
     template<typename T, typename... Args>
         requires (!std::is_array_v<T>)
-    constexpr unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, Args&&... args)
+    // Not constexpr: PoolBlockToken is not a literal type (non-trivial dtor),
+    // and these helpers perform runtime pool allocation / placement-new.
+    unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, Args&&... args)
     {
         static_assert(alignof(T) <= kMaxAlignment,
             "make_pool_unique: alignof(T) exceeds Pool max alignment (64)");
@@ -188,14 +190,14 @@ namespace spallocator
 
     template<typename T, typename... Args>
         requires (!std::is_array_v<T>)
-    constexpr unique_pool_ptr<T> make_pool_unique(Pool& pool, Args&&... args)
+    unique_pool_ptr<T> make_pool_unique(Pool& pool, Args&&... args)
     {
         return make_pool_unique<T>(pool.block_token(), std::forward<Args>(args)...);
     }
 
     template<typename T, typename... Args>
         requires (!std::is_array_v<T>)
-    constexpr unique_pool_ptr<T> make_pool_unique(PoolHandle const& handle, Args&&... args)
+    unique_pool_ptr<T> make_pool_unique(PoolHandle const& handle, Args&&... args)
     {
         return make_pool_unique<T>(handle.block_token(), std::forward<Args>(args)...);
     }
@@ -204,7 +206,7 @@ namespace spallocator
     // written). Strong exception guarantee if an element ctor throws.
     template<typename T>
         requires std::is_unbounded_array_v<T>
-    constexpr unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, std::size_t size)
+    unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, std::size_t size)
     {
         using ElementType = std::remove_extent_t<T>;
         static_assert(alignof(ElementType) <= kMaxAlignment,
@@ -241,14 +243,14 @@ namespace spallocator
 
     template<typename T>
         requires std::is_unbounded_array_v<T>
-    constexpr unique_pool_ptr<T> make_pool_unique(Pool& pool, std::size_t size)
+    unique_pool_ptr<T> make_pool_unique(Pool& pool, std::size_t size)
     {
         return make_pool_unique<T>(pool.block_token(), size);
     }
 
     template<typename T>
         requires std::is_unbounded_array_v<T>
-    constexpr unique_pool_ptr<T> make_pool_unique(PoolHandle const& handle, std::size_t size)
+    unique_pool_ptr<T> make_pool_unique(PoolHandle const& handle, std::size_t size)
     {
         return make_pool_unique<T>(handle.block_token(), size);
     }
