@@ -190,12 +190,18 @@ The repo-root [`IMPLEMENTATION.md`](IMPLEMENTATION.md) redirects here. Source he
 
 ## Testing
 
-The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation, thread safety, smart pointers, SpinLock contention, `PoolAllocator` / STL integration, and `LifetimeObserver` (including concurrent `isAlive`).
+The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, smart-pointer exception safety, SpinLock contention, `PoolAllocator` / STL integration, and `LifetimeObserver` (including concurrent `isAlive`).
 
 ```bash
 make test
 # equivalent:
 make && ./obj/addrsan/tester
+```
+
+CI (`.github/workflows/c-cpp.yml`) runs the full suite for **release** (`-O3 -DNDEBUG`, plus coverage), **addrsan**, and **threadsan**, on both clang and gcc. Locally:
+
+```bash
+./configure --build-type=release --enable-tests && make test
 ```
 
 ## Future Work

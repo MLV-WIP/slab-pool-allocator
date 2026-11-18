@@ -961,6 +961,24 @@ TEST(PoolTest, DeallocateValidatesHeader)
 }
 
 
+// Must pass under NDEBUG: interior user pointers are rejected via exceptions /
+// try_deallocate false, not debug-only asserts.
+TEST(PoolTest, DeallocateRejectsInteriorPointer)
+{
+    Pool pool;
+    auto* p = pool.allocate(64);
+    ASSERT_NE(p, nullptr);
+
+    EXPECT_THROW(pool.deallocate(p + 1), std::invalid_argument);
+    EXPECT_FALSE(pool.try_deallocate(p + 1));
+    EXPECT_THROW(pool.deallocate(p + 32), std::invalid_argument);
+    EXPECT_FALSE(pool.try_deallocate(p + 32));
+
+    // Exact user pointer still frees cleanly after rejected interiors.
+    EXPECT_NO_THROW(pool.deallocate(p));
+}
+
+
 TEST(PoolAllocatorTest, DeallocateIsNoexcept)
 {
     Pool pool;
@@ -1199,6 +1217,45 @@ TEST(PoolTest, uniquePoolPtrSingleStrongExceptionSafety)
 
     ThrowOnNthConstruct::throw_at = -1;
     auto ok = make_pool_unique<ThrowOnNthConstruct>(pool);
+    EXPECT_EQ(ThrowOnNthConstruct::live, 1);
+    ok.reset();
+    EXPECT_EQ(ThrowOnNthConstruct::live, 0);
+}
+
+
+// Must pass under NDEBUG (exceptions, not runtime_assert).
+TEST(PoolTest, sharedPoolPtrArrayStrongExceptionSafety)
+{
+    Pool pool;
+    ThrowOnNthConstruct::live = 0;
+    ThrowOnNthConstruct::throw_at = 3;
+
+    EXPECT_THROW(
+        (void)make_pool_shared<ThrowOnNthConstruct[]>(pool, 5),
+        std::runtime_error);
+    EXPECT_EQ(ThrowOnNthConstruct::live, 0);
+
+    ThrowOnNthConstruct::throw_at = -1;
+    auto ok = make_pool_shared<ThrowOnNthConstruct[]>(pool, 3);
+    EXPECT_EQ(ThrowOnNthConstruct::live, 3);
+    ok.reset();
+    EXPECT_EQ(ThrowOnNthConstruct::live, 0);
+}
+
+
+TEST(PoolTest, sharedPoolPtrSingleStrongExceptionSafety)
+{
+    Pool pool;
+    ThrowOnNthConstruct::live = 0;
+    ThrowOnNthConstruct::throw_at = 0;
+
+    EXPECT_THROW(
+        (void)make_pool_shared<ThrowOnNthConstruct>(pool),
+        std::runtime_error);
+    EXPECT_EQ(ThrowOnNthConstruct::live, 0);
+
+    ThrowOnNthConstruct::throw_at = -1;
+    auto ok = make_pool_shared<ThrowOnNthConstruct>(pool);
     EXPECT_EQ(ThrowOnNthConstruct::live, 1);
     ok.reset();
     EXPECT_EQ(ThrowOnNthConstruct::live, 0);
