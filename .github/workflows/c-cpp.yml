@@ -16,6 +16,8 @@ jobs:
         #arch: [amd64, arm64]
         arch: [amd64]
         compiler: [clang, gcc]
+        # auto = newest dialect the toolchain accepts; c++20 pins the floor.
+        cxxstd: [auto, c++20]
         # memsan is a valid local BUILD_TYPE but omitted here: it needs an
         # MSan-instrumented C++ runtime and gtest from the host toolchain.
         sanitizer-config:
@@ -49,8 +51,8 @@ jobs:
         echo "Current vm.mmap_rnd_bits=$(sysctl -n vm.mmap_rnd_bits)"
         sysctl -w vm.mmap_rnd_bits=28
         echo "Updated vm.mmap_rnd_bits=$(sysctl -n vm.mmap_rnd_bits)"
-    - name: configure (${{ matrix.sanitizer-config.name }})
-      run: ./configure ${{ matrix.sanitizer-config.enable-flags }} --enable-tests --enable-demo --build-type=${{ matrix.sanitizer-config.build-type }}
+    - name: configure (${{ matrix.sanitizer-config.name }}, cxxstd=${{ matrix.cxxstd }})
+      run: ./configure ${{ matrix.sanitizer-config.enable-flags }} --enable-tests --enable-demo --build-type=${{ matrix.sanitizer-config.build-type }} --with-cxxstd=${{ matrix.cxxstd }}
     - name: make
       run: make
     - name: make test

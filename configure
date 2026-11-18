@@ -96,7 +96,7 @@ Optional Packages:
   --with-gtest=DIR        Google Test installation directory
   --with-cxx=COMPILER     C++ compiler to use (g++, clang++, etc.)
   --with-cxxflags=FLAGS   additional C++ compiler flags
-  --with-cxxstd=STD       C++ dialect: c++20, c++23, or c++26
+  --with-cxxstd=STD       C++ dialect: auto, c++20, c++23, or c++26
                           [default: auto — newest the compiler accepts]
   --with-slab-target-bytes=N
                           slab buffer soft target in bytes (power of two)
@@ -119,6 +119,7 @@ Examples:
   ./configure --with-slab-target-bytes=16384 --with-slab-target-multiplier=16
   ./configure --with-max-allocation-mib=256 --with-max-class-mib=1024
   ./configure --with-cxxstd=c++20
+  ./configure --with-cxxstd=auto
 
 EOF
 }
@@ -393,6 +394,7 @@ fi
 
 normalize_cxxstd() {
     # Accept c++20 / 20 / -std=c++20 (and 23/26). Echo canonical -std=c++XX.
+    # "auto" is handled by the caller (same as omitting --with-cxxstd).
     local raw="$1"
     raw=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
     raw="${raw#-std=}"
@@ -412,9 +414,11 @@ normalize_cxxstd() {
     esac
 }
 
-if [ -n "$REQUESTED_CXXSTD" ]; then
+# Treat omitted and explicit --with-cxxstd=auto the same.
+REQUESTED_CXXSTD_NORM=$(echo "$REQUESTED_CXXSTD" | tr '[:upper:]' '[:lower:]')
+if [ -n "$REQUESTED_CXXSTD" ] && [ "$REQUESTED_CXXSTD_NORM" != "auto" ]; then
     if ! CXXSTD=$(normalize_cxxstd "$REQUESTED_CXXSTD"); then
-        print_error "--with-cxxstd must be c++20, c++23, or c++26 (got: $REQUESTED_CXXSTD)"
+        print_error "--with-cxxstd must be auto, c++20, c++23, or c++26 (got: $REQUESTED_CXXSTD)"
         exit 1
     fi
     case "$CXXSTD" in
@@ -649,7 +653,7 @@ print_info "Configuration summary:"
 echo "  Prefix:               $PREFIX"
 echo "  Build type:           $BUILD_TYPE"
 echo "  C++ Compiler:         $DETECTED_CXX"
-if [ -n "$REQUESTED_CXXSTD" ]; then
+if [ -n "$REQUESTED_CXXSTD" ] && [ "$(echo "$REQUESTED_CXXSTD" | tr '[:upper:]' '[:lower:]')" != "auto" ]; then
 echo "  C++ dialect:          $CXXSTD (requested)"
 else
 echo "  C++ dialect:          $CXXSTD (auto)"
