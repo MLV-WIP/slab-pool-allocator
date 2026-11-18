@@ -439,8 +439,8 @@ This project’s `SpinLock` escalates:
 **RAII:** prefer `std::scoped_lock` / `std::unique_lock` over bare `lock()` /
 `unlock()` so an exception cannot leave the lock held.
 
-API: [API.md — SpinLock](API.md#spinlock).  
-Correctness deep dive: [SpinLock Analysis](../spallocator/docs/SpinLock_Analysis.md).
+API: [mlvlib API — SpinLock](../mlvlib/docs/API.md#spinlock).  
+Correctness deep dive: [SpinLock Analysis](../mlvlib/docs/deepdive/SpinLock_Analysis.md).
 
 ### Happens-before (intuition)
 
@@ -569,7 +569,7 @@ This is the same rule as any shared mutable object — not a gap in `isAlive()`.
 4. **Assuming “atomics ⇒ TOCTOU solved”** — atomics fix the counter race, not
    cross-thread member access without a protocol.  
 
-API contracts and snippets: [API.md — LifetimeObserver](API.md#lifetimeobserver).
+API contracts and snippets: [mlvlib API — LifetimeObserver](../mlvlib/docs/API.md#lifetimeobserver).
 
 ---
 
@@ -583,8 +583,8 @@ Pool                         ← your disposable / isolatable allocation domain
   ├── routes to SlabProxy    ← oversized system allocations
   └── make_pool_* / PoolAllocator  ← typed RAII on top of the pool
 
-LifetimeObserver (optional)   ← standalone global util; independent of Pool/Slab
-SpinLock                     ← standalone global util; also used by Pool/Slab
+LifetimeObserver (optional)   ← mlvlib; independent of Pool/Slab
+SpinLock                     ← mlvlib::SpinLock; used by Pool/Slab
 ```
 
 Remember: destroy or shard **pools** for lifetime and isolation; tune or
@@ -595,7 +595,7 @@ profile **slabs** for size-class recycling behavior.
 | Demo / test | Concepts |
 |-------------|----------|
 | `demo_spalloc_shared_ptr` | Pool as domain + shared ownership + STL allocator |
-| `demo_lifetime_observer` | Single-strand vs cross-thread liveness |
+| mlvlib `demo_lifetime_observer` | Single-strand vs cross-thread liveness |
 | `make test` | Slab growth/trim, pool routing/alignment, threads, locks |
 
 ---
@@ -650,4 +650,4 @@ reading headers or teaching from the repo.
 - [memcached](https://memcached.org/) — popular user-space slab usage  
 - [API.md](API.md) — call the types  
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — layout, trim, complexity, readiness  
-- [SpinLock Analysis](../spallocator/docs/SpinLock_Analysis.md) — lock correctness  
+- [SpinLock Analysis](../mlvlib/docs/deepdive/SpinLock_Analysis.md) — lock correctness  

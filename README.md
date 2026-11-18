@@ -6,12 +6,12 @@ A C++ memory **pool** backed by **slab** size-class storage — for production s
 
 A memory **pool** (disposable / isolatable allocation domain) backed by **slabs** (fixed-size slot recyclers). Pool and slab are separate ideas — the pool owns lifetime and routing; slabs implement size-class storage.
 
-**Readiness:** The pool, SpinLock, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. Pool lifetime vs clients is defined: orderly RAII (pointers first), optional arena bulk reclaim (`unique_pool_ptr` no-ops when the pool is already dead), and `PoolHandle::create()` for heap domains that retire when idle. `LifetimeObserver` provides race-free atomic liveness checks that are complete for same-thread / single-strand event loops; when callbacks and teardown can race across threads, pair object use with the same mutex/strand that covers destroy (or use `shared_ptr`/`weak_ptr` when you need upgrade-to-own). Known follow-ons (per-class metrics, freelist) are listed under Future Work.
+**Readiness:** The pool, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. Pool lifetime vs clients is defined: orderly RAII (pointers first), optional arena bulk reclaim (`unique_pool_ptr` no-ops when the pool is already dead), and `PoolHandle::create()` for heap domains that retire when idle. Short critical sections use `mlvlib::SpinLock` (from the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule). Known follow-ons (per-class metrics, freelist) are listed under Future Work.
 
 **Directory map:**
 ```
-spallocator/          # header-only library
-spallocator/docs/     # SpinLock_Analysis.md (SpinLock deep dive)
+spallocator/          # header-only allocator library
+mlvlib/               # git submodule — general utils (SpinLock, LifetimeObserver, helpers)
 docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md
 test/                 # Google Test suite (tester.cpp)
 demos/                # example programs
@@ -25,7 +25,7 @@ README.md             # this overview + build/run
 - **Thread-safe routing** — pool + per-slab locking
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolBlockToken`)
 - **Defined pool lifetime** — orderly RAII, arena bulk reclaim, or `PoolHandle::create()` auto-retire
-- **Standalone utilities** — `LifetimeObserver` (async liveness) and `SpinLock` (TTAS → backoff → block); usable outside the pool
+- **mlvlib dependency** — `SpinLock`, helpers, and optional `LifetimeObserver` via the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule
 - **Modern C++20+** — templates, atomics, ranges, concepts; C++23/26 when the toolchain allows
 
 Design and API detail live under [`docs/`](docs/), not in this README.
@@ -37,6 +37,9 @@ Design and API detail live under [`docs/`](docs/), not in this README.
 The Makefile works with defaults (`BUILD_TYPE=addrsan`) or with `./configure` for a persisted `config.mk`.
 
 ```bash
+# Required once after clone (and after CI checkout without submodules:recursive)
+git submodule update --init
+
 # Optional: generate config.mk
 ./configure --enable-tests --enable-demo
 # optional: pin dialect (default = newest of c++26/c++23/c++20 the compiler accepts)
@@ -84,19 +87,17 @@ Sources live in `demos/`. After `make`:
 | Program | Source | What it shows |
 |---------|--------|----------------|
 | `demo_spalloc_shared_ptr` | `demos/demo_spalloc_shared_ptr.cpp` | `make_pool_shared`, sharing, `PoolAllocator` with `std::vector` |
-| `demo_lifetime_observer` | `demos/demo_lifetime_observer.cpp` | `LifetimeObserver`: single-strand callbacks + cross-thread mutex pattern |
+
+`LifetimeObserver` demos and tests live in [mlvlib](https://github.com/MLV-WIP/mlvlib).
 
 ```bash
 # Build everything, then run the shared_ptr demo (Makefile `demo` target)
 make demo
 
-# Or run either binary directly (default build type = addrsan)
+# Or run the binary directly (default build type = addrsan)
 ./obj/addrsan/demo_spalloc_shared_ptr
-./obj/addrsan/demo_lifetime_observer
-
-# Same via obj/ symlinks
+# Same via obj/ symlink
 ./obj/demo_spalloc_shared_ptr
-./obj/demo_lifetime_observer
 ```
 
 ### Basic Usage
@@ -141,9 +142,9 @@ int main() {
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a pool domain |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
 | **PoolHandle** | `spallocator/pool_lifetime.hpp` | Heap domain handle; `create()` retires when idle |
-| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Standalone intrusive weak liveness (not under `spallocator::`) |
-| **SpinLock** | `spallocator/spinlock.hpp` | Standalone short-section lock (TTAS, backoff, TSan annotations) |
-| **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
+| **Helper** | `spallocator/helper.hpp` | Pool size caps; re-exports general helpers from mlvlib |
+| **SpinLock** | `mlvlib/spinlock.hpp` (submodule) | Short-section lock used by Pool/Slab (`mlvlib::SpinLock`) |
+| **LifetimeObserver** | `mlvlib/lifetimeobserver.hpp` (submodule) | Standalone liveness helper (optional; not required by Pool) |
 
 ### Size Classes
 
@@ -184,13 +185,13 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 | **[docs/API.md](docs/API.md)** | Public API reference: contracts, thread-safety, short usage snippets (including helpers) |
 | **[docs/CONCEPTS.md](docs/CONCEPTS.md)** | Conceptual / learning-oriented guide (pools, slabs, lifetime patterns, teaching path) |
 | **[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** | Architecture, design trade-offs, and production readiness |
-| **[SpinLock Analysis](spallocator/docs/SpinLock_Analysis.md)** | SpinLock correctness and performance deep dive (linked from IMPLEMENTATION) |
+| **[SpinLock Analysis](mlvlib/docs/deepdive/SpinLock_Analysis.md)** | SpinLock correctness and performance deep dive (linked from IMPLEMENTATION) |
 
 The repo-root [`IMPLEMENTATION.md`](IMPLEMENTATION.md) redirects here. Source headers also carry design comments.
 
 ## Testing
 
-The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, smart-pointer exception safety, SpinLock contention, `PoolAllocator` / STL integration, and `LifetimeObserver` (including concurrent `isAlive`).
+The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, smart-pointer exception safety, and `PoolAllocator` / STL integration. SpinLock and LifetimeObserver tests live in mlvlib.
 
 ```bash
 make test

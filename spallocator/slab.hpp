@@ -49,11 +49,13 @@
 #include <vector>
 
 #include "helper.hpp"
-#include "spinlock.hpp"
+#include "mlvlib/spinlock.hpp"
 
 
 namespace spallocator
 {
+    using mlvlib::SpinLock;
+
 
     // Compile-time slab buffer packing knobs (override via -D / ./configure).
 #ifndef SPALLOCATOR_SLAB_TARGET_BYTES

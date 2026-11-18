@@ -4,7 +4,6 @@
 
 #include <vector>
 #include "spallocator/helper.hpp"
-#include "spallocator/spinlock.hpp"
 #include "spallocator/slab.hpp"
 #include "spallocator/pool.hpp"
 #include "spallocator/spallocator.hpp"

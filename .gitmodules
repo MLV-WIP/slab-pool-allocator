@@ -1,0 +1,3 @@
+[submodule "mlvlib"]
+	path = mlvlib
+	url = git@github.com:MLV-WIP/mlvlib.git

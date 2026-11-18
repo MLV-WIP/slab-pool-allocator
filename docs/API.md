@@ -7,12 +7,11 @@ Architecture and trade-offs live in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 Conceptual / learning material lives in [CONCEPTS.md](CONCEPTS.md). Build
 instructions stay in the [root README](../README.md).
 
-Unless noted, types are in namespace `spallocator`. **`SpinLock`** and
-**`LifetimeObserver`** are intentionally global (not under `spallocator::`): they
-are standalone utilities that happen to ship with this repo and are usable
-without the pool. General helpers in `helper.hpp` live in `spallocator` today
-(size literals, print, `runtime_assert`); pool size caps in that header are
-allocator policy, not general utilities.
+Unless noted, types are in namespace `spallocator`. General locking and
+liveness utilities live in the [mlvlib](https://github.com/MLV-WIP/mlvlib)
+submodule (`mlvlib::SpinLock`, `mlvlib::LifetimeObserver`, helpers). This
+package’s `helper.hpp` re-exports those helpers into `spallocator` for
+convenience and defines allocator-only size caps.
 
 ---
 
@@ -41,12 +40,7 @@ allocator policy, not general utilities.
   - [`make_pool_unique`](#make_pool_unique)
   - [`make_pool_shared`](#make_pool_shared)
 - [PoolAllocator](#poolallocator)
-- [LifetimeObserver](#lifetimeobserver)
-- [SpinLock](#spinlock)
-- [Helpers](#helpers)
-  - [Size literals](#size-literals)
-  - [Debug / verbose print](#debug--verbose-print)
-  - [`runtime_assert`](#runtime_assert)
+- [Helpers & mlvlib](#helpers--mlvlib)
 - [Contracts cheat-sheet](#contracts-cheat-sheet)
 
 ---
@@ -59,9 +53,9 @@ allocator policy, not general utilities.
 | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolBlockToken`, `PoolControlBlock` |
 | `spallocator/slab.hpp` | `AbstractSlab`, `Slab`, `SlabProxy`, `DynBitset` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
-| `spallocator/lifetimeobserver.hpp` | `LifetimeObserver` (global; standalone) |
-| `spallocator/spinlock.hpp` | `SpinLock` (global; standalone) |
-| `spallocator/helper.hpp` | Size literals, print / `runtime_assert`, pool size caps |
+| `spallocator/helper.hpp` | Pool size caps; re-exports mlvlib helpers into `spallocator` |
+| `mlvlib/spinlock.hpp` | `mlvlib::SpinLock` (submodule; used by Pool/Slab) |
+| `mlvlib/lifetimeobserver.hpp` | `mlvlib::LifetimeObserver` (submodule; optional) |
 
 ```
                     ┌─────────────────────────────────────┐
@@ -71,7 +65,7 @@ allocator policy, not general utilities.
               ▼                    ▼                    ▼
      Slab<…> (fixed-size slots)          SlabProxy (large new[])
   Smart pointers / PoolAllocator ──► PoolBlockToken / PoolHandle
-  LifetimeObserver / SpinLock      (standalone; global namespace)
+  mlvlib::SpinLock / helpers       (submodule; SpinLock used by Pool/Slab)
 ```
 
 `Pool` and `Slab` are separate concepts: the pool is the disposable / isolatable
@@ -85,7 +79,8 @@ Typical includes for pool allocation plus factories:
 #include "spallocator/spallocator.hpp"
 ```
 
-Add `lifetimeobserver.hpp`, `spinlock.hpp`, or `helper.hpp` as needed.
+Add `spallocator/helper.hpp` as needed. For SpinLock / LifetimeObserver
+directly, include the mlvlib headers (see [mlvlib API](../mlvlib/docs/API.md)).
 
 ---
 
@@ -745,249 +740,26 @@ v.push_back(42);
 
 ---
 
-## LifetimeObserver
+## Helpers & mlvlib
 
-**Header:** `spallocator/lifetimeobserver.hpp`  
-**Namespace:** global (standalone utility — not `spallocator::`)
+**Allocator helper header:** `spallocator/helper.hpp`
 
-Intrusive helper for “is this object still alive?” checks from callbacks or
-event handlers. Inspired by `shared_ptr` / `weak_ptr`: **owner** references keep
-the control block’s owner count; **`getObserver()`** returns a weak view that
-does not keep the object alive. Independent of `Pool` / `Slab`; usable in any
-codebase that includes the header.
+- Re-exports `mlvlib` helpers into `spallocator` (`print` / `println`,
+  `debug_print*`, `runtime_assert`, `_KB` / `_MB` / `_GB` literals).
+- Defines compile-time pool caps: `kMaxAllocationBytes`, `kMaxClassBytes`
+  (override via `./configure --with-max-*-mib` / `-DSPALLOCATOR_MAX_*`).
 
-Typical pattern: a type derives from `LifetimeObserver` (protected default ctor
-creates an owner). Callbacks capture `getObserver()`, then call `isAlive()`
-before touching the object.
+**External utilities (submodule):** see [mlvlib](https://github.com/MLV-WIP/mlvlib)
+and local docs under `mlvlib/docs/` after `git submodule update --init`.
 
-```cpp
-class LifetimeObserver {
-public:
-    enum class e_refType { owner, observer };
+| Utility | Header | Notes |
+|---------|--------|-------|
+| `mlvlib::SpinLock` | `mlvlib/spinlock.hpp` | Used by Pool/Slab; deep dive in `mlvlib/docs/deepdive/SpinLock_Analysis.md` |
+| `mlvlib::LifetimeObserver` | `mlvlib/lifetimeobserver.hpp` | Optional; not required by the allocator |
+| Helpers | `mlvlib/helper.hpp` | Canonical home; re-exported via `spallocator/helper.hpp` |
 
-    bool isAlive() const;
-    operator bool() const;
-
-    LifetimeObserver getObserver() const;
-    int64_t getCount(e_refType ref_type) const;
-
-    LifetimeObserver& reset(const LifetimeObserver& other, e_refType ref_type);
-
-    explicit LifetimeObserver(const LifetimeObserver& other);
-    ~LifetimeObserver();
-
-protected:
-    LifetimeObserver();
-    LifetimeObserver(const LifetimeObserver& other, e_refType ref_type);
-    LifetimeObserver& operator=(const LifetimeObserver& other);
-    LifetimeObserver(LifetimeObserver&& other) noexcept;
-    LifetimeObserver& operator=(LifetimeObserver&& other) noexcept;
-};
-```
-
-### Liveness vs object use
-
-| Concern | Guarantee |
-|---------|-----------|
-| Control-block counts | `std::atomic`; concurrent `isAlive()` / ref adjust do not data-race |
-| `isAlive() == false` | Synchronizes with owner teardown of control-block state (acquire vs last release) |
-| Same-thread / single-strand | If callback and destroy cannot overlap, `isAlive()`-then-use is complete — no extra mutex required |
-| Cross-thread use + destroy | Serialize with the same mutex/strand that covers destroy, or use `shared_ptr` / `weak_ptr` when you need upgrade-to-own |
-
-### Methods
-
-| Method | Description |
-|--------|-------------|
-| `isAlive()` | `true` if at least one **owner** reference remains. Does **not** pin the object or grant cross-thread member access by itself. |
-| `operator bool()` | Same as `isAlive()`. |
-| `getObserver()` | Returns a distinct `LifetimeObserver` with **observer** (weak) semantics sharing this control block. Prefer this for callbacks — do not capture an accidental owner copy. |
-| `getCount(ref_type)` | Current owner or observer count (diagnostics / tests). |
-| `reset(other, ref_type)` | Drop this instance’s current ref and attach to `other`’s control block as `ref_type`. |
-| Default ctor (protected) | Creates a new control block with an **owner** ref — used by derived objects. |
-| Copy as observer | Public `explicit` copy constructs an **observer** view of `other` (see header notes for owner-copy rules on derived types). |
-| Copy/move assign & protected copy with `e_refType` | Transfer or share ownership per `ref_type`; move leaves the source with a fresh owner control block so destruction stays well-defined. |
-| Destructor | Releases this instance’s ref; deletes the control block when both counts hit zero (one winner via internal `retired` flag). |
-
-### Usage
-
-**Single-strand** (callback and delete on the same event thread):
-
-```cpp
-struct Service : LifetimeObserver {
-    void on_event();
-};
-
-event_loop.post([obs = svc->getObserver(), svc] {
-    if (obs.isAlive())
-        svc->on_event();
-});
-```
-
-**Cross-thread** (mutex covers check/use and destroy):
-
-```cpp
-std::mutex mu;  // outlives the service
-event_loop.post([&mu, obs = svc->getObserver(), svc] {
-    std::lock_guard lock(mu);
-    if (obs.isAlive())
-        svc->on_event();
-});
-{
-    std::lock_guard lock(mu);
-    delete svc;
-}
-```
-
-More narrative: [CONCEPTS.md — Observing lifetime](CONCEPTS.md#observing-lifetime-without-owning).
-
----
-
-## SpinLock
-
-**Header:** `spallocator/spinlock.hpp`  
-**Namespace:** global (standalone utility — not `spallocator::`)
-
-Lightweight mutex optimized for **short** critical sections. Models
-`BasicLockable` so it works with `std::scoped_lock` / `std::unique_lock`.
-Non-copyable, non-movable. Used inside `Pool` / `Slab`, but designed as a
-general locking primitive on its own.
-
-Internally: test-and-test-and-set spin, then escalating sleep backoff, then
-`std::atomic_flag::wait`. Under ThreadSanitizer, acquire/release annotations
-publish happens-before edges (GCC `__SANITIZE_THREAD__` or Clang
-`__has_feature(thread_sanitizer)`).
-
-```cpp
-class SpinLock {
-public:
-    SpinLock() = default;
-    ~SpinLock() = default;
-
-    void lock();
-    bool try_lock();
-    void unlock();
-};
-```
-
-| Method | Description |
-|--------|-------------|
-| `lock()` | Blocks until the lock is acquired (spin → backoff → wait). |
-| `try_lock()` | Attempts acquisition without blocking. Returns `true` if acquired, `false` if another holder exists. |
-| `unlock()` | Releases the lock and wakes one waiter. Caller must hold the lock. Unlocking a lock you do not own (or double-unlock) is undefined in release builds; debug builds abort via an owner-thread assert. |
-
-| | |
-|--|--|
-| **Thread safety** | Synchronizes threads that use the same `SpinLock` instance around the critical section. Non-recursive: the owning thread must not call `lock()` again until `unlock()`. |
-| **Exceptions** | These methods do not throw. |
-| **Recommendation** | Prefer RAII — `std::scoped_lock` for scope-bound holds, `std::unique_lock` when you need deferred lock, adopt, or early `unlock()` — so exceptions and mismatched pairs cannot leave the lock held. |
-
-```cpp
-SpinLock mu;
-{
-    std::scoped_lock guard(mu);
-    // critical section
-}
-{
-    std::unique_lock guard(mu); // early unlock / re-lock when needed
-    // ...
-    guard.unlock();
-}
-```
-
-In non-`NDEBUG` builds, successful `lock` / `try_lock` record `std::this_thread::get_id()`; `unlock` asserts that id matches before clearing the flag. Release builds keep a flag-only object (no owner member).
-
-Algorithm and correctness deep dive:
-[SpinLock Analysis](../spallocator/docs/SpinLock_Analysis.md).
-
----
-
-## Helpers
-
-**Header:** `spallocator/helper.hpp`  
-**Namespace:** `spallocator` (literals / print / assert); pool caps are allocator policy
-
-Supporting utilities used by the library and demos. Size literals, `print` /
-`println`, and `runtime_assert` are general-purpose helpers that ship here for
-convenience. `kMaxAllocationBytes` / `kMaxClassBytes` are pool policy knobs,
-not a general util API.
-
-### Size literals
-
-Binary (power-of-1024) size suffixes in namespace `spallocator`:
-
-```cpp
-constexpr std::size_t operator""_KB(unsigned long long value);  // × 1024
-constexpr std::size_t operator""_MB(unsigned long long value);  // × 1024²
-constexpr std::size_t operator""_GB(unsigned long long value);  // × 1024³
-```
-
-| Literal | Example | Value |
-|---------|---------|-------|
-| `_KB` | `4_KB` | `4096` |
-| `_MB` | `1_MB` | `1048576` |
-| `_GB` | `1_GB` | `1073741824` |
-
-```cpp
-using spallocator::operator""_KB;
-auto n = 4_KB;
-```
-
-### Compile-time size caps
-
-| Constant | Default | Override |
-|----------|---------|----------|
-| `kMaxAllocationBytes` | 1 GiB | `-DSPALLOCATOR_MAX_ALLOCATION_BYTES=N` (bytes) or `./configure --with-max-allocation-mib=N` |
-| `kMaxClassBytes` | 4 GiB | `-DSPALLOCATOR_MAX_CLASS_BYTES=N` (bytes) or `./configure --with-max-class-mib=N` |
-
-`Pool::allocate` / `SlabProxy` reject requests above `kMaxAllocationBytes`. Each
-`Slab` caps retained buffers so total class storage stays ≤ `kMaxClassBytes`.
-Not runtime-tunable; `static_assert` enforces floor relationships at compile time.
-
-### Debug / verbose print
-
-| Flag / constant | Effect |
-|-----------------|--------|
-| `NDEBUG` defined | `DEBUG_BUILD == false` |
-| `NDEBUG` undefined | `DEBUG_BUILD == true` |
-| `-DVDEBUG` and debug build | `VERBOSE_DEBUG == true` → `debug_print` / `debug_println` emit |
-| Otherwise | `debug_print*` compile to no-ops via `if constexpr` |
-
-```cpp
-void print(std::format_string<Args...> fmt, Args&&... args);
-void println(std::format_string<Args...> fmt, Args&&... args);
-void debug_print(std::format_string<Args...> fmt, Args&&... args);
-void debug_println(std::format_string<Args...> fmt, Args&&... args);
-```
-
-`print` / `println` always format to stdout. When `__cpp_lib_print` is set
-(C++23 library), they are `using` aliases for `std::print` / `std::println`;
-otherwise a small `std::format` + `iostream` shim is used (C++20 builds).
-`debug_*` are for allocator tracing in verbose debug builds only.
-
-**Build note:** minimum dialect is C++20 with working `<format>`. `./configure`
-picks the newest of C++26/23/20 (or `--with-cxxstd=`).
-
-### `runtime_assert`
-
-```cpp
-void runtime_assert(bool condition, const char* message,
-                    const std::source_location& loc = std::source_location::current());
-void runtime_assert(bool condition, const std::string& message,
-                    const std::source_location& loc = std::source_location::current());
-```
-
-| Parameter | Description |
-|-----------|-------------|
-| `condition` | Must be true if the program invariant holds. |
-| `message` | Text included in the failure report. |
-| `loc` | Source location (default: call site). |
-
-| | |
-|--|--|
-| **Debug builds** | On failure: print file/line/function and `std::abort()`. |
-| **Release (`NDEBUG`)** | Body discarded with `if constexpr` — **no check**. |
-| **Intended use** | Internal programming invariants. |
-| **Not for** | Caller-facing validation (use exceptions / error codes); anything with required side effects (they vanish in release). |
+Build requires `-Imlvlib` (Makefile sets this) so `#include "mlvlib/..."` resolves
+against the submodule root.
 
 ---
 

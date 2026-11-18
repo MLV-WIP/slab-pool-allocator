@@ -45,6 +45,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: true
     - name: Limit mmap ASLR entropy for ThreadSanitizer
       if: matrix.sanitizer-config.name == 'threadsan'
       run: |

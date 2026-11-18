@@ -9,7 +9,7 @@ engineers integrating or extending the allocator.
 | [CONCEPTS.md](CONCEPTS.md) | Learning / conceptual narrative (pool ≠ slab) |
 | This file | How the pieces are built and why |
 | [README](../README.md) | Build, test, demos |
-| [SpinLock Analysis](../spallocator/docs/SpinLock_Analysis.md) | Lock correctness deep dive |
+| [SpinLock Analysis](../mlvlib/docs/deepdive/SpinLock_Analysis.md) | Lock correctness deep dive (mlvlib) |
 
 **Audience:** production correctness first. Explanations stay precise so the same
 code remains readable for teaching — without soft-pedaling limits.
@@ -701,7 +701,7 @@ rule as any shared mutable object — not a deficiency in `isAlive()`.
 | Pins object | Yes, if lock succeeds | No |
 | Best when | You need to use the object without an external mutex | Strand/mutex already orders use vs destroy, or you only need a skip/go check |
 
-API contracts: [API.md — LifetimeObserver](API.md#lifetimeobserver).  
+API contracts: [mlvlib API — LifetimeObserver](../mlvlib/docs/API.md#lifetimeobserver).  
 Teaching narrative: [CONCEPTS.md](CONCEPTS.md#observing-lifetime-without-owning).
 
 ---
@@ -750,13 +750,13 @@ canvas.
 
 ## SpinLock (design summary)
 
-`SpinLock` is a **standalone** mutual-exclusion primitive (global namespace in
-`spinlock.hpp`) used today for **short** critical sections in `Pool` and
+`SpinLock` is provided by **mlvlib** (`mlvlib::SpinLock` in
+`mlvlib/spinlock.hpp`) and used for **short** critical sections in `Pool` and
 `Slab`. It is intentionally not nested under `spallocator::` so it can be
 reused outside the allocator. It models `BasicLockable` (`lock` / `unlock` /
 `try_lock`) so `std::scoped_lock` / `std::unique_lock` work. Non-copyable,
 non-movable. Full line-by-line analysis:
-[SpinLock_Analysis.md](../spallocator/docs/SpinLock_Analysis.md).
+[SpinLock_Analysis.md](../mlvlib/docs/deepdive/SpinLock_Analysis.md).
 
 ### Why not always `std::mutex`?
 
@@ -835,7 +835,7 @@ checks — do not mix debug and release TUs against the same `SpinLock` layout.
 - Hold only for brief registry / bitmap work; do not call into user code under
   the lock  
 - Prefer RAII (`std::scoped_lock` / `std::unique_lock`) over bare `lock`/`unlock`  
-- API surface: [API.md — SpinLock](API.md#spinlock)  
+- API surface: [mlvlib API — SpinLock](../mlvlib/docs/API.md#spinlock)  
 
 ---
 
@@ -965,7 +965,7 @@ Also tracked on the
 |----------|--------|
 | `test/tester.cpp` | Slab growth/trim/`DynBitset` scaling, pool routing/alignment/header validation, multi-thread pool use, smart-pointer exception safety, PoolHandle/BlockToken lifetime, SpinLock contention, LifetimeObserver (including concurrent `isAlive`) |
 | `demos/demo_spalloc_shared_ptr.cpp` | Pool as domain + `make_pool_shared` + `PoolAllocator` with STL containers |
-| `demos/demo_lifetime_observer.cpp` | Single-strand vs mutex-guarded cross-thread observer patterns |
+| mlvlib `demos/demo_lifetime_observer.cpp` | Single-strand vs mutex-guarded cross-thread observer patterns |
 
 Prefer `make test` under `addrsan` for day-to-day; add `threadsan` when touching
 locks or observer atomics. Commands:

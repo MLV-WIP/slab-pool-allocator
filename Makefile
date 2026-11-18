@@ -43,17 +43,16 @@ SRCDIR := .
 TESTDIR := ./test
 DEMODIR := ./demos
 INCLUDEDIR := ./spallocator
+MLVLIB_ROOT := ./mlvlib
 # Public API / concepts / implementation docs (repo root docs/).
 APIDOCS := ./docs
-# Deep-dive notes that ship under the header tree (e.g. SpinLock analysis).
-DOCDIR := ./spallocator/docs
 
 # Compiler flags.
 # Prefer CXXSTD from config.mk (./configure picks newest of c++26/23/20).
 # Without config.mk, default to the documented minimum.
 CXXSTD ?= -std=c++20
-# -I. so sources in test/ and demos/ can #include "spallocator/..."
-INCLUDES := -I. -I$(INCLUDEDIR)
+# -I. for "spallocator/..."; -Imlvlib for "mlvlib/..." (submodule root).
+INCLUDES := -I. -I$(INCLUDEDIR) -I$(MLVLIB_ROOT)
 WARNINGS := -Wall -Wextra -Wpedantic -Werror
 
 # Add Google Test includes if tests are enabled
@@ -176,10 +175,6 @@ DEMO_SRC := $(DEMODIR)/demo_spalloc_shared_ptr.cpp
 DEMO_TARGET := demo_spalloc_shared_ptr
 DEMO_DEPFILE := $(OBJDIR)/$(DEMO_TARGET).d
 
-DEMO_LIFETIME_SRC := $(DEMODIR)/demo_lifetime_observer.cpp
-DEMO_LIFETIME_TARGET := demo_lifetime_observer
-DEMO_LIFETIME_DEPFILE := $(OBJDIR)/$(DEMO_LIFETIME_TARGET).d
-
 # Header dependencies
 HEADERS := $(wildcard $(INCLUDEDIR)/*.hpp)
 
@@ -190,7 +185,6 @@ ifeq ($(ENABLE_TESTS),yes)
 endif
 ifeq ($(ENABLE_DEMO),yes)
     TARGETS += $(OBJDIR)/$(DEMO_TARGET)
-    TARGETS += $(OBJDIR)/$(DEMO_LIFETIME_TARGET)
 endif
 
 # Default target
@@ -237,13 +231,6 @@ $(OBJDIR)/$(DEMO_TARGET): $(DEMO_SRC) $(HEADERS) | $(OBJDIR)
 	$(Q)$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 	$(Q)rm -f $(BASEOBJDIR)/$(DEMO_TARGET)
 	$(Q)ln -s $(OBJDIRNAME)/$(DEMO_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET)
-
-# Build LifetimeObserver demo
-$(OBJDIR)/$(DEMO_LIFETIME_TARGET): $(DEMO_LIFETIME_SRC) $(HEADERS) | $(OBJDIR)
-	$(ECHO) "  CXX     $@"
-	$(Q)$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
-	$(Q)rm -f $(BASEOBJDIR)/$(DEMO_LIFETIME_TARGET)
-	$(Q)ln -s $(OBJDIRNAME)/$(DEMO_LIFETIME_TARGET) $(BASEOBJDIR)/$(DEMO_LIFETIME_TARGET)
 
 # Run tests
 test: $(OBJDIR)/$(TESTER_TARGET)
@@ -315,9 +302,9 @@ uninstall:
 # Clean build artifacts
 clean:
 	$(ECHO) "  CLEAN   $(OBJDIR)"
-	$(Q)rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET) $(OBJDIR)/$(DEMO_LIFETIME_TARGET)
+	$(Q)rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET)
 	$(Q)rm -f $(OBJDIR)/*.o $(OBJDIR)/*.d $(OBJDIR)/*.gcda $(OBJDIR)/*.gcno $(OBJDIR)/*.gcov
-	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET) $(BASEOBJDIR)/$(DEMO_LIFETIME_TARGET)
+	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET)
 	$(Q)rm -f *.gcov *.gcda *.gcno
 	$(ECHO) "Clean complete!"
 
@@ -366,4 +353,3 @@ help:
 # Include generated dependency files
 -include $(TESTER_DEPFILE)
 -include $(DEMO_DEPFILE)
--include $(DEMO_LIFETIME_DEPFILE)
