@@ -279,7 +279,9 @@ elif [ "$BUILD_TYPE" = "threadsan" ]; then
     ENABLE_ASAN="no"  # Can't use ASan and TSan together
     ENABLE_LSAN="no"  # Can't use LSan and TSan together
     ENABLE_MSAN="no"
-    [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="yes"
+    # UBSan+TSan together produces intermittent false races in GCC libstdc++
+    # std::thread teardown (IsAccessibleMemoryRange/pipe). Opt in explicitly.
+    [ "$ENABLE_UBSAN" = "auto" ] && ENABLE_UBSAN="no"
 else
     [ "$ENABLE_ASAN" = "auto" ] && ENABLE_ASAN="no"
     [ "$ENABLE_LSAN" = "auto" ] && ENABLE_LSAN="no"

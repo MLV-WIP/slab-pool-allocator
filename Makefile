@@ -131,11 +131,9 @@ else ifeq ($(BUILD_TYPE),threadsan)
     # or a stale config.mk left it off.
     CXXFLAGS += -fsanitize=thread
     LDFLAGS += -fsanitize=thread
-    # UndefinedBehaviorSanitizer
+    # UBSan is opt-in only for threadsan (not auto): pairing it with TSan under
+    # GCC has produced false-positive races in std::thread state teardown.
     ifeq ($(ENABLE_UBSAN),yes)
-        CXXFLAGS += -fsanitize=undefined
-        LDFLAGS += -fsanitize=undefined
-    else ifeq ($(ENABLE_UBSAN),auto)
         CXXFLAGS += -fsanitize=undefined
         LDFLAGS += -fsanitize=undefined
     endif
@@ -340,7 +338,7 @@ help:
 	@echo "  make BUILD_TYPE=release"
 	@echo "  make BUILD_TYPE=addrsan    # AddressSanitizer + LSan + UBSan (default), implies debug"
 	@echo "  make BUILD_TYPE=memsan     # MemorySanitizer + UBSan, implies debug"
-	@echo "  make BUILD_TYPE=threadsan  # ThreadSanitizer + UBSan, implies debug"
+	@echo "  make BUILD_TYPE=threadsan  # ThreadSanitizer (UBSan opt-in), implies debug"
 	@echo ""
 	@echo "Current configuration:"
 	@echo "  Build type:    $(BUILD_TYPE)"
