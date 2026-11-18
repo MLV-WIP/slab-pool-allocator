@@ -32,6 +32,8 @@ SLAB_TARGET_BYTES="8192"
 SLAB_TARGET_MULTIPLIER="16"
 MAX_ALLOCATION_MIB="1024"           # 1 GiB
 MAX_CLASS_MIB="4096"                # 4 GiB
+# Empty => auto-select newest of c++26/c++23/c++20. Set via --with-cxxstd=.
+REQUESTED_CXXSTD=""
 
 # Detected values
 DETECTED_CXX=""
@@ -39,7 +41,10 @@ DETECTED_GTEST=""
 IS_CLANG="no"
 HAS_CXX20="no"
 HAS_CXX23="no"
+HAS_CXX26="no"
+CXXSTD="-std=c++20"
 HAS_FORMAT="no"
+HAS_PRINT="no"
 HAS_RANGES="no"
 HAS_ATOMIC_WAIT="no"
 
@@ -91,6 +96,8 @@ Optional Packages:
   --with-gtest=DIR        Google Test installation directory
   --with-cxx=COMPILER     C++ compiler to use (g++, clang++, etc.)
   --with-cxxflags=FLAGS   additional C++ compiler flags
+  --with-cxxstd=STD       C++ dialect: c++20, c++23, or c++26
+                          [default: auto — newest the compiler accepts]
   --with-slab-target-bytes=N
                           slab buffer soft target in bytes (power of two)
                           [default: 8192]
@@ -111,6 +118,7 @@ Examples:
   ./configure --prefix=/opt/spallocator --build-type=release
   ./configure --with-slab-target-bytes=16384 --with-slab-target-multiplier=16
   ./configure --with-max-allocation-mib=256 --with-max-class-mib=1024
+  ./configure --with-cxxstd=c++20
 
 EOF
 }
@@ -184,6 +192,9 @@ for arg in "$@"; do
             ;;
         --with-cxxflags=*)
             CXXFLAGS="${arg#*=}"
+            ;;
+        --with-cxxstd=*)
+            REQUESTED_CXXSTD="${arg#*=}"
             ;;
         --with-slab-target-bytes=*)
             SLAB_TARGET_BYTES="${arg#*=}"
@@ -344,72 +355,148 @@ if $DETECTED_CXX --version | grep -q "clang"; then
     IS_CLANG="yes"
 fi
 
-# Check for C++20 support
-print_info "Checking for C++20 support..."
+# Probe dialects and select one. Acceptance is "does -std=… compile a trivial
+# TU?" — early -std=c++26 toolchains may still report a C++23 __cplusplus.
+# --with-cxxstd= pins the choice; otherwise pick newest of 26/23/20.
+print_info "Selecting C++ language dialect..."
 cat > conftest.cpp << 'EOF'
-#include <version>
-#if __cplusplus < 202002L
-#error "C++20 not supported"
-#endif
 int main() { return 0; }
 EOF
 
-# Build compiler flags for testing
-TEST_CXXFLAGS="-std=c++20"
-
-if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
+if $DETECTED_CXX -std=c++20 conftest.cpp -o conftest 2>/dev/null; then
     HAS_CXX20="yes"
-    print_success "C++20 support: yes"
 else
+    HAS_CXX20="no"
+fi
+rm -f conftest conftest.o
+
+if $DETECTED_CXX -std=c++23 conftest.cpp -o conftest 2>/dev/null; then
+    HAS_CXX23="yes"
+else
+    HAS_CXX23="no"
+fi
+rm -f conftest conftest.o
+
+if $DETECTED_CXX -std=c++26 conftest.cpp -o conftest 2>/dev/null; then
+    HAS_CXX26="yes"
+else
+    HAS_CXX26="no"
+fi
+rm -f conftest.cpp conftest conftest.o
+
+if [ "$HAS_CXX20" != "yes" ]; then
     print_error "C++20 support: no"
-    print_error "This project requires C++20 support"
+    print_error "This project requires at least C++20"
     print_error "Please upgrade your compiler or use --with-cxx= to specify a newer one"
+    exit 1
+fi
+
+normalize_cxxstd() {
+    # Accept c++20 / 20 / -std=c++20 (and 23/26). Echo canonical -std=c++XX.
+    local raw="$1"
+    raw=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+    raw="${raw#-std=}"
+    case "$raw" in
+        c++20|20|gnu++20)
+            echo "-std=c++20"
+            ;;
+        c++23|23|gnu++23)
+            echo "-std=c++23"
+            ;;
+        c++26|26|gnu++26)
+            echo "-std=c++26"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+if [ -n "$REQUESTED_CXXSTD" ]; then
+    if ! CXXSTD=$(normalize_cxxstd "$REQUESTED_CXXSTD"); then
+        print_error "--with-cxxstd must be c++20, c++23, or c++26 (got: $REQUESTED_CXXSTD)"
+        exit 1
+    fi
+    case "$CXXSTD" in
+        -std=c++20)
+            if [ "$HAS_CXX20" != "yes" ]; then
+                print_error "Requested $CXXSTD but the compiler rejected it"
+                exit 1
+            fi
+            ;;
+        -std=c++23)
+            if [ "$HAS_CXX23" != "yes" ]; then
+                print_error "Requested $CXXSTD but the compiler rejected it"
+                exit 1
+            fi
+            ;;
+        -std=c++26)
+            if [ "$HAS_CXX26" != "yes" ]; then
+                print_error "Requested $CXXSTD but the compiler rejected it"
+                exit 1
+            fi
+            ;;
+    esac
+    print_success "Dialect: $CXXSTD (requested via --with-cxxstd)"
+elif [ "$HAS_CXX26" = "yes" ]; then
+    CXXSTD="-std=c++26"
+    print_success "Dialect: C++26 (auto)"
+elif [ "$HAS_CXX23" = "yes" ]; then
+    CXXSTD="-std=c++23"
+    print_success "Dialect: C++23 (auto)"
+else
+    CXXSTD="-std=c++20"
+    print_success "Dialect: C++20 (auto)"
+fi
+
+# Library feature probes use the selected dialect.
+# std::format is required (no polyfill); early C++20 libcs often lacked it.
+print_info "Checking for std::format..."
+cat > conftest.cpp << 'EOF'
+#include <version>
+#include <format>
+#if !defined(__cpp_lib_format) || __cpp_lib_format < 201907L
+#error "std::format feature-test macro missing or too old"
+#endif
+int main() {
+    auto s = std::format("test {}", 42);
+    return static_cast<int>(s.size());
+}
+EOF
+
+if $DETECTED_CXX $CXXSTD conftest.cpp -o conftest 2>/dev/null; then
+    HAS_FORMAT="yes"
+    print_success "std::format: yes"
+else
+    HAS_FORMAT="no"
+    print_error "std::format: no"
+    print_error "A working <format> implementation is required (C++20 library completeness)."
+    print_error "Upgrade libstdc++/libc++ or the compiler; this project does not vendor a format polyfill."
     rm -f conftest.cpp conftest
     exit 1
 fi
 rm -f conftest.cpp conftest conftest.o
 
-# Check for C++23 support
-print_info "Checking for C++23 support..."
+# std::print is optional (C++23); headers feature-test and fall back if absent.
+print_info "Checking for std::print..."
 cat > conftest.cpp << 'EOF'
 #include <version>
-#if __cplusplus < 202302L
-#error "C++23 not supported"
+#if !defined(__cpp_lib_print) || __cpp_lib_print < 202207L
+#error "std::print not available"
 #endif
-int main() { return 0; }
-EOF
-
-# Build compiler flags for testing
-TEST_CXXFLAGS="-std=c++23"
-
-if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
-    HAS_CXX23="yes"
-    print_success "C++23 support: yes"
-else
-    HAS_CXX23="no"
-    print_warning "C++23 support: no"
-fi
-rm -f conftest.cpp conftest conftest.o
-
-# Check for std::format
-print_info "Checking for std::format..."
-cat > conftest.cpp << 'EOF'
-#include <format>
+#include <print>
 int main() {
-    auto s = std::format("test {}", 42);
+    std::print("{}", 42);
     return 0;
 }
 EOF
 
-# Build compiler flags for testing
-TEST_CXXFLAGS="-std=c++20"
-
-if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
-    HAS_FORMAT="yes"
-    print_success "std::format: yes"
+if $DETECTED_CXX $CXXSTD conftest.cpp -o conftest 2>/dev/null; then
+    HAS_PRINT="yes"
+    print_success "std::print: yes"
 else
-    HAS_FORMAT="no"
-    print_warning "std::format: no (will use fallback)"
+    HAS_PRINT="no"
+    print_warning "std::print: no (headers will use a std::format-based shim)"
 fi
 rm -f conftest.cpp conftest conftest.o
 
@@ -425,10 +512,7 @@ int main() {
 }
 EOF
 
-# Build compiler flags for testing
-TEST_CXXFLAGS="-std=c++20"
-
-if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
+if $DETECTED_CXX $CXXSTD conftest.cpp -o conftest 2>/dev/null; then
     HAS_RANGES="yes"
     print_success "std::ranges: yes"
 else
@@ -454,10 +538,7 @@ int main() {
 }
 EOF
 
-# Build compiler flags for testing
-TEST_CXXFLAGS="-std=c++20"
-
-if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
+if $DETECTED_CXX $CXXSTD conftest.cpp -o conftest 2>/dev/null; then
     HAS_ATOMIC_WAIT="yes"
     print_success "atomic_flag::wait: yes"
 else
@@ -510,7 +591,7 @@ if [ "$ENABLE_ASAN" = "yes" ] || [ "$ENABLE_LSAN" = "yes" ] || [ "$ENABLE_UBSAN"
         cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
-        TEST_CXXFLAGS="-std=c++20 -fsanitize=address"
+        TEST_CXXFLAGS="$CXXSTD -fsanitize=address"
         if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
             print_success "AddressSanitizer: yes"
         else
@@ -524,7 +605,7 @@ EOF
         cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
-        TEST_CXXFLAGS="-std=c++20 -fsanitize=leak"
+        TEST_CXXFLAGS="$CXXSTD -fsanitize=leak"
         if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
             print_success "LeakSanitizer: yes"
         else
@@ -538,7 +619,7 @@ EOF
         cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
-        TEST_CXXFLAGS="-std=c++20 -fsanitize=memory"
+        TEST_CXXFLAGS="$CXXSTD -fsanitize=memory"
         if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
             print_success "MemorySanitizer: yes"
         else
@@ -552,7 +633,7 @@ EOF
         cat > conftest.cpp << 'EOF'
 int main() { return 0; }
 EOF
-        TEST_CXXFLAGS="-std=c++20 -fsanitize=thread"
+        TEST_CXXFLAGS="$CXXSTD -fsanitize=thread"
         if $DETECTED_CXX $TEST_CXXFLAGS conftest.cpp -o conftest 2>/dev/null; then
             print_success "ThreadSanitizer: yes"
         else
@@ -568,9 +649,16 @@ print_info "Configuration summary:"
 echo "  Prefix:               $PREFIX"
 echo "  Build type:           $BUILD_TYPE"
 echo "  C++ Compiler:         $DETECTED_CXX"
+if [ -n "$REQUESTED_CXXSTD" ]; then
+echo "  C++ dialect:          $CXXSTD (requested)"
+else
+echo "  C++ dialect:          $CXXSTD (auto)"
+fi
 echo "  C++20 support:        $HAS_CXX20"
 echo "  C++23 support:        $HAS_CXX23"
+echo "  C++26 support:        $HAS_CXX26"
 echo "  std::format:          $HAS_FORMAT"
+echo "  std::print:           $HAS_PRINT"
 echo "  std::ranges:          $HAS_RANGES"
 echo "  atomic wait/notify:   $HAS_ATOMIC_WAIT"
 echo "  Build tests:          $ENABLE_TESTS"
@@ -611,6 +699,7 @@ PREFIX := $PREFIX
 # Compiler
 CXX := $DETECTED_CXX
 IS_CLANG := $IS_CLANG
+CXXSTD := $CXXSTD
 
 # Build configuration
 BUILD_TYPE := $BUILD_TYPE
@@ -637,8 +726,11 @@ SLAB_TARGET_MULTIPLIER := $SLAB_TARGET_MULTIPLIER
 USER_CXXFLAGS := $USER_CXXFLAGS_VALUE
 
 # Feature detection
+HAS_CXX20 := $HAS_CXX20
 HAS_CXX23 := $HAS_CXX23
+HAS_CXX26 := $HAS_CXX26
 HAS_FORMAT := $HAS_FORMAT
+HAS_PRINT := $HAS_PRINT
 EOF
 
 print_success "Configuration complete!"

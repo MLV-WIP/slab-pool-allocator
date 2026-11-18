@@ -36,9 +36,16 @@
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
+#include <string>
+#include <version>
 #include <format>
-#include <print>
 #include <source_location>
+
+// std::print / std::println are C++23. Prefer the library when the feature-test
+// macro says it is present; otherwise provide a std::format-based shim below.
+#if defined(__cpp_lib_print) && __cpp_lib_print >= 202207L
+#  include <print>
+#endif
 
 
 #ifndef NDEBUG
@@ -93,27 +100,27 @@ namespace spallocator
         "kMaxClassBytes should be at least kMaxAllocationBytes");
 
 
-    #if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
-        using std::print;
-        using std::println;
-    #else
-        #pragma message("C++23 print and println not available; using custom implementations")
-        // print and println added in C++23, but we don't have them yet; make our own
-        // Adapted from GitHub Jhuighuy /TitSolver/source/tit/core/io_utils.hpp under MIT license
-        // --- start Jhuighuy ---
-        template<typename... Args>
-        inline void print(std::format_string<Args...> fmt, Args&&... args)
-        {
-            std::cout << std::format(fmt, std::forward<Args>(args)...);
-        }
+    // format is required (C++20 library completeness; see configure).
+    // print is optional (C++23); gate on __cpp_lib_print, not __cpp_lib_format.
+#if defined(__cpp_lib_print) && __cpp_lib_print >= 202207L
+    using std::print;
+    using std::println;
+#else
+    // Adapted from GitHub Jhuighuy /TitSolver/source/tit/core/io_utils.hpp (MIT)
+    // --- start Jhuighuy ---
+    template<typename... Args>
+    inline void print(std::format_string<Args...> fmt, Args&&... args)
+    {
+        std::cout << std::format(fmt, std::forward<Args>(args)...);
+    }
 
-        template<typename... Args>
-        inline void println(std::format_string<Args...> fmt, Args&&... args)
-        {
-            print("{}\n", fmt, std::forward<Args>(args)...);
-        }
-        // --- end Jhuighuy ---
-    #endif
+    template<typename... Args>
+    inline void println(std::format_string<Args...> fmt, Args&&... args)
+    {
+        std::cout << std::format(fmt, std::forward<Args>(args)...) << '\n';
+    }
+    // --- end Jhuighuy ---
+#endif
 
 
     //

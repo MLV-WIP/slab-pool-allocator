@@ -45,8 +45,10 @@ DEMODIR := ./demos
 INCLUDEDIR := ./spallocator
 DOCDIR := ./spallocator/docs
 
-# Compiler flags
-CXXSTD := -std=c++23
+# Compiler flags.
+# Prefer CXXSTD from config.mk (./configure picks newest of c++26/23/20).
+# Without config.mk, default to the documented minimum.
+CXXSTD ?= -std=c++20
 # -I. so sources in test/ and demos/ can #include "spallocator/..."
 INCLUDES := -I. -I$(INCLUDEDIR)
 WARNINGS := -Wall -Wextra -Wpedantic -Werror

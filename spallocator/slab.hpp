@@ -360,16 +360,14 @@ namespace spallocator
 
         using word_t = unsigned long long;
         constexpr std::size_t kWordBits = std::numeric_limits<word_t>::digits; // 64
-        // Low-kWordBits mask in an N-bit bitset (for to_ullong extraction).
-        constexpr std::bitset<N> kLowWordMask = []() constexpr {
-            std::bitset<N> m;
-            const std::size_t bits = N < kWordBits ? N : kWordBits;
-            for (std::size_t i = 0; i < bits; ++i)
-            {
-                m.set(i);
-            }
-            return m;
-        }();
+        // Low-kWordBits (or N, if smaller) mask for to_ullong extraction.
+        // Built from an ullong ctor — bitset::set is not constexpr until C++23.
+        constexpr std::size_t kMaskBits = N < kWordBits ? N : kWordBits;
+        constexpr word_t kLowWordBits =
+            (kMaskBits == kWordBits)
+                ? ~word_t{0}
+                : ((word_t{1} << kMaskBits) - word_t{1});
+        constexpr std::bitset<N> kLowWordMask{kLowWordBits};
 
         for (std::size_t base = (start / kWordBits) * kWordBits; base < N;
              base += kWordBits)
