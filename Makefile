@@ -43,6 +43,9 @@ SRCDIR := .
 TESTDIR := ./test
 DEMODIR := ./demos
 INCLUDEDIR := ./spallocator
+# Public API / concepts / implementation docs (repo root docs/).
+APIDOCS := ./docs
+# Deep-dive notes that ship under the header tree (e.g. SpinLock analysis).
 DOCDIR := ./spallocator/docs
 
 # Compiler flags.
@@ -291,11 +294,13 @@ install:
 	$(ECHO) "  INSTALL headers to $(PREFIX)/include/spallocator"
 	$(Q)install -d $(PREFIX)/include/spallocator
 	$(Q)install -m 644 $(INCLUDEDIR)/*.hpp $(PREFIX)/include/spallocator/
-	$(ECHO) "  INSTALL docs to $(PREFIX)/share/doc/spallocator"
+	$(ECHO) "  INSTALL docs/LICENSE to $(PREFIX)/share/doc/spallocator"
 	$(Q)install -d $(PREFIX)/share/doc/spallocator
-	$(Q)install -m 644 README.md IMPLEMENTATION.md $(PREFIX)/share/doc/spallocator/
+	$(Q)install -m 644 LICENSE README.md $(PREFIX)/share/doc/spallocator/
+	$(Q)install -m 644 $(APIDOCS)/API.md $(APIDOCS)/CONCEPTS.md \
+		$(APIDOCS)/IMPLEMENTATION.md $(PREFIX)/share/doc/spallocator/
 	$(Q)if [ -d $(DOCDIR) ]; then \
-		install -m 644 $(DOCDIR)/*.md $(PREFIX)/share/doc/spallocator/ 2>/dev/null || true; \
+		install -m 644 $(DOCDIR)/*.md $(PREFIX)/share/doc/spallocator/; \
 	fi
 	$(ECHO) "Installation complete!"
 

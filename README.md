@@ -223,9 +223,9 @@ Recorded for later (not scheduled). See also
 
 ## License
 
-BSD 3-Clause License - Copyright (c) 2025-2026, Michael VanLoon
+BSD 3-Clause License — Copyright (c) 2025-2026, Michael VanLoon.
 
-See LICENSE section in source files for full text.
+See [`LICENSE`](LICENSE) for the full text (also referenced via SPDX in headers).
 
 ## Contributing
 

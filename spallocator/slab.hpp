@@ -30,8 +30,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef SLAP_HPP_
-#define SLAP_HPP_
+#ifndef SLAB_HPP_
+#define SLAB_HPP_
 
 #include <bit>
 #include <bitset>
@@ -738,4 +738,4 @@ namespace spallocator
 }; // namespace spallocator
 
 
-#endif // SLAP_HPP_
+#endif // SLAB_HPP_
