@@ -442,6 +442,60 @@ TEST(PoolTest, MakePoolUniqueFromHandle)
 }
 
 
+// P19 phase A: PoolStats counters and high-water marks.
+TEST(PoolTest, StatsTracksAllocFreeAndLiveHwm)
+{
+    Pool pool;
+    PoolStats empty = pool.stats();
+    EXPECT_EQ(empty.live_allocations, 0u);
+    EXPECT_EQ(empty.alloc_ok, 0u);
+    EXPECT_EQ(empty.alloc_fail, 0u);
+    EXPECT_EQ(empty.free_ok, 0u);
+    EXPECT_EQ(empty.free_fail, 0u);
+    EXPECT_EQ(empty.live_hwm, 0u);
+    EXPECT_GE(empty.retained_slab_bytes, 0u);
+    EXPECT_GE(empty.retained_hwm, empty.retained_slab_bytes);
+
+    auto* a = pool.allocate(16);
+    auto* b = pool.allocate(16);
+    PoolStats mid = pool.stats();
+    EXPECT_EQ(mid.live_allocations, 2u);
+    EXPECT_EQ(mid.alloc_ok, 2u);
+    EXPECT_EQ(mid.live_hwm, 2u);
+    EXPECT_GE(mid.retained_hwm, mid.retained_slab_bytes);
+
+    pool.deallocate(a);
+    PoolStats after_one = pool.stats();
+    EXPECT_EQ(after_one.live_allocations, 1u);
+    EXPECT_EQ(after_one.free_ok, 1u);
+    EXPECT_EQ(after_one.live_hwm, 2u); // HWM does not fall
+
+    pool.deallocate(b);
+    PoolStats done = pool.stats();
+    EXPECT_EQ(done.live_allocations, 0u);
+    EXPECT_EQ(done.alloc_ok, 2u);
+    EXPECT_EQ(done.free_ok, 2u);
+    EXPECT_EQ(done.live_hwm, 2u);
+}
+
+
+TEST(PoolTest, StatsCountsAllocAndFreeFailures)
+{
+    Pool pool;
+    EXPECT_THROW(pool.allocate(16, 12), std::invalid_argument); // not power of two
+    EXPECT_THROW(pool.allocate(2_GB), std::out_of_range);
+
+    std::byte junk{};
+    EXPECT_FALSE(pool.try_deallocate(&junk));
+
+    PoolStats s = pool.stats();
+    EXPECT_EQ(s.alloc_ok, 0u);
+    EXPECT_GE(s.alloc_fail, 2u);
+    EXPECT_EQ(s.free_ok, 0u);
+    EXPECT_GE(s.free_fail, 1u);
+}
+
+
 // Arena + make_pool_shared: control block is heap-allocated; PoolDeleter token
 // outlives slabs. Same no-op model as unique_pool_ptr when !alive.
 TEST(PoolTest, ArenaDestroySharedPtrSkipsTypedDestructor)

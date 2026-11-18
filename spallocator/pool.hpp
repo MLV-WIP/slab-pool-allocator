@@ -140,6 +140,21 @@ namespace spallocator
     }
 
 
+    // Best-effort ops snapshot (P19). Counters use relaxed atomics; fields may
+    // not form a single transactional freeze under concurrency.
+    struct PoolStats
+    {
+        std::uint64_t live_allocations{0};     // outstanding successful allocs
+        std::uint64_t retained_slab_bytes{0};  // size-class buffers held (not "in use")
+        std::uint64_t alloc_ok{0};
+        std::uint64_t alloc_fail{0};           // size/align/cap/slab throws
+        std::uint64_t free_ok{0};              // successful non-null frees
+        std::uint64_t free_fail{0};            // try_deallocate returned false
+        std::uint64_t live_hwm{0};             // peak live_allocations
+        std::uint64_t retained_hwm{0};         // peak retained_slab_bytes observed
+    };
+
+
     class Pool
     {
     public: // methods
@@ -163,6 +178,9 @@ namespace spallocator
 
         // Outstanding user allocations (successful allocate minus successful free).
         std::uint64_t live_allocation_count() const noexcept;
+
+        // Best-effort counters + high-water marks; see PoolStats.
+        PoolStats stats();
 
         // Handle sharing this pool's control block (bumps handle_refs + block_refs).
         PoolHandle handle();
@@ -191,6 +209,12 @@ namespace spallocator
         static std::unique_ptr<AbstractSlab> makeLazySlab(std::size_t axis,
                                                           std::size_t index);
 
+        void note_alloc_ok() noexcept;
+        void note_alloc_fail() noexcept;
+        void note_free_ok() noexcept;
+        void note_free_fail() noexcept;
+        void observe_retained_hwm(std::uint64_t retained_bytes) noexcept;
+
         // Scratch for allocate's header path (not part of the public API).
         struct Allocation
         {
@@ -208,6 +232,13 @@ namespace spallocator
 
         SpinLock lock;
         SpinLock slab_init_lock;
+
+        std::atomic<std::uint64_t> alloc_ok_{0};
+        std::atomic<std::uint64_t> alloc_fail_{0};
+        std::atomic<std::uint64_t> free_ok_{0};
+        std::atomic<std::uint64_t> free_fail_{0};
+        std::atomic<std::uint64_t> live_hwm_{0};
+        std::atomic<std::uint64_t> retained_hwm_{0};
     };
 
 
@@ -344,6 +375,7 @@ namespace spallocator
         {
             // excessively large allocations don't belong in the pool
             // slabs; use other allocation methods instead
+            note_alloc_fail();
             throw std::out_of_range("Allocation size exceeds maximum limit for pool allocator");
         }
 
@@ -352,6 +384,7 @@ namespace spallocator
         if (alignment < kMinAlignment || alignment > kMaxAlignment ||
             (alignment & (alignment - 1)) != 0)
         {
+            note_alloc_fail();
             throw std::invalid_argument("Unsupported alignment requested");
         }
 
@@ -373,7 +406,15 @@ namespace spallocator
                       alloc_size, axis,
                       (slab == &large_slab) ? "large_slab" : "size_class");
 
-        alloc.ptr = slab->allocateItem(alloc_size);
+        try
+        {
+            alloc.ptr = slab->allocateItem(alloc_size);
+        }
+        catch (...)
+        {
+            note_alloc_fail();
+            throw;
+        }
 
 #if defined(SPALLOCATOR_HAS_ASAN)
         // Slot may have been header-poisoned on a prior free.
@@ -390,6 +431,7 @@ namespace spallocator
         *magic_ptr = kAllocMagic;
 
         control_->note_alloc();
+        note_alloc_ok();
         return alloc.ptr + header_size;
     }
 
@@ -436,6 +478,7 @@ namespace spallocator
                     ASAN_POISON_MEMORY_REGION(item - kHeaderPeek, kHeaderPeek);
                 }
 #endif
+                note_free_fail();
                 return false;
             }
 
@@ -452,6 +495,7 @@ namespace spallocator
                     ASAN_POISON_MEMORY_REGION(item - header_size, header_size);
                 }
 #endif
+                note_free_fail();
                 return false;
             }
 
@@ -468,6 +512,7 @@ namespace spallocator
                     ASAN_POISON_MEMORY_REGION(item - header_size, header_size);
                 }
 #endif
+                note_free_fail();
                 return false;
             }
 
@@ -493,6 +538,7 @@ namespace spallocator
             // May return `this` for heap-owned idle pools — delete only after
             // this method is done touching members.
             Pool* doomed = control_->note_free();
+            note_free_ok();
             if (doomed)
             {
                 delete doomed;
@@ -505,6 +551,7 @@ namespace spallocator
             debug_println(
                 "Pool::try_deallocate: slab deallocate failed for ptr={}",
                 static_cast<void*>(item));
+            note_free_fail();
             return false;
         }
     }
@@ -542,6 +589,7 @@ namespace spallocator
         }
 
         debug_println("Pool::trim(keep_min={}): reclaimed {} slabs", keep_min, reclaimed);
+        observe_retained_hwm(getAllocatedMemory());
         return reclaimed;
     }
 
@@ -579,6 +627,66 @@ namespace spallocator
     inline std::uint64_t Pool::live_allocation_count() const noexcept
     {
         return control_ ? control_->live_allocation_count() : 0;
+    }
+
+
+    inline void Pool::observe_retained_hwm(std::uint64_t retained_bytes) noexcept
+    {
+        std::uint64_t cur = retained_hwm_.load(std::memory_order_relaxed);
+        while (retained_bytes > cur &&
+               !retained_hwm_.compare_exchange_weak(
+                   cur, retained_bytes,
+                   std::memory_order_relaxed, std::memory_order_relaxed))
+        {
+        }
+    }
+
+
+    inline void Pool::note_alloc_ok() noexcept
+    {
+        alloc_ok_.fetch_add(1, std::memory_order_relaxed);
+        const std::uint64_t live = live_allocation_count();
+        std::uint64_t cur = live_hwm_.load(std::memory_order_relaxed);
+        while (live > cur &&
+               !live_hwm_.compare_exchange_weak(
+                   cur, live,
+                   std::memory_order_relaxed, std::memory_order_relaxed))
+        {
+        }
+    }
+
+
+    inline void Pool::note_alloc_fail() noexcept
+    {
+        alloc_fail_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+
+    inline void Pool::note_free_ok() noexcept
+    {
+        free_ok_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+
+    inline void Pool::note_free_fail() noexcept
+    {
+        free_fail_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+
+    inline PoolStats Pool::stats()
+    {
+        PoolStats s;
+        s.live_allocations = live_allocation_count();
+        s.retained_slab_bytes = getAllocatedMemory();
+        observe_retained_hwm(s.retained_slab_bytes);
+        s.alloc_ok = alloc_ok_.load(std::memory_order_relaxed);
+        s.alloc_fail = alloc_fail_.load(std::memory_order_relaxed);
+        s.free_ok = free_ok_.load(std::memory_order_relaxed);
+        s.free_fail = free_fail_.load(std::memory_order_relaxed);
+        s.live_hwm = live_hwm_.load(std::memory_order_relaxed);
+        s.retained_hwm = retained_hwm_.load(std::memory_order_relaxed);
+        return s;
     }
 
 

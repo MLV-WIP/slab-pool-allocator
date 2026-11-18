@@ -194,7 +194,7 @@ make && ./obj/addrsan/tester
 
 ## Future Work
 
-- Memory statistics and profiling API
+- Per-class metrics breakdown (PoolStats counters/HWMs shipped)
 - Configurable SpinLock parameters
 
 ### Research / design backlog

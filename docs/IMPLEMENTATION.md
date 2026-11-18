@@ -916,7 +916,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 | Fixed size-class ladders | Deliberate; shaped buffers are backlog R2 |
 | Lock type | Hard-wired `SpinLock`; pluggable primitive is backlog R5 |
 | MSan in CI | Deferred pending host instrumented runtime |
-| Metrics API | Minimal (`getAllocatedMemory`); richer stats planned |
+| Metrics API | `PoolStats` / `Pool::stats()` (alloc/free counters + HWMs); richer per-class breakdown later |
 | C API | C++ only today; C99 wrapper is backlog R4 |
 
 These are engineering follow-ons, not soft-pedaled “educational” gaps. Pool
@@ -929,7 +929,7 @@ and [API.md](API.md); remaining rows are scale/API surface, not silent UB.
 
 Near-term / opportunistic:
 
-- Richer allocation / fragmentation metrics API  
+- Per-class breakdown on top of `PoolStats` (P19 phase A shipped counters/HWMs)  
 - Intrusive freelist if next-fit + CTZ still dominate profiles  
 - Denser free address lookup if `std::map` shows hot at large `m`  
 - Thread-local caches; NUMA-aware buffers  

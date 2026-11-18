@@ -24,6 +24,7 @@ Unless noted, types are in namespace `spallocator`. `SpinLock` and
   - [`deallocate` / `try_deallocate`](#deallocate--try_deallocate)
   - [`trim`](#trim)
   - [`getAllocatedMemory`](#getallocatedmemory)
+  - [`stats` / `PoolStats`](#stats--poolstats)
   - [`selectSlab`](#selectslab)
   - [Lifetime models](#lifetime-models)
 - [Slab & SlabProxy](#slab--slabproxy)
@@ -155,6 +156,7 @@ Pool();
 PoolHandle handle();
 PoolBlockToken block_token();
 std::uint64_t live_allocation_count() const noexcept;
+PoolStats stats();
 PoolControlBlock* control() const noexcept;  // diagnostics
 ```
 
@@ -425,6 +427,35 @@ std::size_t getAllocatedMemory();
 | **Returns** | Sum of bytes in **retained size-class slab buffers** currently held by the pool (not a live “bytes in use by clients” counter, and not counting transient `SlabProxy` blocks). |
 | **Thread safety** | Safe. |
 | **Use** | Approximate RSS contribution of pooled slabs; pair with `trim` when investigating retention. |
+
+### `stats` / `PoolStats`
+
+```cpp
+struct PoolStats {
+    std::uint64_t live_allocations;     // outstanding successful allocs
+    std::uint64_t retained_slab_bytes;  // size-class buffers held (same basis as getAllocatedMemory)
+    std::uint64_t alloc_ok;
+    std::uint64_t alloc_fail;           // size/align/cap/slab failures
+    std::uint64_t free_ok;              // successful non-null frees
+    std::uint64_t free_fail;            // try_deallocate returned false
+    std::uint64_t live_hwm;             // peak live_allocations
+    std::uint64_t retained_hwm;         // peak retained_slab_bytes observed
+};
+
+PoolStats stats();
+```
+
+| | |
+|--|--|
+| **Returns** | Best-effort snapshot of counters and high-water marks (HWMs). Not a single transactional freeze under concurrency. |
+| **`live_*` vs `retained_*`** | Live = outstanding client allocations. Retained = bytes in size-class slab buffers still mapped (may stay high after free until `trim`). |
+| **`retained_hwm`** | Advanced when `stats()` or `trim()` observes a higher retained total (not on every allocate). |
+| **Thread safety** | Safe; counters use relaxed atomics. |
+
+```cpp
+auto s = pool.stats();
+if (s.live_hwm > threshold) { /* alert */ }
+```
 
 ### `selectSlab`
 
