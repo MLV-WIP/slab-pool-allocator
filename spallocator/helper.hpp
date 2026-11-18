@@ -71,6 +71,28 @@ namespace spallocator
     }
 
 
+    // Compile-time size caps (override via -D / ./configure). Not runtime-tunable.
+#ifndef SPALLOCATOR_MAX_ALLOCATION_BYTES
+#  define SPALLOCATOR_MAX_ALLOCATION_BYTES (1024ull * 1024ull * 1024ull) // 1 GiB
+#endif
+#ifndef SPALLOCATOR_MAX_CLASS_BYTES
+#  define SPALLOCATOR_MAX_CLASS_BYTES (4ull * 1024ull * 1024ull * 1024ull) // 4 GiB
+#endif
+
+    inline constexpr std::size_t kMaxAllocationBytes =
+        static_cast<std::size_t>(SPALLOCATOR_MAX_ALLOCATION_BYTES);
+    inline constexpr std::size_t kMaxClassBytes =
+        static_cast<std::size_t>(SPALLOCATOR_MAX_CLASS_BYTES);
+
+    // Largest ladder slot today is 4096; max header/axis is 64.
+    static_assert(kMaxAllocationBytes >= 4096u + 64u,
+        "kMaxAllocationBytes must cover largest size-class footprint plus header");
+    static_assert(kMaxClassBytes >= 16u * 4096u,
+        "kMaxClassBytes must fit at least one max-ladder buffer (16 x 4096)");
+    static_assert(kMaxClassBytes >= kMaxAllocationBytes,
+        "kMaxClassBytes should be at least kMaxAllocationBytes");
+
+
     #if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
         using std::print;
         using std::println;

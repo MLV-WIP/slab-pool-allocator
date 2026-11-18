@@ -30,6 +30,8 @@ ENABLE_COVERAGE="auto"
 VERBOSE="no"
 SLAB_TARGET_BYTES="8192"
 SLAB_TARGET_MULTIPLIER="16"
+MAX_ALLOCATION_MIB="1024"           # 1 GiB
+MAX_CLASS_MIB="4096"                # 4 GiB
 
 # Detected values
 DETECTED_CXX=""
@@ -95,6 +97,12 @@ Optional Packages:
   --with-slab-target-multiplier=N
                           minimum slots per slab buffer (minimum 4)
                           [default: 16]
+  --with-max-allocation-mib=N
+                          compile-time max single allocation in MiB (1024^2)
+                          [default: 1024]
+  --with-max-class-mib=N
+                          compile-time max retained per size class in MiB
+                          [default: 4096]
 
 Examples:
   ./configure
@@ -102,6 +110,7 @@ Examples:
   ./configure --with-gtest=/usr/local --disable-tests
   ./configure --prefix=/opt/spallocator --build-type=release
   ./configure --with-slab-target-bytes=16384 --with-slab-target-multiplier=16
+  ./configure --with-max-allocation-mib=256 --with-max-class-mib=1024
 
 EOF
 }
@@ -182,6 +191,12 @@ for arg in "$@"; do
         --with-slab-target-multiplier=*)
             SLAB_TARGET_MULTIPLIER="${arg#*=}"
             ;;
+        --with-max-allocation-mib=*)
+            MAX_ALLOCATION_MIB="${arg#*=}"
+            ;;
+        --with-max-class-mib=*)
+            MAX_CLASS_MIB="${arg#*=}"
+            ;;
         *)
             print_error "Unknown option: $arg"
             usage
@@ -190,7 +205,7 @@ for arg in "$@"; do
     esac
 done
 
-# Light validation of slab packing knobs (static_assert is authoritative).
+# Light validation of compile-time size knobs (static_assert is authoritative).
 if ! [[ "$SLAB_TARGET_BYTES" =~ ^[1-9][0-9]*$ ]]; then
     print_error "--with-slab-target-bytes must be a positive integer (got: $SLAB_TARGET_BYTES)"
     exit 1
@@ -207,6 +222,21 @@ if [ $((SLAB_TARGET_BYTES & (SLAB_TARGET_BYTES - 1))) -ne 0 ]; then
     print_error "--with-slab-target-bytes must be a power of two (got: $SLAB_TARGET_BYTES)"
     exit 1
 fi
+if ! [[ "$MAX_ALLOCATION_MIB" =~ ^[1-9][0-9]*$ ]]; then
+    print_error "--with-max-allocation-mib must be a positive integer (got: $MAX_ALLOCATION_MIB)"
+    exit 1
+fi
+if ! [[ "$MAX_CLASS_MIB" =~ ^[1-9][0-9]*$ ]]; then
+    print_error "--with-max-class-mib must be a positive integer (got: $MAX_CLASS_MIB)"
+    exit 1
+fi
+# 1 MiB already exceeds helper.hpp floors (4096+64 / 16*4096).
+if [ "$MAX_CLASS_MIB" -lt "$MAX_ALLOCATION_MIB" ]; then
+    print_error "--with-max-class-mib ($MAX_CLASS_MIB) must be >= --with-max-allocation-mib ($MAX_ALLOCATION_MIB)"
+    exit 1
+fi
+MAX_ALLOCATION_BYTES=$((MAX_ALLOCATION_MIB * 1024 * 1024))
+MAX_CLASS_BYTES=$((MAX_CLASS_MIB * 1024 * 1024))
 
 # Validate build type
 case $BUILD_TYPE in
@@ -556,17 +586,19 @@ echo "  ThreadSanitizer:      $ENABLE_TSAN"
 echo "  Code coverage:        $ENABLE_COVERAGE"
 echo "  Slab target bytes:    $SLAB_TARGET_BYTES"
 echo "  Slab target mult:     $SLAB_TARGET_MULTIPLIER"
+echo "  Max allocation MiB:   $MAX_ALLOCATION_MIB ($MAX_ALLOCATION_BYTES bytes)"
+echo "  Max class MiB:        $MAX_CLASS_MIB ($MAX_CLASS_BYTES bytes)"
 echo ""
 
 # Generate config.mk
 print_info "Generating config.mk..."
 
-# Append packing knobs as -D so headers' #ifndef defaults are overridden.
-SLAB_CXXFLAGS="-DSPALLOCATOR_SLAB_TARGET_BYTES=$SLAB_TARGET_BYTES -DSPALLOCATOR_SLAB_TARGET_MULTIPLIER=$SLAB_TARGET_MULTIPLIER"
+# Append size knobs as -D so headers' #ifndef defaults are overridden.
+SIZE_CXXFLAGS="-DSPALLOCATOR_SLAB_TARGET_BYTES=$SLAB_TARGET_BYTES -DSPALLOCATOR_SLAB_TARGET_MULTIPLIER=$SLAB_TARGET_MULTIPLIER -DSPALLOCATOR_MAX_ALLOCATION_BYTES=$MAX_ALLOCATION_BYTES -DSPALLOCATOR_MAX_CLASS_BYTES=$MAX_CLASS_BYTES"
 if [ -n "$CXXFLAGS" ]; then
-    USER_CXXFLAGS_VALUE="$CXXFLAGS $SLAB_CXXFLAGS"
+    USER_CXXFLAGS_VALUE="$CXXFLAGS $SIZE_CXXFLAGS"
 else
-    USER_CXXFLAGS_VALUE="$SLAB_CXXFLAGS"
+    USER_CXXFLAGS_VALUE="$SIZE_CXXFLAGS"
 fi
 
 cat > config.mk << EOF

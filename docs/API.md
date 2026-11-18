@@ -339,13 +339,13 @@ a pointer to that payload (past the hidden header).
 
 | Parameter | Description |
 |-----------|-------------|
-| `size` | Number of bytes the caller will use. Must be `≤ 1_GB`. |
+| `size` | Number of bytes the caller will use. Must be `≤ kMaxAllocationBytes` (default 1 GiB). |
 | `alignment` | Required alignment of the returned pointer. Default `8`. Must be a power of two in `[kMinAlignment, kMaxAlignment]` (`4`…`64`). |
 
 | | |
 |--|--|
 | **Returns** | Pointer to `size` usable bytes, aligned to `alignment`. Exclusive ownership until free. |
-| **Throws** | `std::out_of_range` if `size > 1_GB`; `std::invalid_argument` if `alignment` is out of range or not a power of two; may also throw from the underlying system allocator (`std::bad_alloc` / `new`). |
+| **Throws** | `std::out_of_range` if `size > kMaxAllocationBytes`; `std::invalid_argument` if `alignment` is out of range or not a power of two; may also throw from the underlying system allocator (`std::bad_alloc` / `new`). |
 | **Thread safety** | Safe for concurrent callers on the same `Pool`. |
 
 ```cpp
@@ -921,6 +921,17 @@ constexpr std::size_t operator""_GB(unsigned long long value);  // × 1024³
 using spallocator::operator""_KB;
 auto n = 4_KB;
 ```
+
+### Compile-time size caps
+
+| Constant | Default | Override |
+|----------|---------|----------|
+| `kMaxAllocationBytes` | 1 GiB | `-DSPALLOCATOR_MAX_ALLOCATION_BYTES=N` (bytes) or `./configure --with-max-allocation-mib=N` |
+| `kMaxClassBytes` | 4 GiB | `-DSPALLOCATOR_MAX_CLASS_BYTES=N` (bytes) or `./configure --with-max-class-mib=N` |
+
+`Pool::allocate` / `SlabProxy` reject requests above `kMaxAllocationBytes`. Each
+`Slab` caps retained buffers so total class storage stays ≤ `kMaxClassBytes`.
+Not runtime-tunable; `static_assert` enforces floor relationships at compile time.
 
 ### Debug / verbose print
 

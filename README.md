@@ -39,8 +39,9 @@ The Makefile works with defaults (`BUILD_TYPE=addrsan`) or with `./configure` fo
 ```bash
 # Optional: generate config.mk
 ./configure --enable-tests --enable-demo
-# optional packing knobs (compile-time; defaults 8192 / 16):
+# optional compile-time size knobs (defaults 8192 / 16 / 1024 MiB / 4096 MiB):
 # ./configure --with-slab-target-bytes=16384 --with-slab-target-multiplier=16
+# ./configure --with-max-allocation-mib=256 --with-max-class-mib=1024
 
 # Build all enabled targets (tests + demos)
 make

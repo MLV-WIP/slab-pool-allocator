@@ -194,7 +194,9 @@ namespace spallocator
         // Per-slab slot maps stay std::bitset (compile-time slot count).
         // Convention: bit set ⇒ slot occupied; clear ⇒ free.
         std::vector<std::bitset<slots_per_buffer>> slab_map;
-        static constexpr std::size_t max_slabs{4_GB / slab_alloc_size};
+        static constexpr std::size_t max_slabs{kMaxClassBytes / slab_alloc_size};
+        static_assert(max_slabs >= 1,
+            "kMaxClassBytes must allow at least one buffer of this ElemSize");
         DynBitset slab_available_map;
 
         std::map<std::byte*, std::size_t> base_address_map;
@@ -714,7 +716,7 @@ namespace spallocator
             throw std::invalid_argument(
                 std::format("SlabProxy should only be used for large allocations, got {}", elem_size));
         }
-        if (elem_size > 1_GB)
+        if (elem_size > kMaxAllocationBytes)
         {
             throw std::out_of_range(
                 std::format("Requested size {} exceeds maximum allowed size for SlabProxy", elem_size));

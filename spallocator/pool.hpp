@@ -371,7 +371,7 @@ namespace spallocator
         Allocation alloc;
         alloc.size = item_size;
 
-        if (item_size > 1_GB)
+        if (item_size > kMaxAllocationBytes)
         {
             // excessively large allocations don't belong in the pool
             // slabs; use other allocation methods instead
@@ -501,7 +501,8 @@ namespace spallocator
 
             uint32_t alloc_size_u32 = *reinterpret_cast<uint32_t*>(item - 4);
             std::size_t alloc_size = alloc_size_u32;
-            if (alloc_size < header_size || alloc_size > 1_GB + kMaxAlignment)
+            if (alloc_size < header_size ||
+                alloc_size > kMaxAllocationBytes + kMaxAlignment)
             {
                 debug_println(
                     "Invalid allocation size {} in header at ptr={} (header_size={})",

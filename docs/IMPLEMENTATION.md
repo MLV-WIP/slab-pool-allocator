@@ -144,7 +144,7 @@ Before trusting the header:
 
 1. `header_size ∈ {8,16,32,64}`  
 2. Magic equals `kAllocMagic`  
-3. Footprint in a plausible range (`header_size ≤ alloc_size ≤ 1_GB + max align`)  
+3. Footprint in a plausible range (`header_size ≤ alloc_size ≤ kMaxAllocationBytes + max align`)  
 
 Failures:
 
@@ -248,8 +248,8 @@ of the current code; see [Thread safety](#thread-safety--lock-ordering).
 
 ### Allocate — `pool.allocate(100)` (default align 8)
 
-1. **Validate (pool, unlocked):** reject `N > 1_GB`; require power-of-two align
-   in `[4, 64]`  
+1. **Validate (pool, unlocked):** reject `N > kMaxAllocationBytes`; require
+   power-of-two align in `[4, 64]`  
 2. **Compute (pool):** `header_size = 8`, `alloc_size = 108`  
 3. **Classify (pool):** `nativeAxis(8) → 16`; class **128B** (108 > 96)  
 4. **Resolve backend (pool lock, brief):** `slabs16[index]` or lazy create path  
@@ -330,6 +330,8 @@ one axis.
   **8 KiB** target / **16** min slots, overridable at compile time via
   `./configure --with-slab-target-*`)
   when `ElemSize < 1_KB`, otherwise a small multiple of `ElemSize`)  
+- At most `kMaxClassBytes / slab_alloc_size` buffers (default **4 GiB** class
+  cap; `./configure --with-max-class-mib`)  
 - Per-buffer freemap of slots  
 - Growable availability map (`DynBitset`) across buffers  
 - `base_address_map` for free  

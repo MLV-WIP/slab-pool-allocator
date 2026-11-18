@@ -509,7 +509,7 @@ TEST(PoolTest, StatsCountsAllocAndFreeFailures)
     // approaching/hitting policy errors (align, size cap) without scraping logs.
     Pool pool;
     EXPECT_THROW(pool.allocate(16, 12), std::invalid_argument); // not power of two
-    EXPECT_THROW(pool.allocate(2_GB), std::out_of_range);
+    EXPECT_THROW(pool.allocate(kMaxAllocationBytes + 1), std::out_of_range);
 
     std::byte junk{};
     EXPECT_FALSE(pool.try_deallocate(&junk));
@@ -825,7 +825,7 @@ TEST(SlabProxyTest, SizeLimitsThrow)
         auto* p = proxy.allocateItem(1_KB + 1);
         proxy.deallocateItem(p);
     });
-    EXPECT_THROW(proxy.allocateItem(1_GB + 1), std::out_of_range);
+    EXPECT_THROW(proxy.allocateItem(kMaxAllocationBytes + 1), std::out_of_range);
 }
 
 
