@@ -32,9 +32,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -1368,10 +1370,17 @@ TEST(PoolTest, MultiThreadTest)
 
     constexpr int allocations_per_thread = 10000;
 
+    // Seed on the main thread only — std::random_device is not required to be
+    // thread-safe, so workers must not share a single device.
     std::random_device rd;
+    std::vector<std::uint32_t> seeds(num_threads);
+    for (std::uint32_t& seed : seeds)
+    {
+        seed = rd();
+    }
 
-    auto worker = [&pool, &rd]() {
-        std::mt19937 gen(rd());
+    auto worker = [&pool](std::uint32_t seed) {
+        std::mt19937 gen(seed);
         std::uniform_int_distribution<int> dist(0, 1000);
         std::vector<std::byte*> items;
         for (int i = 0; i < allocations_per_thread; ++i)
@@ -1389,9 +1398,10 @@ TEST(PoolTest, MultiThreadTest)
     };
 
     std::vector<std::thread> threads;
-    for (size_t i = 0; i < num_threads; ++i)
+    threads.reserve(num_threads);
+    for (std::size_t i = 0; i < num_threads; ++i)
     {
-        threads.emplace_back(worker);
+        threads.emplace_back(worker, seeds[i]);
     }
 
     for (auto& t : threads)
