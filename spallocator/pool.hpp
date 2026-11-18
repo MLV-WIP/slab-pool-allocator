@@ -140,7 +140,7 @@ namespace spallocator
     }
 
 
-    // Best-effort ops snapshot (P19). Counters use relaxed atomics; fields may
+    // Best-effort ops snapshot. Counters use relaxed atomics; fields may
     // not form a single transactional freeze under concurrency.
     struct PoolStats
     {

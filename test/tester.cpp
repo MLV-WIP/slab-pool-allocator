@@ -79,24 +79,32 @@ TEST(BitsetSearchTest, FindNextClearBit)
 
 TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
 {
-    // After filling slots [0, cursor), a free bit below the cursor must not
-    // steal the next alloc — next-fit continues forward.
+    // Why: next-fit must not regress to first-fit. After advancing the cursor,
+    // a free slot *behind* it must not win the next allocate — otherwise LIFO
+    // churn re-scans the front of the freemap every time.
+    //
+    // Slot indices are derived from selectBufferSize<>() so the scenario stays
+    // valid across kSlabTargetBytes / multiplier configure knobs (old tests
+    // hard-coded 200/50 for a 256-slot 4 KiB buffer).
     Slab<16, 16> slab;
     constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
+    static_assert(kSlots >= 16);
+    constexpr std::size_t kCursor = kSlots / 2;
+    constexpr std::size_t kEarlier = kCursor / 4;
     std::vector<std::byte*> items;
     items.reserve(kSlots);
 
-    constexpr std::size_t kCursor = 200;
     for (std::size_t i = 0; i < kCursor; ++i)
     {
         items.push_back(slab.allocateItem(16));
     }
     std::byte* const base = items.front();
-    slab.deallocateItem(items[50]);
-    items[50] = nullptr;
+    // Hole behind the cursor (would win under first-fit).
+    slab.deallocateItem(items[kEarlier]);
+    items[kEarlier] = nullptr;
 
     std::byte* next = slab.allocateItem(16);
-    EXPECT_EQ(next, base + kCursor * 16);
+    EXPECT_EQ(next, base + kCursor * 16); // continues forward, ignores hole
     items.push_back(next);
     EXPECT_EQ(slab.getSlabCount(), 1u);
 
@@ -112,9 +120,17 @@ TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
 
 TEST(SlabTest, NextFitWrapsWithinBuffer)
 {
-    // Cursor past the only free slot → wrap within the same buffer (no grow).
+    // Why: when the only free slot is below the cursor, next-fit must wrap
+    // *once within the same buffer* before growing. Growing here would waste
+    // RSS and break the “reuse holes in the current slab” contract.
+    //
+    // Fill the whole buffer, park the cursor near the end, free a low slot,
+    // then prove the next alloc returns that low slot without adding a buffer.
     Slab<16, 16> slab;
     constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
+    static_assert(kSlots >= 16);
+    constexpr std::size_t kHigh = kSlots - 6;
+    constexpr std::size_t kLow = 10;
     std::vector<std::byte*> items;
     items.reserve(kSlots);
     for (std::size_t i = 0; i < kSlots; ++i)
@@ -124,18 +140,18 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
     EXPECT_EQ(slab.getSlabCount(), 1u);
     std::byte* const base = items.front();
 
-    // Move cursor just past a high slot, then free a low slot only.
-    slab.deallocateItem(items[250]);
-    items[250] = slab.allocateItem(16); // cursor now at 251
-    EXPECT_EQ(items[250], base + 250 * 16);
+    // Re-take kHigh so the cursor sits at kHigh + 1 (past the only soon-free hole).
+    slab.deallocateItem(items[kHigh]);
+    items[kHigh] = slab.allocateItem(16);
+    EXPECT_EQ(items[kHigh], base + kHigh * 16);
 
-    slab.deallocateItem(items[10]);
-    items[10] = nullptr;
+    slab.deallocateItem(items[kLow]);
+    items[kLow] = nullptr;
 
     std::byte* wrapped = slab.allocateItem(16);
-    EXPECT_EQ(wrapped, base + 10 * 16);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
-    items[10] = wrapped;
+    EXPECT_EQ(wrapped, base + kLow * 16);
+    EXPECT_EQ(slab.getSlabCount(), 1u); // wrap, do not grow
+    items[kLow] = wrapped;
 
     for (auto* p : items)
     {
@@ -146,6 +162,9 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
 
 TEST(SlabTest, NextFitSurvivesReclaim)
 {
+    // Why: reclaimEmptySlabs swap-with-last invalidates buffer indices, so the
+    // next-fit cursor must be reset. After growing to two buffers, freeing all,
+    // and reclaiming one, alloc/free on the survivor must still work.
     Slab<16, 16> slab;
     constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
     std::vector<std::byte*> items;
@@ -163,7 +182,6 @@ TEST(SlabTest, NextFitSurvivesReclaim)
     EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
     EXPECT_EQ(slab.getSlabCount(), 1u);
 
-    // Cursor was reset on reclaim; alloc/free still works on the survivor.
     auto* p = slab.allocateItem(16);
     ASSERT_NE(p, nullptr);
     slab.deallocateItem(p);
@@ -174,6 +192,8 @@ TEST(SlabTest, NextFitSurvivesReclaim)
 // records ns/op via RecordProperty; prefer BUILD_TYPE=release for numbers.
 TEST(SlabTest, AllocFreeChurnMicrobench)
 {
+    // Warm a full buffer then LIFO churn; slot count follows selectBufferSize
+    // so the warm-up still saturates exactly one buffer under any packing knobs.
     Slab<16, 16> slab;
     constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
 #if defined(NDEBUG)
@@ -216,6 +236,9 @@ TEST(SlabTest, AllocFreeChurnMicrobench)
 
 TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
 {
+    // Why: empty buffers are retained by default (monotonic growth); reclaim
+    // must drop extras while keeping ≥ keep_min. Capacity is selectBufferSize
+    // based so “fill one buffer + 1” still forces a second buffer after packing.
     Slab<16, 16> slab;
     constexpr std::size_t kSlotsPerSlab = selectBufferSize<16>() / 16;
     EXPECT_EQ(slab.getSlabCount(), 1u);
@@ -259,7 +282,7 @@ TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
 }
 
 
-// P18 step 1: control block + live_allocs + handle() (no heap retire yet).
+// Control block + live_allocs + handle() (stack pool; no heap auto-retire).
 TEST(PoolTest, ControlBlockTracksLiveAllocsAndHandle)
 {
     Pool pool;
@@ -315,7 +338,7 @@ TEST(PoolTest, ControlBlockSurvivesPoolWhenHandleRemains)
 }
 
 
-// P18 step 2: heap PoolHandle::create + retire when handles and allocs are 0.
+// Heap PoolHandle::create + retire when handles and live allocs are both zero.
 TEST(PoolTest, PoolHandleCreateRetiresWhenEmptyHandleDropped)
 {
     PoolControlBlock* block = nullptr;
@@ -401,7 +424,7 @@ int ArenaDtorProbe::destructions = 0;
 } // namespace
 
 
-// P18 step 3: deleter token + arena no-op (skip ~T when pool already dead).
+// Arena teardown: PoolDeleter sees !alive and skips ~T / free.
 TEST(PoolTest, ArenaDestroySkipsTypedDestructorInDeleter)
 {
     ArenaDtorProbe::destructions = 0;
@@ -442,9 +465,10 @@ TEST(PoolTest, MakePoolUniqueFromHandle)
 }
 
 
-// P19 phase A: PoolStats counters and high-water marks.
 TEST(PoolTest, StatsTracksAllocFreeAndLiveHwm)
 {
+    // Why: ops need live vs retained pressure and peak live (HWM) before hard
+    // caps trip. HWM must not fall when frees drop the current live count.
     Pool pool;
     PoolStats empty = pool.stats();
     EXPECT_EQ(empty.live_allocations, 0u);
@@ -468,7 +492,7 @@ TEST(PoolTest, StatsTracksAllocFreeAndLiveHwm)
     PoolStats after_one = pool.stats();
     EXPECT_EQ(after_one.live_allocations, 1u);
     EXPECT_EQ(after_one.free_ok, 1u);
-    EXPECT_EQ(after_one.live_hwm, 2u); // HWM does not fall
+    EXPECT_EQ(after_one.live_hwm, 2u); // peak retained after free
 
     pool.deallocate(b);
     PoolStats done = pool.stats();
@@ -481,6 +505,8 @@ TEST(PoolTest, StatsTracksAllocFreeAndLiveHwm)
 
 TEST(PoolTest, StatsCountsAllocAndFreeFailures)
 {
+    // Why: alloc_fail / free_fail are the alert signals for bad clients and
+    // approaching/hitting policy errors (align, size cap) without scraping logs.
     Pool pool;
     EXPECT_THROW(pool.allocate(16, 12), std::invalid_argument); // not power of two
     EXPECT_THROW(pool.allocate(2_GB), std::out_of_range);
@@ -554,10 +580,13 @@ TEST(PoolTest, MakePoolSharedFromHandle)
 
 TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
 {
+    // Why: Pool::trim is the ops path to return peak RSS after load drops.
+    // Grow the 32 B size class past one buffer, free everything, then trim
+    // back to the eager baseline. Slot count uses selectBufferSize<32>().
     Pool pool;
     const std::size_t before = pool.getAllocatedMemory();
 
-    // allocate(16) → footprint 24 → 32B class.
+    // allocate(16) → footprint 24 → 32 B class on axis 16.
     constexpr std::size_t kSlotsPerSlab = selectBufferSize<32>() / 32;
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
@@ -580,7 +609,9 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
 
 TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
 {
-    // Former fixed bitset<4_GB/4_KB> was 128 KiB per Slab instance.
+    // Why: DynBitset must stay tiny vs the old fixed bitset<max_slabs>
+    // (~128 KiB when buffers were 4 KiB). Filling one packed buffer + 1 forces
+    // a second live slab so we also check the map grows with live count only.
     constexpr std::size_t kLegacyFixedBytes = 128_KB;
 
     Slab<16, 16> slab;
@@ -589,7 +620,6 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
     EXPECT_LT(slab.getAvailabilityMapBytes(), kLegacyFixedBytes);
     EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
 
-    // Fill the first buffer to force a second slab.
     constexpr std::size_t kSlotsPerSlab = selectBufferSize<16>() / 16;
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
@@ -610,8 +640,48 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
 }
 
 
+TEST(SlabTest, SelectBufferSizeExactPackAndFloors)
+{
+    // Why: buffer packing must leave zero unused tail bytes (old fixed 4 KiB
+    // buffers wasted up to 6.25% on 384/768) and honor both knobs:
+    //   slots = max(kSlabTargetMultiplier, kSlabTargetBytes / ElemSize)
+    //   buffer = slots * ElemSize
+    // Classes below were the worst historical tails under 4 KiB buffers.
+    EXPECT_EQ(selectBufferSize<48>() % 48u, 0u);
+    EXPECT_EQ(selectBufferSize<96>() % 96u, 0u);
+    EXPECT_EQ(selectBufferSize<192>() % 192u, 0u);
+    EXPECT_EQ(selectBufferSize<384>() % 384u, 0u);
+    EXPECT_EQ(selectBufferSize<768>() % 768u, 0u);
+
+    // Soft target wins when target/ElemSize > multiplier (may be slightly
+    // under kSlabTargetBytes for odd ElemSize — that is intentional exact pack).
+    EXPECT_EQ(selectBufferSize<16>(),
+              (kSlabTargetBytes / 16) * 16);
+    EXPECT_EQ(selectBufferSize<48>(),
+              (kSlabTargetBytes / 48) * 48);
+    EXPECT_EQ(selectBufferSize<384>(),
+              (kSlabTargetBytes / 384) * 384);
+
+    // Hard floor: large classes must not starve at 4 slots (old ElemSize*4);
+    // they get exactly kSlabTargetMultiplier slots.
+    EXPECT_EQ(selectBufferSize<1_KB>(), kSlabTargetMultiplier * 1_KB);
+    EXPECT_EQ(selectBufferSize<4096>(), kSlabTargetMultiplier * 4096u);
+
+    // Slab<> must publish the same size the freemap/bitset was compiled with.
+    Slab<48, 16> s48;
+    Slab<384, 16> s384;
+    EXPECT_EQ(s48.getAllocSize(), selectBufferSize<48>());
+    EXPECT_EQ(s384.getAllocSize(), selectBufferSize<384>());
+    EXPECT_EQ(s48.getAllocSize() / 48u, kSlabTargetBytes / 48u);
+    EXPECT_GE(s384.getAllocSize() / 384u, kSlabTargetMultiplier);
+}
+
+
 TEST(SlabTest, CreateSlabs)
 {
+    // Smoke: getAllocSize/getAllocatedMemory match selectBufferSize for a
+    // cross-section of classes, including multiplier-floored large sizes and
+    // an odd ElemSize that is not a KiB multiple (KB-multiple assert removed).
     {
         Slab<64> slab;
         EXPECT_EQ(slab.getElemSize(), 64u);
@@ -632,7 +702,6 @@ TEST(SlabTest, CreateSlabs)
         EXPECT_EQ(slab.getElemSize(), 1_KB);
         EXPECT_EQ(slab.getAllocSize(), selectBufferSize<1_KB>());
         EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<1_KB>());
-        // min multiplier floors large classes (default 16 × 1 KiB).
         EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 1_KB);
     }
 
@@ -653,7 +722,6 @@ TEST(SlabTest, CreateSlabs)
     }
 
     {
-        // Odd ElemSize (multiple of 16): exact pack, no KB-multiple requirement.
         Slab<12336> slab;
         EXPECT_EQ(slab.getElemSize(), 12336u);
         EXPECT_EQ(slab.getAllocSize(), selectBufferSize<12336>());
@@ -666,6 +734,9 @@ TEST(SlabTest, CreateSlabs)
 
 TEST(SlabTest, AllocateItems)
 {
+    // Why: growth must happen only after a buffer is full, and retained empty
+    // buffers stay mapped until trim/reclaim (monotonic). Drive fills from
+    // selectBufferSize so expectations track packing knobs.
     Slab<128> slab;
 
     constexpr std::size_t kBuf = selectBufferSize<128>();

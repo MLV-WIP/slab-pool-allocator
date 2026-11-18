@@ -914,10 +914,10 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 
 | Topic | Status |
 |-------|--------|
-| Pool destroy while clients hold pointers | **Addressed (P18)** — ControlBlock / Handle / BlockToken; orderly + arena + heap auto-retire |
+| Pool destroy while clients hold pointers | **Addressed** — ControlBlock / Handle / BlockToken; orderly + arena + heap auto-retire |
 | Alloc bit scan | Next-fit + CTZ word search (production); freelist if still hot |
 | Address map | O(log m); denser structures if free is hot |
-| Fixed size-class ladders | Deliberate; exact-pack buffers (P19 B); non-ladder shaping is backlog R2 |
+| Fixed size-class ladders | Deliberate; exact-pack buffers within classes; non-ladder shaping is backlog R2 |
 | Lock type | Hard-wired `SpinLock`; pluggable primitive is backlog R5 |
 | MSan in CI | Deferred pending host instrumented runtime |
 | Metrics API | `PoolStats` / `Pool::stats()` (alloc/free counters + HWMs); richer per-class breakdown later |
@@ -933,7 +933,7 @@ and [API.md](API.md); remaining rows are scale/API surface, not silent UB.
 
 Near-term / opportunistic:
 
-- Per-class breakdown on top of `PoolStats` (P19 phase A shipped counters/HWMs)  
+- Per-class breakdown on top of `PoolStats` (counters/HWMs already shipped)  
 - Intrusive freelist if next-fit + CTZ still dominate profiles  
 - Denser free address lookup if `std::map` shows hot at large `m`  
 - Thread-local caches; NUMA-aware buffers  
@@ -948,8 +948,8 @@ Also tracked on the
 
 | Item | Notes |
 |------|--------|
-| Non–fixed-class buffer shaping | Drop ladders entirely; P19 B already exact-packs within classes (`kSlabTargetBytes` / multiplier) |
-| Pool lifetime vs smart pointers | **Done (P18)** — ControlBlock / Handle / BlockToken; orderly + arena + heap retire |
+| Non–fixed-class buffer shaping | Drop ladders entirely; buffers already exact-pack within classes (`kSlabTargetBytes` / multiplier) |
+| Pool lifetime vs smart pointers | **Done** — ControlBlock / Handle / BlockToken; orderly + arena + heap retire |
 | C99 wrapper | Opaque pool handle API for C callers |
 | Pluggable lock primitive | Compile-time choice of `SpinLock` vs `std::mutex` (or similar) for Pool/Slab |
 
