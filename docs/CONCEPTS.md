@@ -36,6 +36,7 @@ to weaken them.
 - [Observing lifetime without owning](#observing-lifetime-without-owning)
 - [Putting the pieces together](#putting-the-pieces-together)
 - [Concepts illustrated](#concepts-illustrated)
+- [Choosing a memory strategy](#choosing-a-memory-strategy)
 - [Further reading](#further-reading)
 
 ---
@@ -487,6 +488,32 @@ arena (pool first — bulk reclaim; documented destructor-skip for
 `unique_pool_ptr`). Details:
 [IMPLEMENTATION.md — Pool lifetime](IMPLEMENTATION.md#pool-lifetime-controlblock--poolhandle).
 
+### Finalization vs reclamation
+
+It helps to name two distinct steps that `delete` usually bundles together:
+
+| Term | Meaning | In this library |
+|------|---------|-----------------|
+| **Finalization** | Run `~T()` (release non-memory resources, break invariants) | Orderly path: `PoolDeleter` always finalizes while the pool is alive |
+| **Reclamation** | Return or drop the underlying storage | Orderly: return the slot to a slab freemap. Arena: `~Pool` drops slabs in bulk |
+
+**Orderly teardown** does both, in the usual C++ order: finalize then reclaim,
+per object, under smart-pointer / container lifetime.
+
+**Arena teardown** (`~Pool` while `unique_pool_ptr` / `make_pool_shared` owners
+may still exist) **skips finalization and per-object reclaim** in `PoolDeleter`
+when the control block is already `!alive`, then reclaims storage by destroying
+slabs. That matches deferred-reclamation thinking: reclaim a whole domain at a
+chosen moment. It is safe for byte buffers and **trivially destructible**
+payloads; for types with meaningful destructors, prefer orderly teardown (or
+accept that `~T()` will not run). Do not rely on one arena-reclaimed object
+observing another during skipped finalization - there is no destruction order.
+
+`PoolDeleter` is **stateful** (it holds a `PoolBlockToken`). Empty / EBO-friendly
+deleters are preferable when size matters, but the token is required so arena
+`~Pool` can be observed safely without parking the control block in the slab.
+That size cost is intentional.
+
 ### Exception safety (the strong guarantee)
 
 When constructing an array of `N` elements, if element *k* throws:
@@ -626,6 +653,7 @@ reading headers or teaching from the repo.
 - Slab allocation vs general heap  
 - Headers / metadata beside the payload (pool protocol over slab slots)  
 - Internal vs external fragmentation  
+- Finalization vs reclamation (orderly vs arena)  
 - RAII and custom deleters / allocators  
 
 ### Data structures
@@ -643,11 +671,65 @@ reading headers or teaching from the repo.
 
 ---
 
+## Choosing a memory strategy
+
+Custom allocation pays off only when the default path is a measured bottleneck
+or when you need a named lifetime / isolation domain. Prefer the simplest tool
+that meets the workload; re-check after compiler or standard-library upgrades.
+
+### When to use what
+
+| Need | Prefer | Why |
+|------|--------|-----|
+| General-purpose alloc/free; no special lifetime story | `new` / `delete`, `std::allocator`, containers as usual | Highly tuned; zero maintenance in *your* code |
+| STL containers with a shared runtime resource; stack buffers; easy composition | `std::pmr` (`monotonic_buffer_resource`, `synchronized_pool_resource` / `unsynchronized_pool_resource`, custom `memory_resource`) | Value-based allocators; virtual dispatch is usually cheap vs allocation itself |
+| Concurrent service churn across many sizes; shardable domains; RAII / STL on a pool; optional arena bulk reclaim | **`spallocator::Pool`** (this library) | Size-class recycling slabs + large fallback + smart pointers / `PoolAllocator` |
+| Bounded phase (request / scene / level); allocate forward; almost no individual free; reclaim everything at end | Bump / size-based arena (not shipped here yet; see backlog) | Fastest shape when reuse is unnecessary - sequential allocate, bulk free |
+
+If profiling cannot show a win over the standard library (or over `std::pmr`
+pool resources) for your sizes and thread model, stay with the standard tools.
+
+### How this library maps to common teaching patterns
+
+Patrice Roy's *C++ Memory Management* (Packt, 2025) walks several patterns that
+line up with - or deliberately differ from - this codebase:
+
+| Pattern (Roy) | Role | Here |
+|---------------|------|------|
+| **Chunked pool** (`ChunkSizedAllocator`-style size categories, smallest fit, overflow path) | Academic multi-size pool | Production analogue: size-class `Slab`s + `SlabProxy`, with **reuse**, growth, headers, and `trim` |
+| **Size-based bump arena** (sequential allocate, empty individual free, destroy domain to reclaim) | Scene / level / bounded N | Closest today: arena `~Pool` bulk reclaim. A dedicated bump facility remains design backlog - this `Pool` still classifies and recycles on the hot path |
+| **Deferred reclamation** | Finalize and/or reclaim a group at a chosen moment | Arena path: skip per-object finalization in `PoolDeleter` when `!alive`, reclaim storage with the pool. Prefer orderly teardown when `~T()` must run |
+| **Traditional (type-based) allocator** | Compile-time allocator in the container type | `PoolAllocator<T>` (POCCA/POCMA/POCS false; equality by control block) |
+| **PMR (`memory_resource`)** | Runtime resource pointer; easy to compose | Not shipped yet; `PoolAllocator` remains the primary STL path (no virtual on that path) |
+
+**Alignment note:** Roy's academic chunked example often rounds categories to
+powers of two so contiguous slots stay aligned. This library instead uses
+explicit `Slab<ElemSize, Alignment>` axes and a pool header of
+`max(8, alignment)`, so high-align traffic does not share a layout that cannot
+recover axis and slot base on free.
+
+**Synchronization note:** allocation APIs must be thread-safe. Roy's samples
+often use `std::mutex` and warn that lock cost on free can erase gains. This
+project uses short-section `mlvlib::SpinLock` at pool and per-slab granularity;
+pluggable lock choice is backlog if contention profiles prefer a mutex.
+
+More design detail:
+[IMPLEMENTATION.md - Future work](IMPLEMENTATION.md#future-work) and
+[Smart pointers](IMPLEMENTATION.md#smart-pointers-design).
+
+---
+
 ## Further reading
 
+- Patrice Roy - *C++ Memory Management* (Packt, 2025), especially Ch. 10
+  (arenas / chunked pools), Ch. 11 (deferred reclamation), and Ch. 14
+  (traditional allocators and PMR). Sample code:
+  [PacktPublishing/C-Plus-Plus-Memory-Management](https://github.com/PacktPublishing/C-Plus-Plus-Memory-Management)  
+- [Arena-based memory management (excerpt)](https://deepengineering.net/p/arena-based-memory-management) - public Ch. 10 material  
 - [Bonwick (1994) — The Slab Allocator](https://www.usenix.org/legacy/publications/library/proceedings/bos94/full_papers/bonwick.ps)  
 - [Linux SLAB/SLUB overview](https://www.kernel.org/doc/gorman/html/understand/understand011.html)  
 - [memcached](https://memcached.org/) — popular user-space slab usage  
 - [API.md](API.md) — call the types  
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — layout, trim, complexity, readiness  
 - [SpinLock Analysis](../mlvlib/docs/deepdive/SpinLock_Analysis.md) — lock correctness  
+

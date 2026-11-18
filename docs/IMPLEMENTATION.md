@@ -491,7 +491,7 @@ not change slab internals; they enforce RAII and exception safety on top.
 | Piece | Design point |
 |-------|----------------|
 | `PoolBlockToken` | `block_refs` pin on `PoolControlBlock`; observes `alive`; not a handle pin |
-| `PoolDeleter` | Placement-new counterpart: `~T()` then `try_deallocate`; arrays destroy **reverse** order; if `!alive`, **no-op** (arena); abort on bad free while alive |
+| `PoolDeleter` | Placement-new counterpart: **finalize** (`~T()`) then **reclaim** (`try_deallocate`); arrays destroy **reverse** order; if `!alive`, **no-op** both steps (arena); abort on bad free while alive. Stateful (`PoolBlockToken`) by necessity - see below |
 | `make_pool_unique` | Placement `new`; on ctor throw, return slot (**strong guarantee**); overloads for `Pool&` / `PoolHandle` / token |
 | `make_pool_shared` | Placement `new` + `shared_ptr(p, PoolDeleter)`; object in pool, CB on heap |
 | `PoolAllocator` | Stateful token; no POCCA/POCMA/POCS; equal iff **same control block**; allocate throws `bad_alloc` if `!alive`; deallocate no-ops if dead |
@@ -556,9 +556,18 @@ readable after `~Pool`, without pinning an empty heap pool the way
 | **Arena + `unique_pool_ptr` / `make_pool_shared`** | Pool first while owners may still exist | `PoolDeleter` (token outside the slab; CB on heap for `shared_ptr`) sees `!alive` → skip `~T` and free |
 | **Arena + `PoolAllocator` / raw `allocate_shared`** | **Unsafe** if storage outlives `~Pool` | Standard `~T` / pool-resident CB can UAF — use orderly teardown |
 
-Arena bulk reclaim is the right tool for byte buffers / trivial payloads (or
-when you accept skipped destructors via `PoolDeleter`). Do not park durable
-resources only in pooled objects if you might destroy the pool first.
+Arena bulk reclaim is the right tool for byte buffers / **trivially
+destructible** payloads (or when you accept skipped finalization via
+`PoolDeleter`). Do not park durable resources only in pooled objects if you
+might destroy the pool first. Conceptual vocabulary (finalization vs
+reclamation) and when-to-use guidance:
+[CONCEPTS.md - Choosing a memory strategy](CONCEPTS.md#choosing-a-memory-strategy).
+
+**Why a stateful deleter?** Empty / EBO-friendly `unique_ptr` deleters keep
+`sizeof(unique_ptr)` at a raw pointer. `PoolDeleter` stores a `PoolBlockToken`
+so arena `~Pool` remains observable after storage is gone. That enlarges
+`unique_pool_ptr` relative to a stateless deleter; the cost buys defined
+arena behavior instead of UAF.
 
 Factories accept `Pool&`, `PoolHandle`, or `PoolBlockToken`. Prefer
 `PoolHandle::create()` for heap domains that should auto-retire when idle —
@@ -954,8 +963,12 @@ Also tracked on the
 |------|--------|
 | Non–fixed-class buffer shaping | Drop ladders entirely; buffers already exact-pack within classes (`kSlabTargetBytes` / multiplier) |
 | Pool lifetime vs smart pointers | **Done** — ControlBlock / Handle / BlockToken; orderly + arena + heap retire |
+| Bump / size-based arena facility | Sequential allocate, no individual reuse, bulk reclaim - distinct from recycling `Pool` (see [CONCEPTS - Choosing a memory strategy](CONCEPTS.md#choosing-a-memory-strategy)) |
+| PMR `memory_resource` adapter | Optional `std::pmr` bridge; keep `PoolAllocator` as the primary / non-virtual STL path |
+| Baseline ratio benches | Pool vs `::operator new` / `std::pmr::*pool_resource`; re-check after toolchain upgrades |
 | C99 wrapper | Opaque pool handle API for C callers |
 | Pluggable lock primitive | Compile-time choice of `SpinLock` vs `std::mutex` (or similar) for Pool/Slab |
+| Fail-closed allocate policy | Optional: refuse OS fallback when over caps (timing-critical / bounded domains) |
 
 ---
 

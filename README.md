@@ -227,6 +227,7 @@ Recorded for later (not scheduled). See also
 - [Bonwick (1994) - The Slab Allocator](https://www.usenix.org/legacy/publications/library/proceedings/bos94/full_papers/bonwick.ps) - Original USENIX paper
 - [Linux SLAB/SLUB/SLOB](https://www.kernel.org/doc/gorman/html/understand/understand011.html) - Kernel implementations
 - [memcached](https://memcached.org/) - Popularized slab allocation for user-space
+- Patrice Roy - *C++ Memory Management* (Packt, 2025) - arenas, deferred reclamation, allocators/PMR; strategy mapping in [docs/CONCEPTS.md](docs/CONCEPTS.md#choosing-a-memory-strategy)
 
 ## License
 
