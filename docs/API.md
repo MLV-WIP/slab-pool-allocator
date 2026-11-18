@@ -537,7 +537,7 @@ base-address map for frees.
 | Method | Description |
 |--------|-------------|
 | `allocateItem` / `deallocateItem` | See `AbstractSlab`; guarded by the slab’s `SpinLock`. |
-| `getElemSize()` / `getAlignment()` / `getAllocSize()` | Compile-time slot size, alignment, and buffer size chosen for this specialization. |
+| `getElemSize()` / `getAlignment()` / `getAllocSize()` | Compile-time slot size, alignment, and buffer bytes (`selectBufferSize`: exact multiple of `ElemSize`; see `kSlabTargetBytes` / `kSlabTargetMultiplier`). |
 | `getAllocatedMemory()` | `slab_count × buffer_size` currently retained. |
 | `getAvailabilityMapBytes()` | Bytes used by the growable availability bitset (diagnostics). |
 | `getSlabCount()` | Number of buffers currently held. |

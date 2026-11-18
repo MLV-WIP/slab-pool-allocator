@@ -55,15 +55,37 @@
 namespace spallocator
 {
 
+    // Compile-time slab buffer packing knobs (override via -D / ./configure).
+#ifndef SPALLOCATOR_SLAB_TARGET_BYTES
+#  define SPALLOCATOR_SLAB_TARGET_BYTES (8u * 1024u)
+#endif
+#ifndef SPALLOCATOR_SLAB_TARGET_MULTIPLIER
+#  define SPALLOCATOR_SLAB_TARGET_MULTIPLIER 16u
+#endif
+
+    inline constexpr std::size_t kSlabTargetBytes =
+        SPALLOCATOR_SLAB_TARGET_BYTES;
+    inline constexpr std::size_t kSlabTargetMultiplier =
+        SPALLOCATOR_SLAB_TARGET_MULTIPLIER;
+
+    static_assert(kSlabTargetMultiplier >= 4,
+        "kSlabTargetMultiplier must be at least 4 (min slots per buffer)");
+    static_assert(kSlabTargetBytes >= kSlabTargetMultiplier,
+        "kSlabTargetBytes must be >= kSlabTargetMultiplier");
+    static_assert((kSlabTargetBytes & (kSlabTargetBytes - 1)) == 0,
+        "kSlabTargetBytes must be a power of two");
+    // Largest ladder ElemSize today is 4096 (axis 64).
+    static_assert(kSlabTargetMultiplier * 4096ull >= kSlabTargetBytes,
+        "kSlabTargetMultiplier too small for largest ElemSize under target");
+
+    // Exact-pack buffer: slots = max(multiplier, target/ElemSize), zero tail.
     template<std::size_t ElemSize>
-    constexpr std::size_t selectBufferSize() {
-        // for small element sizes, pre-allocate a buffer large enough to
-        // hold multiple elements to reduce the number of allocations
-        if constexpr (ElemSize < 1_KB) {
-            return 4_KB;
-        } else {
-            return ElemSize * 4;
-        }
+    constexpr std::size_t selectBufferSize()
+    {
+        constexpr std::size_t from_target = kSlabTargetBytes / ElemSize;
+        constexpr std::size_t slots =
+            from_target > kSlabTargetMultiplier ? from_target : kSlabTargetMultiplier;
+        return slots * ElemSize;
     }
 
 
@@ -162,15 +184,16 @@ namespace spallocator
             "ElemSize must be at least Alignment");
 
         static constexpr std::size_t slab_alloc_size{selectBufferSize<ElemSize>()};
-        static_assert(slab_alloc_size >= 4_KB, "Allocation size must be greater than 4096 bytes");
-        static_assert(
-            (ElemSize > 2_KB) || (slab_alloc_size % 1_KB == 0),
-            "Allocation size must be a multiple of 1024 when ElemSize <= 2KB");
+        static constexpr std::size_t slots_per_buffer{slab_alloc_size / ElemSize};
+        static_assert(slab_alloc_size == slots_per_buffer * ElemSize,
+            "slab buffer must be an exact multiple of ElemSize (zero tail)");
+        static_assert(slots_per_buffer >= kSlabTargetMultiplier,
+            "slab buffer must hold at least kSlabTargetMultiplier slots");
 
         std::vector<std::byte*> slab_data;
         // Per-slab slot maps stay std::bitset (compile-time slot count).
         // Convention: bit set ⇒ slot occupied; clear ⇒ free.
-        std::vector<std::bitset<slab_alloc_size / ElemSize>> slab_map;
+        std::vector<std::bitset<slots_per_buffer>> slab_map;
         static constexpr std::size_t max_slabs{4_GB / slab_alloc_size};
         DynBitset slab_available_map;
 

@@ -324,7 +324,11 @@ one axis.
 
 **Owns**
 
-- Zero or more equally sized **buffers** (`slab_alloc_size` — typically 4 KiB
+- Zero or more equally sized **buffers** (`slab_alloc_size` from
+  `selectBufferSize`: exact pack of
+  `max(kSlabTargetMultiplier, kSlabTargetBytes / ElemSize)` slots; defaults
+  **8 KiB** target / **16** min slots, overridable at compile time via
+  `./configure --with-slab-target-*`)
   when `ElemSize < 1_KB`, otherwise a small multiple of `ElemSize`)  
 - Per-buffer freemap of slots  
 - Growable availability map (`DynBitset`) across buffers  
@@ -913,7 +917,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 | Pool destroy while clients hold pointers | **Addressed (P18)** — ControlBlock / Handle / BlockToken; orderly + arena + heap auto-retire |
 | Alloc bit scan | Next-fit + CTZ word search (production); freelist if still hot |
 | Address map | O(log m); denser structures if free is hot |
-| Fixed size-class ladders | Deliberate; shaped buffers are backlog R2 |
+| Fixed size-class ladders | Deliberate; exact-pack buffers (P19 B); non-ladder shaping is backlog R2 |
 | Lock type | Hard-wired `SpinLock`; pluggable primitive is backlog R5 |
 | MSan in CI | Deferred pending host instrumented runtime |
 | Metrics API | `PoolStats` / `Pool::stats()` (alloc/free counters + HWMs); richer per-class breakdown later |
@@ -944,7 +948,7 @@ Also tracked on the
 
 | Item | Notes |
 |------|--------|
-| Non–fixed-class buffer shaping | Size buffers to `(elem + header) × multiple` instead of discrete ladders |
+| Non–fixed-class buffer shaping | Drop ladders entirely; P19 B already exact-packs within classes (`kSlabTargetBytes` / multiplier) |
 | Pool lifetime vs smart pointers | **Done (P18)** — ControlBlock / Handle / BlockToken; orderly + arena + heap retire |
 | C99 wrapper | Opaque pool handle API for C callers |
 | Pluggable lock primitive | Compile-time choice of `SpinLock` vs `std::mutex` (or similar) for Pool/Slab |

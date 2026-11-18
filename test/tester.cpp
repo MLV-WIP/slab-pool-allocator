@@ -82,7 +82,7 @@ TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
     // After filling slots [0, cursor), a free bit below the cursor must not
     // steal the next alloc — next-fit continues forward.
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = 4_KB / 16;
+    constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
     std::vector<std::byte*> items;
     items.reserve(kSlots);
 
@@ -114,7 +114,7 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
 {
     // Cursor past the only free slot → wrap within the same buffer (no grow).
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = 4_KB / 16;
+    constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
     std::vector<std::byte*> items;
     items.reserve(kSlots);
     for (std::size_t i = 0; i < kSlots; ++i)
@@ -147,7 +147,7 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
 TEST(SlabTest, NextFitSurvivesReclaim)
 {
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = 4_KB / 16;
+    constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
     std::vector<std::byte*> items;
     items.reserve(kSlots + 1);
     for (std::size_t i = 0; i < kSlots + 1; ++i)
@@ -175,7 +175,7 @@ TEST(SlabTest, NextFitSurvivesReclaim)
 TEST(SlabTest, AllocFreeChurnMicrobench)
 {
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = 4_KB / 16;
+    constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
 #if defined(NDEBUG)
     constexpr int kIters = 500000;
 #else
@@ -217,7 +217,7 @@ TEST(SlabTest, AllocFreeChurnMicrobench)
 TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
 {
     Slab<16, 16> slab;
-    constexpr std::size_t kSlotsPerSlab = 4_KB / 16;
+    constexpr std::size_t kSlotsPerSlab = selectBufferSize<16>() / 16;
     EXPECT_EQ(slab.getSlabCount(), 1u);
     const std::size_t baseline = slab.getAllocatedMemory();
 
@@ -557,8 +557,8 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
     Pool pool;
     const std::size_t before = pool.getAllocatedMemory();
 
-    // allocate(16) → footprint 24 → 32B class; 4 KiB / 32 = 128 slots/slab.
-    constexpr std::size_t kSlotsPerSlab = 4_KB / 32;
+    // allocate(16) → footprint 24 → 32B class.
+    constexpr std::size_t kSlotsPerSlab = selectBufferSize<32>() / 32;
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab + 1; ++i)
@@ -589,8 +589,8 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
     EXPECT_LT(slab.getAvailabilityMapBytes(), kLegacyFixedBytes);
     EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
 
-    // Fill the first 4 KiB / 16 B slab (256 slots) to force a second slab.
-    constexpr std::size_t kSlotsPerSlab = 4_KB / 16;
+    // Fill the first buffer to force a second slab.
+    constexpr std::size_t kSlotsPerSlab = selectBufferSize<16>() / 16;
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab; ++i)
@@ -615,44 +615,50 @@ TEST(SlabTest, CreateSlabs)
     {
         Slab<64> slab;
         EXPECT_EQ(slab.getElemSize(), 64u);
-        EXPECT_EQ(slab.getAllocSize(), 4_KB);
-        EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
+        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<64>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<64>());
+        EXPECT_EQ(slab.getAllocSize() % 64u, 0u);
     }
 
     {
         Slab<128> slab;
         EXPECT_EQ(slab.getElemSize(), 128u);
-        EXPECT_EQ(slab.getAllocSize(), 4_KB);
-        EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
+        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<128>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<128>());
     }
 
     {
         Slab<1_KB> slab;
         EXPECT_EQ(slab.getElemSize(), 1_KB);
-        EXPECT_EQ(slab.getAllocSize(), 4_KB);
-        EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
+        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<1_KB>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<1_KB>());
+        // min multiplier floors large classes (default 16 × 1 KiB).
+        EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 1_KB);
     }
 
     {
         Slab<2_KB> slab;
         EXPECT_EQ(slab.getElemSize(), 2_KB);
-        EXPECT_EQ(slab.getAllocSize(), 8_KB);
-        EXPECT_EQ(slab.getAllocatedMemory(), 8_KB);
+        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<2_KB>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<2_KB>());
+        EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 2_KB);
     }
 
     {
         Slab<16_KB> slab;
         EXPECT_EQ(slab.getElemSize(), 16_KB);
-        EXPECT_EQ(slab.getAllocSize(), 64_KB);
-        EXPECT_EQ(slab.getAllocatedMemory(), 64_KB);
+        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<16_KB>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<16_KB>());
+        EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 16_KB);
     }
 
     {
-        // not an even multiple of 1024
+        // Odd ElemSize (multiple of 16): exact pack, no KB-multiple requirement.
         Slab<12336> slab;
         EXPECT_EQ(slab.getElemSize(), 12336u);
-        EXPECT_EQ(slab.getAllocSize(), 49344u);
-        EXPECT_EQ(slab.getAllocatedMemory(), 49344u);
+        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<12336>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<12336>());
+        EXPECT_EQ(slab.getAllocSize() % 12336u, 0u);
     }
 
 }
@@ -662,53 +668,47 @@ TEST(SlabTest, AllocateItems)
 {
     Slab<128> slab;
 
-    // initial allocation should be 4KB
-    EXPECT_EQ(slab.getAllocatedMemory(), 4_KB);
+    constexpr std::size_t kBuf = selectBufferSize<128>();
+    constexpr std::size_t kSlots = kBuf / 128;
+    EXPECT_EQ(slab.getAllocatedMemory(), kBuf);
+    EXPECT_EQ(slab.getSlabCount(), 1u);
 
     std::vector<std::byte*> items;
-    for (int i = 0; i < 32; ++i)
+    items.reserve(2 * kSlots + 1);
+    for (std::size_t i = 0; i < kSlots; ++i)
     {
-        auto item = slab.allocateItem(120);
-        EXPECT_NE(item, nullptr);
-        items.push_back(item);
+        auto* p = slab.allocateItem(120);
+        EXPECT_NE(p, nullptr);
+        items.push_back(p);
+    }
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+
+    // One past capacity → second buffer.
+    items.push_back(slab.allocateItem(120));
+    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getAllocatedMemory(), 2 * kBuf);
+
+    for (std::size_t i = 1; i < kSlots; ++i)
+    {
+        items.push_back(slab.allocateItem(120));
+    }
+    EXPECT_EQ(slab.getSlabCount(), 2u);
+
+    items.push_back(slab.allocateItem(120));
+    EXPECT_EQ(slab.getSlabCount(), 3u);
+    EXPECT_EQ(slab.getAllocatedMemory(), 3 * kBuf);
+
+    for (auto* p : items)
+    {
+        slab.deallocateItem(p);
     }
 
-    // next allocation should cause a new slab to be allocated
-    auto item = slab.allocateItem(120);
-    EXPECT_NE(item, nullptr);
-    items.push_back(item);
-
-    EXPECT_EQ(slab.getAllocatedMemory(), 8_KB);
-
-    for (int i = 0; i < 31; ++i)
+    // Reuse retained buffers (monotonic growth until trim).
+    for (std::size_t i = 0; i < 2 * kSlots + 1; ++i)
     {
-        auto item = slab.allocateItem(120);
-        EXPECT_NE(item, nullptr);
-        items.push_back(item);
+        EXPECT_NE(slab.allocateItem(120), nullptr);
     }
-
-    // next allocation should cause a new slab to be allocated
-    item = slab.allocateItem(120);
-    EXPECT_NE(item, nullptr);
-    items.push_back(item);
-
-    EXPECT_EQ(slab.getAllocatedMemory(), 12_KB);
-
-    // free all items
-    for (auto it : items)
-    {
-        slab.deallocateItem(it);
-    }
-
-    // allocate again, should reuse freed items
-    for (int i = 0; i < 65; ++i)
-    {
-        auto item = slab.allocateItem(120);
-        EXPECT_NE(item, nullptr);
-    }
-
-    // same memory allocation should persist from previous allocations
-    EXPECT_EQ(slab.getAllocatedMemory(), 12_KB);
+    EXPECT_EQ(slab.getAllocatedMemory(), 3 * kBuf);
 }
 
 

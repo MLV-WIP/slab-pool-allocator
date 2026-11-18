@@ -6,7 +6,7 @@ A C++ memory **pool** backed by **slab** size-class storage — for production s
 
 A memory **pool** (disposable / isolatable allocation domain) backed by **slabs** (fixed-size slot recyclers). Pool and slab are separate ideas — the pool owns lifetime and routing; slabs implement size-class storage.
 
-**Readiness:** The pool, SpinLock, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. Pool lifetime vs clients is defined: orderly RAII (pointers first), optional arena bulk reclaim (`unique_pool_ptr` no-ops when the pool is already dead), and `PoolHandle::create()` for heap domains that retire when idle. `LifetimeObserver` provides race-free atomic liveness checks that are complete for same-thread / single-strand event loops; when callbacks and teardown can race across threads, pair object use with the same mutex/strand that covers destroy (or use `shared_ptr`/`weak_ptr` when you need upgrade-to-own). Known follow-ons (metrics, freelist) are listed under Future Work.
+**Readiness:** The pool, SpinLock, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. Pool lifetime vs clients is defined: orderly RAII (pointers first), optional arena bulk reclaim (`unique_pool_ptr` no-ops when the pool is already dead), and `PoolHandle::create()` for heap domains that retire when idle. `LifetimeObserver` provides race-free atomic liveness checks that are complete for same-thread / single-strand event loops; when callbacks and teardown can race across threads, pair object use with the same mutex/strand that covers destroy (or use `shared_ptr`/`weak_ptr` when you need upgrade-to-own). Known follow-ons (per-class metrics, freelist) are listed under Future Work.
 
 **Directory map:**
 ```
@@ -39,6 +39,8 @@ The Makefile works with defaults (`BUILD_TYPE=addrsan`) or with `./configure` fo
 ```bash
 # Optional: generate config.mk
 ./configure --enable-tests --enable-demo
+# optional packing knobs (compile-time; defaults 8192 / 16):
+# ./configure --with-slab-target-bytes=16384 --with-slab-target-multiplier=16
 
 # Build all enabled targets (tests + demos)
 make
