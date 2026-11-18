@@ -750,8 +750,10 @@ canvas.
 
 ## SpinLock (design summary)
 
-`SpinLock` is the mutual-exclusion primitive used today for **short** critical
-sections in `Pool` and `Slab`. It models `BasicLockable` (`lock` / `unlock` /
+`SpinLock` is a **standalone** mutual-exclusion primitive (global namespace in
+`spinlock.hpp`) used today for **short** critical sections in `Pool` and
+`Slab`. It is intentionally not nested under `spallocator::` so it can be
+reused outside the allocator. It models `BasicLockable` (`lock` / `unlock` /
 `try_lock`) so `std::scoped_lock` / `std::unique_lock` work. Non-copyable,
 non-movable. Full line-by-line analysis:
 [SpinLock_Analysis.md](../spallocator/docs/SpinLock_Analysis.md).

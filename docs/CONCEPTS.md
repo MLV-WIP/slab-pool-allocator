@@ -583,8 +583,8 @@ Pool                         ← your disposable / isolatable allocation domain
   ├── routes to SlabProxy    ← oversized system allocations
   └── make_pool_* / PoolAllocator  ← typed RAII on top of the pool
 
-LifetimeObserver (optional)   ← async liveness; independent of Pool/Slab
-SpinLock                     ← used inside Pool and Slab; usable on its own
+LifetimeObserver (optional)   ← standalone global util; independent of Pool/Slab
+SpinLock                     ← standalone global util; also used by Pool/Slab
 ```
 
 Remember: destroy or shard **pools** for lifetime and isolation; tune or
@@ -614,8 +614,9 @@ reading headers or teaching from the repo.
 
 ### Modern C++
 
-- `std::atomic_flag::wait` / `notify_one` for efficient blocking  
-- `std::format` / `std::print`  
+- Minimum **C++20** with working `<format>`, ranges, and `atomic_flag::wait` /
+  `notify_one`; configure may select C++23 or C++26 when available  
+- `std::print` when `__cpp_lib_print` is set; otherwise a format-based shim  
 - Ranges for reverse-order destruction  
 - `std::source_location` in debug asserts  
 

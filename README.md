@@ -25,8 +25,8 @@ README.md             # this overview + build/run
 - **Thread-safe routing** — pool + per-slab locking
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolBlockToken`)
 - **Defined pool lifetime** — orderly RAII, arena bulk reclaim, or `PoolHandle::create()` auto-retire
-- **LifetimeObserver** with atomic liveness checks for async callbacks; **SpinLock** (TTAS → backoff → block)
-- **Modern C++20/23** — templates, atomics, ranges, concepts
+- **Standalone utilities** — `LifetimeObserver` (async liveness) and `SpinLock` (TTAS → backoff → block); usable outside the pool
+- **Modern C++20+** — templates, atomics, ranges, concepts; C++23/26 when the toolchain allows
 
 Design and API detail live under [`docs/`](docs/), not in this README.
 
@@ -39,6 +39,8 @@ The Makefile works with defaults (`BUILD_TYPE=addrsan`) or with `./configure` fo
 ```bash
 # Optional: generate config.mk
 ./configure --enable-tests --enable-demo
+# optional: pin dialect (default = newest of c++26/c++23/c++20 the compiler accepts)
+# ./configure --with-cxxstd=c++20
 # optional compile-time size knobs (defaults 8192 / 16 / 1024 MiB / 4096 MiB):
 # ./configure --with-slab-target-bytes=16384 --with-slab-target-multiplier=16
 # ./configure --with-max-allocation-mib=256 --with-max-class-mib=1024
@@ -139,8 +141,8 @@ int main() {
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a pool domain |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
 | **PoolHandle** | `spallocator/pool_lifetime.hpp` | Heap domain handle; `create()` retires when idle |
-| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Intrusive weak liveness; extra sync only when use and destroy can race across threads |
-| **SpinLock** | `spallocator/spinlock.hpp` | Short-section lock with TTAS, backoff, and TSan annotations |
+| **LifetimeObserver** | `spallocator/lifetimeobserver.hpp` | Standalone intrusive weak liveness (not under `spallocator::`) |
+| **SpinLock** | `spallocator/spinlock.hpp` | Standalone short-section lock (TTAS, backoff, TSan annotations) |
 | **Helper** | `spallocator/helper.hpp` | User-defined literals, formatting, assertions |
 
 ### Size Classes
@@ -169,9 +171,10 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 
 ## Requirements
 
-- **Minimum**: C++20 (for `atomic_flag::wait()`/`notify_one()`)
-- **Recommended**: C++23 (for `std::format`, `std::source_location`)
-- **Compilers**: GCC 11+, Clang 14+, MSVC 19.29+
+- **Minimum**: C++20 with a working `<format>`, `std::ranges`, and `atomic_flag::wait` / `notify_one`
+- **Dialect**: `./configure` selects the newest of C++26 / C++23 / C++20 the compiler accepts (`--with-cxxstd=` to pin)
+- **`std::print`**: used when `__cpp_lib_print` is set; otherwise a `std::format`-based shim in `helper.hpp`
+- **Compilers**: GCC 11+, Clang 18+ recommended for full dialect probing (older may work at C++20)
 - **Dependencies**: Google Test (for unit tests)
 
 ## Documentation

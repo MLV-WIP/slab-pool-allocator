@@ -7,8 +7,12 @@ Architecture and trade-offs live in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 Conceptual / learning material lives in [CONCEPTS.md](CONCEPTS.md). Build
 instructions stay in the [root README](../README.md).
 
-Unless noted, types are in namespace `spallocator`. `SpinLock` and
-`LifetimeObserver` are declared as global classes in their headers today.
+Unless noted, types are in namespace `spallocator`. **`SpinLock`** and
+**`LifetimeObserver`** are intentionally global (not under `spallocator::`): they
+are standalone utilities that happen to ship with this repo and are usable
+without the pool. General helpers in `helper.hpp` live in `spallocator` today
+(size literals, print, `runtime_assert`); pool size caps in that header are
+allocator policy, not general utilities.
 
 ---
 
@@ -55,9 +59,9 @@ Unless noted, types are in namespace `spallocator`. `SpinLock` and
 | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolBlockToken`, `PoolControlBlock` |
 | `spallocator/slab.hpp` | `AbstractSlab`, `Slab`, `SlabProxy`, `DynBitset` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
-| `spallocator/lifetimeobserver.hpp` | `LifetimeObserver` |
-| `spallocator/spinlock.hpp` | `SpinLock` |
-| `spallocator/helper.hpp` | Size literals, `runtime_assert`, debug print |
+| `spallocator/lifetimeobserver.hpp` | `LifetimeObserver` (global; standalone) |
+| `spallocator/spinlock.hpp` | `SpinLock` (global; standalone) |
+| `spallocator/helper.hpp` | Size literals, print / `runtime_assert`, pool size caps |
 
 ```
                     ┌─────────────────────────────────────┐
@@ -67,7 +71,7 @@ Unless noted, types are in namespace `spallocator`. `SpinLock` and
               ▼                    ▼                    ▼
      Slab<…> (fixed-size slots)          SlabProxy (large new[])
   Smart pointers / PoolAllocator ──► PoolBlockToken / PoolHandle
-  LifetimeObserver                 (stand-alone utility)
+  LifetimeObserver / SpinLock      (standalone; global namespace)
 ```
 
 `Pool` and `Slab` are separate concepts: the pool is the disposable / isolatable
@@ -743,12 +747,14 @@ v.push_back(42);
 
 ## LifetimeObserver
 
-**Header:** `spallocator/lifetimeobserver.hpp`
+**Header:** `spallocator/lifetimeobserver.hpp`  
+**Namespace:** global (standalone utility — not `spallocator::`)
 
 Intrusive helper for “is this object still alive?” checks from callbacks or
 event handlers. Inspired by `shared_ptr` / `weak_ptr`: **owner** references keep
 the control block’s owner count; **`getObserver()`** returns a weak view that
-does not keep the object alive.
+does not keep the object alive. Independent of `Pool` / `Slab`; usable in any
+codebase that includes the header.
 
 Typical pattern: a type derives from `LifetimeObserver` (protected default ctor
 creates an owner). Callbacks capture `getObserver()`, then call `isAlive()`
@@ -838,11 +844,13 @@ More narrative: [CONCEPTS.md — Observing lifetime](CONCEPTS.md#observing-lifet
 
 ## SpinLock
 
-**Header:** `spallocator/spinlock.hpp`
+**Header:** `spallocator/spinlock.hpp`  
+**Namespace:** global (standalone utility — not `spallocator::`)
 
 Lightweight mutex optimized for **short** critical sections. Models
 `BasicLockable` so it works with `std::scoped_lock` / `std::unique_lock`.
-Non-copyable, non-movable.
+Non-copyable, non-movable. Used inside `Pool` / `Slab`, but designed as a
+general locking primitive on its own.
 
 Internally: test-and-test-and-set spin, then escalating sleep backoff, then
 `std::atomic_flag::wait`. Under ThreadSanitizer, acquire/release annotations
@@ -895,11 +903,13 @@ Algorithm and correctness deep dive:
 
 ## Helpers
 
-**Header:** `spallocator/helper.hpp`
+**Header:** `spallocator/helper.hpp`  
+**Namespace:** `spallocator` (literals / print / assert); pool caps are allocator policy
 
-Supporting utilities used by the library and demos. They are public, but they
-are not the core allocator surface — called out here so call sites and build
-flags are clear.
+Supporting utilities used by the library and demos. Size literals, `print` /
+`println`, and `runtime_assert` are general-purpose helpers that ship here for
+convenience. `kMaxAllocationBytes` / `kMaxClassBytes` are pool policy knobs,
+not a general util API.
 
 ### Size literals
 
@@ -949,8 +959,13 @@ void debug_print(std::format_string<Args...> fmt, Args&&... args);
 void debug_println(std::format_string<Args...> fmt, Args&&... args);
 ```
 
-`print` / `println` always format to stdout (using `std::print` when available).
+`print` / `println` always format to stdout. When `__cpp_lib_print` is set
+(C++23 library), they are `using` aliases for `std::print` / `std::println`;
+otherwise a small `std::format` + `iostream` shim is used (C++20 builds).
 `debug_*` are for allocator tracing in verbose debug builds only.
+
+**Build note:** minimum dialect is C++20 with working `<format>`. `./configure`
+picks the newest of C++26/23/20 (or `--with-cxxstd=`).
 
 ### `runtime_assert`
 
