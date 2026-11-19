@@ -918,8 +918,8 @@ Filters (for focused timing or profiling):
 
 | Flag | Values | Notes |
 |------|--------|-------|
-| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all` |
-| `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a` |
+| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all`. `bulk` is alloc-then-free-all (grows many slab buffers) |
+| `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk` |
 
 Default alignment is 8. `--align=64` is a Pool axis/header-tax spot-check only
 (not a full alignment matrix).

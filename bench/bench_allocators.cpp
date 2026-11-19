@@ -415,8 +415,9 @@ void print_help()
         "  --backend=LIST      new,pool,pmr_unsync,pmr_sync,slab16,all (comma-separated; default all)\n"
         "  --help              Show this help\n"
         "\n"
-        "Filters skip inapplicable combinations with a note (e.g. slab16 outside LIFO;\n"
-        "pmr_sync outside threaded; threaded needs --threads=N with N>1).\n"
+        "Filters skip inapplicable combinations with a note (e.g. slab16 outside\n"
+        "lifo/bulk; pmr_sync outside threaded; threaded needs --threads=N with N>1).\n"
+        "Bulk alloc-then-free-all grows many slab buffers (multi-buffer free uses the map).\n"
         "When ::new is omitted, tables print ns/op only (no vs ::new ratio).\n"
         "\n"
         "Multi-size scenarios draw user sizes uniformly from [16, 1024].\n"
@@ -769,7 +770,9 @@ void note_skip(std::string_view why)
 void run_align8_suite(Options const& opt)
 {
     constexpr std::size_t kSize = 16;
-    const int bulk_count = std::min(opt.iters, 100000);
+    // Cap bulk live-set size (pointer vector + retained slabs). Default packing
+    // is 512 slots/buffer for Slab<16,16>, so counts >> 512 exercise multi-buffer.
+    const int bulk_count = std::min(opt.iters, 500000);
     const BackendId be = opt.backends;
 
     // --- Warmed LIFO churn (16B) ---
@@ -852,7 +855,7 @@ void run_align8_suite(Options const& opt)
         }
         if (has(be, BackendId::Slab16))
         {
-            note_skip("slab16 only supports size<=16 (LIFO scenario)");
+            note_skip("slab16 only supports size<=16 (use --scenario=lifo or bulk)");
         }
         print_table(
             "Multi-size mix (uniform random user size in [16, 1024], alloc+free pair)",
@@ -864,13 +867,9 @@ void run_align8_suite(Options const& opt)
         std::cout << "\n";
     }
 
-    // --- Alloc-all then free-all ---
+    // --- Alloc-all then free-all (grows many slab buffers; not single-slot churn) ---
     if (has(opt.scenarios, Scenario::Bulk))
     {
-        if (has(be, BackendId::Slab16))
-        {
-            note_skip("slab16 omitted from alloc-then-free-all (LIFO-only in this harness)");
-        }
         if (has(be, BackendId::PmrSync))
         {
             note_skip("pmr_sync omitted from alloc-then-free-all (use --scenario=threaded)");
@@ -879,13 +878,17 @@ void run_align8_suite(Options const& opt)
         const bool want_new = has(be, BackendId::New);
         const bool want_pool = has(be, BackendId::Pool);
         const bool want_pmr = has(be, BackendId::PmrUnsync);
-        if (!want_new && !want_pool && !want_pmr)
+        const bool want_slab = has(be, BackendId::Slab16);
+        if (!want_new && !want_pool && !want_pmr && !want_slab)
         {
             std::cout << "Alloc-then-free-all skipped (no applicable backends selected).\n\n";
         }
         else
         {
-            std::cout << "Alloc-then-free-all (size=16, count=" << bulk_count << ")\n";
+            // Slab<16,16> holds 512 slots/buffer at default packing; count>>512
+            // forces multi-buffer growth (and map-backed free when m>1).
+            std::cout << "Alloc-then-free-all (size=16, count=" << bulk_count
+                      << "; multi-buffer growth)\n";
             std::cout << std::left << std::setw(28) << "  backend"
                       << std::right << std::setw(14) << "alloc ns/op"
                       << std::setw(14) << "free ns/op"
@@ -942,6 +945,14 @@ void run_align8_suite(Options const& opt)
                 auto [a, f] =
                     timed_alloc_then_free_all(b, kSize, opt.alignment, bulk_count);
                 print_bulk(PmrUnsyncBackend::name, a, f);
+            }
+            if (want_slab)
+            {
+                Slab16Backend slab_b;
+                auto [a, f] =
+                    timed_alloc_then_free_all(slab_b, kSize, opt.alignment, bulk_count);
+                print_bulk(Slab16Backend::name, a, f);
+                print_slab16_stats("after alloc-then-free-all", slab_b.slab);
             }
             std::cout << "\n";
         }
