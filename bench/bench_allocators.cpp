@@ -49,7 +49,8 @@ inline constexpr std::size_t kUserSizeMin = 16;
 inline constexpr std::size_t kUserSizeMax = 1024;
 
 // Default per-thread live batch for --scenario=threaded (peak live ≈ threads×batch).
-inline constexpr int kDefaultThreadedBatch = 512;
+// 1024 favors multi-buffer growth across several size classes under --size-mix=class.
+inline constexpr int kDefaultThreadedBatch = 1024;
 
 enum class SizeMix
 {
@@ -491,7 +492,7 @@ void print_help()
         "  --align=8|64        Payload alignment (default 8). 64 runs Pool vs ::new spot-check only.\n"
         "  --iters=N           Timed alloc/free pairs per scenario (default release 300000)\n"
         "  --threads=N         Worker threads for multi-thread multi-size churn (default 1)\n"
-        "  --batch=N           Per-thread live batch for threaded scenario (default 512)\n"
+        "  --batch=N           Per-thread live batch for threaded scenario (default 1024)\n"
         "  --size-mix=MIX      uniform | class (default class). Class = equal weight per\n"
         "                      reachable axis-16 size class (exact-fit user size).\n"
         "  --scenario=LIST     lifo,multi,bulk,threaded,all (comma-separated; default all)\n"
@@ -502,7 +503,7 @@ void print_help()
         "lifo/bulk; pmr_sync outside threaded; threaded needs --threads=N with N>1).\n"
         "Bulk alloc-then-free-all grows many slab buffers (multi-buffer free uses the map).\n"
         "Threaded: shared allocator + start barrier (contention); peak live ≈ threads×batch\n"
-        "so multi-buffer growth needs a large batch (default 512) and preferably --size-mix=class.\n"
+        "so multi-buffer growth needs a large batch (default 1024) and --size-mix=class (default).\n"
         "When ::new is omitted, tables print ns/op only (no vs ::new ratio).\n"
         "\n"
         "Per-thread std::minstd_rand (seed key + worker index).\n"

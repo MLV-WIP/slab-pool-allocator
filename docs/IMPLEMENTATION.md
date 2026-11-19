@@ -920,7 +920,7 @@ Filters (for focused timing or profiling):
 |------|--------|-------|
 | `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all`. `bulk` is alloc-then-free-all (grows many slab buffers) |
 | `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk` |
-| `--batch=` | Per-thread live batch for `threaded` (default **512**) | Peak live ≈ `threads×batch`; needed for multi-buffer growth under contention |
+| `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
 | `--size-mix=` | `uniform` or `class` (default **class**) | `class` = equal weight per reachable axis-16 size class (exact-fit user size); better multi-slab coverage than uniform bytes |
 
 Default alignment is 8. `--align=64` is a Pool axis/header-tax spot-check only
