@@ -59,6 +59,9 @@ make test
 make bench BUILD_TYPE=release
 # make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
 # make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new spot-check
+# make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
+# Focused perf record/report (BUILD_TYPE=profile: -O3 + frame pointers + -g)
+# make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'
 ```
 
 Binaries land under `obj/<build_type>/` (default `obj/addrsan/`), with convenience symlinks in `obj/`:
@@ -76,6 +79,7 @@ Binaries land under `obj/<build_type>/` (default `obj/addrsan/`), with convenien
 ```bash
 make BUILD_TYPE=debug       # unoptimized debug
 make BUILD_TYPE=release     # optimized (-O3 -DNDEBUG) + coverage (CI default)
+make BUILD_TYPE=profile     # like release + -g -fno-omit-frame-pointer (for perf)
 make BUILD_TYPE=addrsan     # AddressSanitizer + LSan + UBSan (default)
 make BUILD_TYPE=memsan      # MemorySanitizer (Clang; needs host MSan runtime — not in CI)
 make BUILD_TYPE=threadsan   # ThreadSanitizer + UBSan
@@ -94,7 +98,7 @@ On-demand harness in `bench/` (not built by default `make`, not a CI gate):
 |---------|--------|------------------|
 | `bench_allocators` | `bench/bench_allocators.cpp` | `::operator new`, `Pool`, `std::pmr` pool resources, bare `Slab<16,16>` |
 
-Reports ns/op and **ratio vs `::new`**. Prefer `BUILD_TYPE=release`. See [docs/IMPLEMENTATION.md — Performance](docs/IMPLEMENTATION.md#performance).
+Reports ns/op and **ratio vs `::new`**. Prefer `BUILD_TYPE=release` (`make bench` forces coverage off). Filter with `--scenario=` / `--backend=` for focused runs. For `perf` stacks use `make profile` (`BUILD_TYPE=profile`: `-O3` + frame pointers + `-g`). See [docs/IMPLEMENTATION.md — Performance](docs/IMPLEMENTATION.md#performance).
 
 ### Demos
 

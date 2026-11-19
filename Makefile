@@ -22,6 +22,15 @@ ENABLE_UBSAN ?= auto
 ENABLE_TSAN ?= auto
 ENABLE_COVERAGE ?= auto
 
+# Bench / profile timings must not be skewed by gcov arc instrumentation.
+# `make profile` also forces BUILD_TYPE=profile (release + frame pointers + -g).
+ifneq ($(filter profile,$(MAKECMDGOALS)),)
+    BUILD_TYPE := profile
+endif
+ifneq ($(filter bench profile,$(MAKECMDGOALS)),)
+    ENABLE_COVERAGE := no
+endif
+
 # Auto-detect Google Test if not specified
 ifndef GTEST_DIR
     ifneq ($(wildcard /opt/homebrew/Cellar/googletest/*),)
@@ -80,6 +89,12 @@ else ifeq ($(BUILD_TYPE),release)
     CXXFLAGS += -DNDEBUG -O3
     LDFLAGS += -O3
     OBJDIRNAME := release
+else ifeq ($(BUILD_TYPE),profile)
+    # Optimized like release, but keep frame pointers + debug info for perf/Hotspot.
+    CXXFLAGS += -DNDEBUG -O3 -g -fno-omit-frame-pointer
+    LDFLAGS += -O3 -g
+    OBJDIRNAME := profile
+    ENABLE_COVERAGE := no
 else ifeq ($(BUILD_TYPE),addrsan)
     CXXFLAGS += -DDEBUG -O0 -g -fno-omit-frame-pointer
     LDFLAGS += -g
@@ -196,7 +211,7 @@ endif
 .DEFAULT_GOAL := all
 
 # Phony targets
-.PHONY: all clean test demo bench install uninstall help check-config
+.PHONY: all clean test demo bench profile install uninstall help check-config
 
 all: check-config $(TARGETS)
 	$(Q)if [ -n "$(TARGETS)" ]; then \
@@ -293,10 +308,40 @@ else
 	@exit 1
 endif
 
-# Run bench (prefer BUILD_TYPE=release for meaningful ratios)
+# Run bench (prefer BUILD_TYPE=release for meaningful ratios).
+# Coverage is forced off when the `bench` goal is present (see top of Makefile).
 bench: $(OBJDIR)/$(BENCH_TARGET)
 	$(ECHO) "  RUN     $(BENCH_TARGET) $(BENCH_ARGS)"
 	$(Q)$(OBJDIR)/$(BENCH_TARGET) $(BENCH_ARGS)
+
+# Profile build + perf record/report. Forces BUILD_TYPE=profile via MAKECMDGOALS.
+# Example:
+#   make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'
+PERF ?= perf
+PERF_RECORD_ARGS ?= record -g --call-graph fp --freq=999
+PERF_DATA ?= $(OBJDIR)/perf.data
+
+profile: $(OBJDIR)/$(BENCH_TARGET)
+	$(ECHO) "  PERF    $(PERF_RECORD_ARGS) -o $(PERF_DATA) -- $(BENCH_TARGET) $(BENCH_ARGS)"
+	$(Q)command -v $(PERF) >/dev/null 2>&1 || { \
+		echo "perf not found (install linux-tools / perf)."; \
+		echo "Profile binary ready: $(OBJDIR)/$(BENCH_TARGET)"; \
+		exit 1; \
+	}
+	$(Q)if ! $(PERF) $(PERF_RECORD_ARGS) -o $(PERF_DATA) -- $(OBJDIR)/$(BENCH_TARGET) $(BENCH_ARGS); then \
+		echo ""; \
+		echo "perf record failed (often kernel.perf_event_paranoid is too strict)."; \
+		echo "Profile binary is ready: $(OBJDIR)/$(BENCH_TARGET)"; \
+		echo "  $(OBJDIR)/$(BENCH_TARGET) $(BENCH_ARGS)"; \
+		echo "Then, after allowing perf for your user, re-run:"; \
+		echo "  make profile BENCH_ARGS='$(BENCH_ARGS)'"; \
+		echo "Or: sudo sysctl kernel.perf_event_paranoid=1   # temporary; prefer 1 or 2"; \
+		exit 1; \
+	fi
+	$(ECHO) "  PERF    report -i $(PERF_DATA) (top symbols)"
+	$(Q)$(PERF) report -i $(PERF_DATA) --stdio --no-children -n --percent-limit 1 | head -n 60
+	@echo "Full report: $(PERF) report -i $(PERF_DATA)"
+	@echo "Hotspot GUI: hotspot $(PERF_DATA)"
 
 # Install (header-only library)
 install:
@@ -326,6 +371,7 @@ clean:
 	$(ECHO) "  CLEAN   $(OBJDIR)"
 	$(Q)rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET) $(OBJDIR)/$(BENCH_TARGET)
 	$(Q)rm -f $(OBJDIR)/*.o $(OBJDIR)/*.d $(OBJDIR)/*.gcda $(OBJDIR)/*.gcno $(OBJDIR)/*.gcov
+	$(Q)rm -f $(OBJDIR)/perf.data $(OBJDIR)/perf.data.old
 	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET) $(BASEOBJDIR)/$(BENCH_TARGET)
 	$(Q)rm -f *.gcov *.gcda *.gcno
 	$(ECHO) "Clean complete!"
@@ -351,6 +397,7 @@ help:
 	@echo "  make coverage          - Run tests and print gcov summary (release default)"
 	@echo "  make demo              - Run demo program"
 	@echo "  make bench             - Build/run allocator comparison bench (on-demand)"
+	@echo "  make profile           - Build profile binary + perf record/report (on-demand)"
 	@echo "  make clean             - Remove build artifacts"
 	@echo "  make distclean         - Remove all generated files"
 	@echo ""
@@ -358,6 +405,8 @@ help:
 	@echo "  make bench BUILD_TYPE=release"
 	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'"
 	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--align=64'"
+	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'"
+	@echo "  make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'"
 	@echo ""
 	@echo "Installation:"
 	@echo "  make install           - Install headers and docs to PREFIX"
@@ -366,6 +415,7 @@ help:
 	@echo "Build type selection (without configure):"
 	@echo "  make BUILD_TYPE=debug"
 	@echo "  make BUILD_TYPE=release"
+	@echo "  make BUILD_TYPE=profile    # release + -g -fno-omit-frame-pointer (for perf)"
 	@echo "  make BUILD_TYPE=addrsan    # AddressSanitizer + LSan + UBSan (default), implies debug"
 	@echo "  make BUILD_TYPE=memsan     # MemorySanitizer + UBSan, implies debug"
 	@echo "  make BUILD_TYPE=threadsan  # ThreadSanitizer (UBSan opt-in), implies debug"

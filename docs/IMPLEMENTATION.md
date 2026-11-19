@@ -893,12 +893,15 @@ deliberate simplicity until profiles disagree.
 ### Comparative baselines (`make bench`)
 
 On-demand harness: `bench/bench_allocators.cpp` via `make bench` (not part of
-`make test` / default `all`). Prefer `BUILD_TYPE=release`.
+`make test` / default `all`). Prefer `BUILD_TYPE=release`. The `bench` and
+`profile` make goals force `ENABLE_COVERAGE=no` so gcov arcs do not inflate
+ns/op.
 
 ```bash
 make bench BUILD_TYPE=release
 make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
 make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # optional Pool vs ::new
+make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
 ```
 
 Compares `::operator new`, `spallocator::Pool`, `std::pmr::unsynchronized_pool_resource`,
@@ -911,11 +914,43 @@ per-thread `std::minstd_rand` seeded from a fixed key plus worker index
 bytes. Absolute ns are host/toolchain-specific; re-run after compiler or
 stdlib upgrades and compare ratios on the same machine.
 
+Filters (for focused timing or profiling):
+
+| Flag | Values | Notes |
+|------|--------|-------|
+| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all` |
+| `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a` |
+
 Default alignment is 8. `--align=64` is a Pool axis/header-tax spot-check only
 (not a full alignment matrix).
 
 `SlabTest.AllocFreeChurnMicrobench` remains a light GTest smoke/`RecordProperty`
 check for the slab engine; use `make bench` for comparative baselines.
+
+### Profiling (`make profile`)
+
+`BUILD_TYPE=profile` is release-equivalent (`-O3 -DNDEBUG`) plus `-g` and
+`-fno-omit-frame-pointer` so Linux `perf` / Hotspot can unwind stacks. The
+`profile` goal builds that binary, runs `perf record` into
+`obj/profile/perf.data`, and prints a short `perf report` summary.
+
+```bash
+make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'
+make profile BENCH_ARGS='--scenario=lifo --backend=pool --iters=2000000'
+# Full interactive report / GUI:
+#   perf report -i obj/profile/perf.data
+#   hotspot obj/profile/perf.data
+```
+
+Pin one scenario and one backend so samples concentrate on the path under study.
+Compare Slab-only vs Pool to separate engine cost from Pool routing/header work.
+Do not treat sanitizer or coverage builds as profile baselines.
+
+If `perf record` fails with “Access to performance monitoring…”, the profile
+binary was still built under `obj/profile/`. Relax
+`kernel.perf_event_paranoid` for your session (often `1` or `2`), or grant
+`CAP_PERFMON`, then re-run `make profile`. You can also time the binary
+directly: `./obj/profile/bench_allocators --scenario=lifo --backend=slab16`.
 
 ---
 
@@ -927,7 +962,7 @@ check for the slab engine; use `make bench` for comparative baselines.
 | `BUILD_TYPE=threadsan` | TSan (+ UBSan); exercises locks / annotations |
 | `BUILD_TYPE=release` | `-O3 -DNDEBUG`; coverage on by default in CI |
 | `BUILD_TYPE=memsan` | Valid locally when host provides instrumented C++ runtime/gtest; **omitted from CI** |
-| `-DVDEBUG` | Verbose `debug_println` (slab create/alloc/free, selection, misses) |
+| `-DVDEBUG` | Verbose `debug_println` macros (args evaluated only when verbose; slab create/alloc/free, …) |
 
 Sanitizer instrumentors are mutually exclusive at configure time (ASan/LSan vs
 MSan vs TSan); UBSan may combine. `BUILD_TYPE` always applies the matching
