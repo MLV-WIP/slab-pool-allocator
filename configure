@@ -20,6 +20,7 @@ CXXFLAGS=""
 BUILD_TYPE="release"
 ENABLE_TESTS="yes"
 ENABLE_DEMO="yes"
+ENABLE_BENCH="yes"
 GTEST_DIR=""
 ENABLE_ASAN="auto"
 ENABLE_LSAN="auto"
@@ -78,6 +79,8 @@ Optional Features:
   --disable-tests         do not build test suite
   --enable-demo           build demo programs [default: yes]
   --disable-demo          do not build demo programs
+  --enable-bench          enable on-demand allocator bench target [default: yes]
+  --disable-bench         disable make bench
   --enable-asan           enable AddressSanitizer [default: auto]
   --disable-asan          disable AddressSanitizer
   --enable-lsan           enable LeakSanitizer [default: auto]
@@ -148,6 +151,12 @@ for arg in "$@"; do
             ;;
         --disable-demo)
             ENABLE_DEMO="no"
+            ;;
+        --enable-bench)
+            ENABLE_BENCH="yes"
+            ;;
+        --disable-bench)
+            ENABLE_BENCH="no"
             ;;
         --enable-asan)
             ENABLE_ASAN="yes"
@@ -672,6 +681,7 @@ if [ "$ENABLE_TESTS" = "yes" ]; then
 echo "  Google Test:          $DETECTED_GTEST"
 fi
 echo "  Build demo:           $ENABLE_DEMO"
+echo "  Bench target:         $ENABLE_BENCH"
 echo "  AddressSanitizer:     $ENABLE_ASAN"
 echo "  LeakSanitizer:        $ENABLE_LSAN"
 echo "  MemorySanitizer:      $ENABLE_MSAN"
@@ -711,6 +721,7 @@ CXXSTD := $CXXSTD
 BUILD_TYPE := $BUILD_TYPE
 ENABLE_TESTS := $ENABLE_TESTS
 ENABLE_DEMO := $ENABLE_DEMO
+ENABLE_BENCH := $ENABLE_BENCH
 VERBOSE := $VERBOSE
 
 # Google Test
@@ -751,6 +762,9 @@ echo "  make coverage     - Run tests and print coverage summary"
 fi
 if [ "$ENABLE_DEMO" = "yes" ]; then
 echo "  make demo         - Run demo program"
+fi
+if [ "$ENABLE_BENCH" = "yes" ]; then
+echo "  make bench        - On-demand allocator comparison (prefer BUILD_TYPE=release)"
 fi
 echo "  make clean        - Clean build artifacts"
 echo "  make install      - Install (to $PREFIX)"

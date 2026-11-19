@@ -188,8 +188,9 @@ TEST(SlabTest, NextFitSurvivesReclaim)
 }
 
 
-// Microbench evidence for P16 (next-fit + CTZ). Not a pass/fail gate on time —
-// records ns/op via RecordProperty; prefer BUILD_TYPE=release for numbers.
+// Light smoke / RecordProperty timing for the slab engine. Comparative
+// baselines vs ::new / pmr live in `make bench` (bench/bench_allocators.cpp),
+// not in this suite. Prefer BUILD_TYPE=release for any timing numbers.
 TEST(SlabTest, AllocFreeChurnMicrobench)
 {
     // Warm a full buffer then LIFO churn; slot count follows selectBufferSize

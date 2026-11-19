@@ -15,6 +15,7 @@ mlvlib/               # git submodule — general utils (SpinLock, LifetimeObser
 docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md
 test/                 # Google Test suite (tester.cpp)
 demos/                # example programs
+bench/                # on-demand allocator comparison (`make bench`)
 README.md             # this overview + build/run
 ```
 
@@ -53,6 +54,11 @@ make
 
 # Run the unit test suite
 make test
+
+# On-demand allocator comparison (not part of make test; prefer release)
+make bench BUILD_TYPE=release
+# make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
+# make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new spot-check
 ```
 
 Binaries land under `obj/<build_type>/` (default `obj/addrsan/`), with convenience symlinks in `obj/`:
@@ -79,6 +85,16 @@ make coverage               # run tests and print coverage summary (release)
 `make coverage` uses `llvm-cov gcov` after a Clang build and `gcov` after GCC. Put the desired tool version on `PATH` (e.g. `update-alternatives`).
 
 Google Test is required for `make test`. If GTest is not found, tests are disabled automatically.
+
+### Benchmarks
+
+On-demand harness in `bench/` (not built by default `make`, not a CI gate):
+
+| Program | Source | What it compares |
+|---------|--------|------------------|
+| `bench_allocators` | `bench/bench_allocators.cpp` | `::operator new`, `Pool`, `std::pmr` pool resources, bare `Slab<16,16>` |
+
+Reports ns/op and **ratio vs `::new`**. Prefer `BUILD_TYPE=release`. See [docs/IMPLEMENTATION.md — Performance](docs/IMPLEMENTATION.md#performance).
 
 ### Demos
 

@@ -888,11 +888,34 @@ Waste has three buckets:
 | `SlabProxy` | Avoids forcing huge objects through size-class bookkeeping |
 
 Measure before replacing the address map or moving to a freelist — both are
-deliberate simplicity until profiles disagree. `SlabTest.AllocFreeChurnMicrobench`
-records ns/op for 16B alloc/free pairs. Snapshot on this host after P16
-(`BUILD_TYPE=release ENABLE_COVERAGE=no`): ~3.8 µs per warmed alloc+free pair
-(500k iters). Use that test to compare hosts/commits; do not treat the absolute
-number as portable.
+deliberate simplicity until profiles disagree.
+
+### Comparative baselines (`make bench`)
+
+On-demand harness: `bench/bench_allocators.cpp` via `make bench` (not part of
+`make test` / default `all`). Prefer `BUILD_TYPE=release`.
+
+```bash
+make bench BUILD_TYPE=release
+make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
+make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # optional Pool vs ::new
+```
+
+Compares `::operator new`, `spallocator::Pool`, `std::pmr::unsynchronized_pool_resource`,
+`std::pmr::synchronized_pool_resource` (multi-thread), and bare `Slab<16,16>`
+(16B churn). Prints **ns/op** and **ratio vs `::new`** for warmed LIFO churn,
+randomized multi-size mix (uniform user sizes in `[16, 1024]`), alloc-then-free-all,
+and optional multi-thread multi-size churn (`--threads=N`). Size picks use
+per-thread `std::minstd_rand` seeded from a fixed key plus worker index
+(repeatable). After Pool / Slab scenarios, prints `PoolStats` or slab retained
+bytes. Absolute ns are host/toolchain-specific; re-run after compiler or
+stdlib upgrades and compare ratios on the same machine.
+
+Default alignment is 8. `--align=64` is a Pool axis/header-tax spot-check only
+(not a full alignment matrix).
+
+`SlabTest.AllocFreeChurnMicrobench` remains a light GTest smoke/`RecordProperty`
+check for the slab engine; use `make bench` for comparative baselines.
 
 ---
 
@@ -965,7 +988,7 @@ Also tracked on the
 | Pool lifetime vs smart pointers | **Done** — ControlBlock / Handle / BlockToken; orderly + arena + heap retire |
 | Bump / size-based arena facility | Sequential allocate, no individual reuse, bulk reclaim - distinct from recycling `Pool` (see [CONCEPTS - Choosing a memory strategy](CONCEPTS.md#choosing-a-memory-strategy)) |
 | PMR `memory_resource` adapter | Optional `std::pmr` bridge; keep `PoolAllocator` as the primary / non-virtual STL path |
-| Baseline ratio benches | Pool vs `::operator new` / `std::pmr::*pool_resource`; re-check after toolchain upgrades |
+| Baseline ratio benches | **Shipped** — `make bench` (`bench/bench_allocators.cpp`); re-check after toolchain upgrades |
 | C99 wrapper | Opaque pool handle API for C callers |
 | Pluggable lock primitive | Compile-time choice of `SpinLock` vs `std::mutex` (or similar) for Pool/Slab |
 | Fail-closed allocate policy | Optional: refuse OS fallback when over caps (timing-critical / bounded domains) |

@@ -13,6 +13,7 @@ IS_CLANG ?= no
 BUILD_TYPE ?= addrsan
 ENABLE_TESTS ?= yes
 ENABLE_DEMO ?= yes
+ENABLE_BENCH ?= yes
 VERBOSE ?= no
 ENABLE_ASAN ?= auto
 ENABLE_LSAN ?= auto
@@ -42,6 +43,7 @@ BASEOBJDIR := ./obj
 SRCDIR := .
 TESTDIR := ./test
 DEMODIR := ./demos
+BENCHDIR := ./bench
 INCLUDEDIR := ./spallocator
 MLVLIB_ROOT := ./mlvlib
 # Public API / concepts / implementation docs (repo root docs/).
@@ -173,10 +175,15 @@ DEMO_SRC := $(DEMODIR)/demo_spalloc_shared_ptr.cpp
 DEMO_TARGET := demo_spalloc_shared_ptr
 DEMO_DEPFILE := $(OBJDIR)/$(DEMO_TARGET).d
 
+BENCH_SRC := $(BENCHDIR)/bench_allocators.cpp
+BENCH_TARGET := bench_allocators
+BENCH_DEPFILE := $(OBJDIR)/$(BENCH_TARGET).d
+
 # Header dependencies
 HEADERS := $(wildcard $(INCLUDEDIR)/*.hpp)
 
-# Targets
+# Targets built by `make all`. Bench is on-demand only (`make bench`) so
+# routine builds / CI are not slowed by timing harness compiles.
 TARGETS :=
 ifeq ($(ENABLE_TESTS),yes)
     TARGETS += $(OBJDIR)/$(TESTER_TARGET)
@@ -189,7 +196,7 @@ endif
 .DEFAULT_GOAL := all
 
 # Phony targets
-.PHONY: all clean test demo install uninstall help check-config
+.PHONY: all clean test demo bench install uninstall help check-config
 
 all: check-config $(TARGETS)
 	$(Q)if [ -n "$(TARGETS)" ]; then \
@@ -274,6 +281,23 @@ demo: $(OBJDIR)/$(DEMO_TARGET)
 	$(ECHO) "  RUN     $(DEMO_TARGET)"
 	$(Q)$(OBJDIR)/$(DEMO_TARGET)
 
+# Build on-demand allocator comparison bench (not part of `all` / `test`).
+$(OBJDIR)/$(BENCH_TARGET): $(BENCH_SRC) $(HEADERS) | $(OBJDIR)
+ifeq ($(ENABLE_BENCH),yes)
+	$(ECHO) "  CXX     $@"
+	$(Q)$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) -pthread
+	$(Q)rm -f $(BASEOBJDIR)/$(BENCH_TARGET)
+	$(Q)ln -s $(OBJDIRNAME)/$(BENCH_TARGET) $(BASEOBJDIR)/$(BENCH_TARGET)
+else
+	@echo "Bench disabled (ENABLE_BENCH=$(ENABLE_BENCH))"
+	@exit 1
+endif
+
+# Run bench (prefer BUILD_TYPE=release for meaningful ratios)
+bench: $(OBJDIR)/$(BENCH_TARGET)
+	$(ECHO) "  RUN     $(BENCH_TARGET) $(BENCH_ARGS)"
+	$(Q)$(OBJDIR)/$(BENCH_TARGET) $(BENCH_ARGS)
+
 # Install (header-only library)
 install:
 	$(ECHO) "  INSTALL headers to $(PREFIX)/include/spallocator"
@@ -300,9 +324,9 @@ uninstall:
 # Clean build artifacts
 clean:
 	$(ECHO) "  CLEAN   $(OBJDIR)"
-	$(Q)rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET)
+	$(Q)rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET) $(OBJDIR)/$(BENCH_TARGET)
 	$(Q)rm -f $(OBJDIR)/*.o $(OBJDIR)/*.d $(OBJDIR)/*.gcda $(OBJDIR)/*.gcno $(OBJDIR)/*.gcov
-	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET)
+	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET) $(BASEOBJDIR)/$(BENCH_TARGET)
 	$(Q)rm -f *.gcov *.gcda *.gcno
 	$(ECHO) "Clean complete!"
 
@@ -326,8 +350,14 @@ help:
 	@echo "  make test              - Run test suite"
 	@echo "  make coverage          - Run tests and print gcov summary (release default)"
 	@echo "  make demo              - Run demo program"
+	@echo "  make bench             - Build/run allocator comparison bench (on-demand)"
 	@echo "  make clean             - Remove build artifacts"
 	@echo "  make distclean         - Remove all generated files"
+	@echo ""
+	@echo "Bench tips:"
+	@echo "  make bench BUILD_TYPE=release"
+	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'"
+	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--align=64'"
 	@echo ""
 	@echo "Installation:"
 	@echo "  make install           - Install headers and docs to PREFIX"
@@ -345,9 +375,11 @@ help:
 	@echo "  Compiler:      $(CXX)"
 	@echo "  Tests:         $(ENABLE_TESTS)"
 	@echo "  Demo:          $(ENABLE_DEMO)"
+	@echo "  Bench:         $(ENABLE_BENCH)"
 	@echo "  Prefix:        $(PREFIX)"
 	@echo ""
 
 # Include generated dependency files
 -include $(TESTER_DEPFILE)
 -include $(DEMO_DEPFILE)
+-include $(BENCH_DEPFILE)
