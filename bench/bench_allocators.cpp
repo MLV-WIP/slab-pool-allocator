@@ -973,7 +973,7 @@ void run_align8_suite(Options const& opt)
             }
             if (has(be, BackendId::Slab16))
             {
-                note_skip("slab16 omitted from threaded multi-size (LIFO-only in this harness)");
+                note_skip("slab16 omitted from threaded multi-size (size<=16 only; use lifo/bulk)");
             }
 
             std::vector<Row> rows;
