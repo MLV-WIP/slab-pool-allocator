@@ -48,6 +48,15 @@ inline void sink_ptr(void* p) noexcept
 inline constexpr std::size_t kUserSizeMin = 16;
 inline constexpr std::size_t kUserSizeMax = 1024;
 
+// Default per-thread live batch for --scenario=threaded (peak live ≈ threads×batch).
+inline constexpr int kDefaultThreadedBatch = 512;
+
+enum class SizeMix
+{
+    Uniform, // uniform user bytes in [kUserSizeMin, kUserSizeMax]
+    Class,   // uniform over reachable axis-16 size classes (exact-fit user size)
+};
+
 // Per-worker std::minstd_rand (fast LCG from <random>). Deterministic seed per
 // worker index so runs are repeatable and threads do not share RNG state.
 inline constexpr std::uint32_t kBenchRngSeedKey = 0x51AB0001u;
@@ -66,10 +75,54 @@ inline std::minstd_rand make_bench_rng(unsigned worker_index = 0)
     return std::minstd_rand{z};
 }
 
-inline std::size_t pick_user_size(std::minstd_rand& rng)
+inline std::size_t pool_header_size(std::size_t alignment)
 {
-    std::uniform_int_distribution<std::size_t> dist(kUserSizeMin, kUserSizeMax);
-    return dist(rng);
+    return alignment < 8 ? 8 : alignment;
+}
+
+// Exact-fit user sizes that land on each reachable native-axis class when
+// footprint = user + header. With align 8 (header 8) and user ≥ 16, class 16
+// is unreachable; classes 32..1024 are.
+inline std::size_t pick_user_size(std::minstd_rand& rng, SizeMix mix,
+                                 std::size_t alignment)
+{
+    if (mix == SizeMix::Uniform)
+    {
+        std::uniform_int_distribution<std::size_t> dist(kUserSizeMin, kUserSizeMax);
+        return dist(rng);
+    }
+
+    const std::size_t header = pool_header_size(alignment);
+    // Mirror spallocator::kLadder16; keep local to avoid pulling ladder internals
+    // into the bench beyond what Pool already documents.
+    static constexpr std::size_t kLadder[] = {
+        16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024};
+
+    std::size_t choices[sizeof(kLadder) / sizeof(kLadder[0])];
+    std::size_t n = 0;
+    for (std::size_t cls : kLadder)
+    {
+        if (cls <= header)
+        {
+            continue;
+        }
+        const std::size_t user = cls - header;
+        if (user >= kUserSizeMin && user <= kUserSizeMax)
+        {
+            choices[n++] = user;
+        }
+    }
+    if (n == 0)
+    {
+        return kUserSizeMin;
+    }
+    std::uniform_int_distribution<std::size_t> dist(0, n - 1);
+    return choices[dist(rng)];
+}
+
+char const* size_mix_label(SizeMix m)
+{
+    return m == SizeMix::Class ? "class" : "uniform";
 }
 
 void print_pool_stats(std::string_view label, spallocator::Pool& pool)
@@ -332,6 +385,8 @@ struct Options
     std::size_t alignment = 8;
     int iters = 300000;
     int threads = 1;
+    int batch = kDefaultThreadedBatch;
+    SizeMix size_mix = SizeMix::Class;
     Scenario scenarios = Scenario::All;
     BackendId backends = BackendId::All;
     bool help = false;
@@ -361,6 +416,27 @@ Options parse_args(int argc, char** argv)
         else if (a.rfind("--threads=", 0) == 0)
         {
             opt.threads = static_cast<int>(std::strtol(a.data() + 10, nullptr, 10));
+        }
+        else if (a.rfind("--batch=", 0) == 0)
+        {
+            opt.batch = static_cast<int>(std::strtol(a.data() + 8, nullptr, 10));
+        }
+        else if (a.rfind("--size-mix=", 0) == 0)
+        {
+            std::string_view v = a.substr(11);
+            if (v == "uniform")
+            {
+                opt.size_mix = SizeMix::Uniform;
+            }
+            else if (v == "class")
+            {
+                opt.size_mix = SizeMix::Class;
+            }
+            else
+            {
+                std::cerr << "--size-mix must be uniform or class\n";
+                opt.help = true;
+            }
         }
         else if (a.rfind("--scenario=", 0) == 0)
         {
@@ -394,6 +470,10 @@ Options parse_args(int argc, char** argv)
     {
         opt.threads = 1;
     }
+    if (opt.batch < 1)
+    {
+        opt.batch = 1;
+    }
     if (opt.alignment != 8 && opt.alignment != 64)
     {
         std::cerr << "--align must be 8 (default suite) or 64 (Pool vs ::new spot-check)\n";
@@ -411,6 +491,9 @@ void print_help()
         "  --align=8|64        Payload alignment (default 8). 64 runs Pool vs ::new spot-check only.\n"
         "  --iters=N           Timed alloc/free pairs per scenario (default release 300000)\n"
         "  --threads=N         Worker threads for multi-thread multi-size churn (default 1)\n"
+        "  --batch=N           Per-thread live batch for threaded scenario (default 512)\n"
+        "  --size-mix=MIX      uniform | class (default class). Class = equal weight per\n"
+        "                      reachable axis-16 size class (exact-fit user size).\n"
         "  --scenario=LIST     lifo,multi,bulk,threaded,all (comma-separated; default all)\n"
         "  --backend=LIST      new,pool,pmr_unsync,pmr_sync,slab16,all (comma-separated; default all)\n"
         "  --help              Show this help\n"
@@ -418,12 +501,14 @@ void print_help()
         "Filters skip inapplicable combinations with a note (e.g. slab16 outside\n"
         "lifo/bulk; pmr_sync outside threaded; threaded needs --threads=N with N>1).\n"
         "Bulk alloc-then-free-all grows many slab buffers (multi-buffer free uses the map).\n"
+        "Threaded: shared allocator + start barrier (contention); peak live ≈ threads×batch\n"
+        "so multi-buffer growth needs a large batch (default 512) and preferably --size-mix=class.\n"
         "When ::new is omitted, tables print ns/op only (no vs ::new ratio).\n"
         "\n"
-        "Multi-size scenarios draw user sizes uniformly from [16, 1024].\n"
         "Per-thread std::minstd_rand (seed key + worker index).\n"
         "Recommended: make bench BUILD_TYPE=release\n"
-        "Profiling:   make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'\n";
+        "Profiling:   make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'\n"
+        "Threaded:    make bench BUILD_TYPE=release BENCH_ARGS='--scenario=threaded --threads=4'\n";
 }
 
 void print_banner(Options const& opt)
@@ -432,6 +517,8 @@ void print_banner(Options const& opt)
     std::cout << "  alignment: " << opt.alignment << "\n";
     std::cout << "  iters:     " << opt.iters << "\n";
     std::cout << "  threads:   " << opt.threads << "\n";
+    std::cout << "  batch:     " << opt.batch << " (threaded peak live ≈ threads×batch)\n";
+    std::cout << "  size-mix:  " << size_mix_label(opt.size_mix) << "\n";
     std::cout << "  scenario:  " << scenario_label(opt.scenarios) << "\n";
     std::cout << "  backend:   " << backend_label(opt.backends) << "\n";
 #if defined(__clang__)
@@ -589,13 +676,14 @@ Timing timed_lifo_churn(Backend& b, std::size_t size, std::size_t align, int ite
 }
 
 template <class Backend>
-void warm_random_sizes(Backend& b, std::size_t align, std::minstd_rand& rng, int warm_count)
+void warm_random_sizes(Backend& b, std::size_t align, std::minstd_rand& rng,
+                       SizeMix mix, int warm_count)
 {
     std::vector<std::pair<void*, std::size_t>> live;
     live.reserve(static_cast<std::size_t>(warm_count));
     for (int i = 0; i < warm_count; ++i)
     {
-        std::size_t s = pick_user_size(rng);
+        std::size_t s = pick_user_size(rng, mix, align);
         live.emplace_back(b.allocate(s, align), s);
     }
     for (auto& [p, s] : live)
@@ -605,15 +693,15 @@ void warm_random_sizes(Backend& b, std::size_t align, std::minstd_rand& rng, int
 }
 
 template <class Backend>
-Timing timed_multi_size_churn(Backend& b, std::size_t align, int iters,
+Timing timed_multi_size_churn(Backend& b, std::size_t align, SizeMix mix, int iters,
                               unsigned worker_index = 0)
 {
     std::minstd_rand rng = make_bench_rng(worker_index);
-    warm_random_sizes(b, align, rng, 256);
+    warm_random_sizes(b, align, rng, mix, 256);
     const auto t0 = clock_type::now();
     for (int i = 0; i < iters; ++i)
     {
-        std::size_t s = pick_user_size(rng);
+        std::size_t s = pick_user_size(rng, mix, align);
         void* p = b.allocate(s, align);
         sink_ptr(p);
         b.deallocate(p, s, align);
@@ -648,30 +736,38 @@ std::pair<Timing, Timing> timed_alloc_then_free_all(Backend& b, std::size_t size
 }
 
 template <class Backend>
-Timing timed_threaded_multi_size_churn(Backend& shared, std::size_t align,
-                                       int total_iters, int threads)
+Timing timed_threaded_multi_size_churn(Backend& shared, std::size_t align, SizeMix mix,
+                                       int total_iters, int threads, int batch)
 {
     {
         std::minstd_rand warm_rng = make_bench_rng(0);
-        warm_random_sizes(shared, align, warm_rng, 256);
+        warm_random_sizes(shared, align, warm_rng, mix, 256);
     }
     std::atomic<int> ready{0};
     std::vector<std::thread> workers;
     workers.reserve(static_cast<std::size_t>(threads));
 
     // Each worker holds its own batch of live pointers (not shared across threads).
-    constexpr std::size_t kBatch = 16;
-    const int per = total_iters / threads / static_cast<int>(kBatch);
+    // Large batch → peak live ≈ threads×batch for multi-buffer growth under mix=class.
+    const std::size_t kBatch = static_cast<std::size_t>(batch);
+    const int per = total_iters / threads / batch;
+    if (per < 1)
+    {
+        std::cerr << "threaded: iters too small for threads×batch; "
+                     "raise --iters or lower --threads/--batch\n";
+        return {};
+    }
 
     const auto t0 = clock_type::now();
     for (int t = 0; t < threads; ++t)
     {
         const unsigned worker_index = static_cast<unsigned>(t);
-        workers.emplace_back([&shared, &ready, align, per, threads, worker_index] {
+        workers.emplace_back([&shared, &ready, align, mix, per, threads, kBatch,
+                              worker_index] {
             // Per-thread RNG: same seed key every process run; distinct stream
             // per worker_index (not std::thread::id - that is not stable).
             std::minstd_rand rng = make_bench_rng(worker_index);
-            std::vector<std::pair<void*, std::size_t>> batch(kBatch);
+            std::vector<std::pair<void*, std::size_t>> batch_ptrs(kBatch);
 
             ready.fetch_add(1, std::memory_order_acq_rel);
             while (ready.load(std::memory_order_acquire) < threads)
@@ -682,16 +778,16 @@ Timing timed_threaded_multi_size_churn(Backend& shared, std::size_t align,
             {
                 for (std::size_t j = 0; j < kBatch; ++j)
                 {
-                    std::size_t s = pick_user_size(rng);
-                    batch[j].first = shared.allocate(s, align);
-                    batch[j].second = s;
-                    sink_ptr(batch[j].first);
+                    std::size_t s = pick_user_size(rng, mix, align);
+                    batch_ptrs[j].first = shared.allocate(s, align);
+                    batch_ptrs[j].second = s;
+                    sink_ptr(batch_ptrs[j].first);
                 }
                 // Reverse free; use signed index so j >= 0 is well-defined
                 // (size_t would wrap forever after j hits 0).
                 for (int j = static_cast<int>(kBatch) - 1; j >= 0; --j)
                 {
-                    auto& slot = batch[static_cast<std::size_t>(j)];
+                    auto& slot = batch_ptrs[static_cast<std::size_t>(j)];
                     shared.deallocate(slot.first, slot.second, align);
                     slot.first = nullptr;
                 }
@@ -704,7 +800,7 @@ Timing timed_threaded_multi_size_churn(Backend& shared, std::size_t align,
     }
     const auto t1 = clock_type::now();
     // ops = alloc+free pairs (each outer iter does kBatch of them).
-    return make_timing(t1 - t0, per * threads * static_cast<int>(kBatch));
+    return make_timing(t1 - t0, per * threads * batch);
 }
 
 struct Row
@@ -834,20 +930,24 @@ void run_align8_suite(Options const& opt)
         if (has(be, BackendId::New))
         {
             NewDeleteBackend new_b;
-            rows.push_back(row_from(
-                new_b, timed_multi_size_churn(new_b, opt.alignment, opt.iters), true));
+                rows.push_back(row_from(
+                new_b,
+                timed_multi_size_churn(new_b, opt.alignment, opt.size_mix, opt.iters),
+                true));
         }
         if (has(be, BackendId::Pool))
         {
             rows.push_back(row_from(
-                pool_b, timed_multi_size_churn(pool_b, opt.alignment, opt.iters)));
+                pool_b,
+                timed_multi_size_churn(pool_b, opt.alignment, opt.size_mix, opt.iters)));
             ran_pool = true;
         }
         if (has(be, BackendId::PmrUnsync))
         {
             PmrUnsyncBackend pmr_b;
             rows.push_back(row_from(
-                pmr_b, timed_multi_size_churn(pmr_b, opt.alignment, opt.iters)));
+                pmr_b,
+                timed_multi_size_churn(pmr_b, opt.alignment, opt.size_mix, opt.iters)));
         }
         if (has(be, BackendId::PmrSync))
         {
@@ -858,7 +958,8 @@ void run_align8_suite(Options const& opt)
             note_skip("slab16 only supports size<=16 (use --scenario=lifo or bulk)");
         }
         print_table(
-            "Multi-size mix (uniform random user size in [16, 1024], alloc+free pair)",
+            std::string("Multi-size mix (size-mix=") + size_mix_label(opt.size_mix) +
+                ", alloc+free pair)",
             rows);
         if (ran_pool)
         {
@@ -980,13 +1081,19 @@ void run_align8_suite(Options const& opt)
             PoolBackend pool_b;
             bool ran_pool = false;
 
+            const int peak_live = opt.threads * opt.batch;
+            std::cout << "Multi-thread multi-size (shared allocator; size-mix="
+                      << size_mix_label(opt.size_mix) << "; batch=" << opt.batch
+                      << "; peak live ≈ " << peak_live << ")\n";
+
             if (has(be, BackendId::New))
             {
                 NewDeleteBackend new_b;
                 rows.push_back(row_from(
                     new_b,
                     timed_threaded_multi_size_churn(
-                        new_b, opt.alignment, opt.iters, opt.threads),
+                        new_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
+                        opt.batch),
                     true));
             }
             if (has(be, BackendId::Pool))
@@ -994,7 +1101,8 @@ void run_align8_suite(Options const& opt)
                 rows.push_back(row_from(
                     pool_b,
                     timed_threaded_multi_size_churn(
-                        pool_b, opt.alignment, opt.iters, opt.threads)));
+                        pool_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
+                        opt.batch)));
                 ran_pool = true;
             }
             if (has(be, BackendId::PmrSync))
@@ -1003,14 +1111,15 @@ void run_align8_suite(Options const& opt)
                 rows.push_back(row_from(
                     pmr_b,
                     timed_threaded_multi_size_churn(
-                        pmr_b, opt.alignment, opt.iters, opt.threads)));
+                        pmr_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
+                        opt.batch)));
             }
-            print_table(
-                "Multi-thread multi-size (uniform random [16, 1024], shared allocator)",
-                rows);
+            print_table("Multi-thread timing", rows);
             if (ran_pool)
             {
                 print_pool_stats("after multi-thread multi-size", pool_b.pool);
+                std::cout << "    (peak live ≈ " << peak_live
+                          << "; retained_slab_bytes reflects multi-buffer growth)\n";
             }
             std::cout << "\n";
         }

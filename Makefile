@@ -406,6 +406,7 @@ help:
 	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'"
 	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--align=64'"
 	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'"
+	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--scenario=threaded --threads=4'"
 	@echo "  make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'"
 	@echo ""
 	@echo "Installation:"
