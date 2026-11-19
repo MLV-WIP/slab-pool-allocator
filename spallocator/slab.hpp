@@ -441,16 +441,25 @@ namespace spallocator
                 if (slab_available_map.test(slab_index))
                 {
                     auto& slab_slots = slab_map[slab_index];
-                    // Forward from the cursor; if that misses and the cursor was
-                    // mid-buffer, wrap within this buffer before leaving it.
-                    std::size_t item_index =
-                        find_next_clear_bit(slab_slots, slot_start);
-                    if (item_index >= slab_slots.size() && slot_start > 0)
+                    // Next-fit fast path: if the cursor slot is free, take it
+                    // without a freemap word scan (common for LIFO / local churn).
+                    std::size_t item_index = slab_slots.size();
+                    if (slot_start < slab_slots.size() && !slab_slots.test(slot_start))
                     {
-                        item_index = find_next_clear_bit(slab_slots, 0);
-                        if (item_index >= slot_start)
+                        item_index = slot_start;
+                    }
+                    else
+                    {
+                        // Forward from the cursor; if that misses and the cursor
+                        // was mid-buffer, wrap within this buffer before leaving.
+                        item_index = find_next_clear_bit(slab_slots, slot_start);
+                        if (item_index >= slab_slots.size() && slot_start > 0)
                         {
-                            item_index = slab_slots.size(); // already scanned
+                            item_index = find_next_clear_bit(slab_slots, 0);
+                            if (item_index >= slot_start)
+                            {
+                                item_index = slab_slots.size(); // already scanned
+                            }
                         }
                     }
                     if (item_index < slab_slots.size())
@@ -502,6 +511,23 @@ namespace spallocator
     template<std::size_t ElemSize, std::size_t Alignment>
     std::optional<std::size_t> Slab<ElemSize, Alignment>::findSlabForItem(std::byte* item) const
     {
+        // Single-buffer fast path: skip the address map (common steady state).
+        if (slab_data.size() == 1)
+        {
+            std::byte* const slab_start = slab_data[0];
+            std::byte* const slab_end = slab_start + slab_alloc_size;
+            if (item >= slab_start && item < slab_end)
+            {
+                return 0;
+            }
+            debug_println(
+                "Item {} is not within sole slab range {} - {}; treating as unknown pointer",
+                static_cast<void*>(item),
+                static_cast<void*>(slab_start),
+                static_cast<void*>(slab_end));
+            return std::nullopt;
+        }
+
         auto it = base_address_map.upper_bound(item);
         if (it != base_address_map.begin())
         {
