@@ -225,13 +225,16 @@ namespace spallocator
     private: // data members
         PoolControlBlock* control_{nullptr};
 
+        // Eager axis-16 registry: filled in Pool() and never replaced/nulled.
+        // Hot resolve is lock-free; slot freemaps still use per-slab locks.
         std::array<std::unique_ptr<AbstractSlab>, kLadder16Count> slabs16{};
+        // Lazy axes: publish under Pool::lock (see getOrCreateLazy).
         std::array<std::unique_ptr<AbstractSlab>, kLadder32Count> slabs32{};
         std::array<std::unique_ptr<AbstractSlab>, kLadder64Count> slabs64{};
         SlabProxy large_slab;
 
-        SpinLock lock;
-        SpinLock slab_init_lock;
+        SpinLock lock;           // lazy registry publish / snapshot
+        SpinLock slab_init_lock; // serialize heavy lazy Slab construction
 
         std::atomic<std::uint64_t> alloc_ok_{0};
         std::atomic<std::uint64_t> alloc_fail_{0};
@@ -356,9 +359,12 @@ namespace spallocator
             return &large_slab;
         }
 
+        // Axis 16 is eager and immutable for the pool lifetime: ctor installs
+        // every ladder rung; trim/reclaim only drops empty buffers inside each
+        // slab, never the unique_ptr slot. Locking here was pure double-lock
+        // tax on the default align 4/8/16 path (Pool::lock then slab_lock).
         if (axis <= kSlabNativeAlignment)
         {
-            std::scoped_lock<SpinLock> guard(lock);
             return slabs16[index].get();
         }
 

@@ -252,7 +252,8 @@ of the current code; see [Thread safety](#thread-safety--lock-ordering).
    power-of-two align in `[4, 64]`  
 2. **Compute (pool):** `header_size = 8`, `alloc_size = 108`  
 3. **Classify (pool):** `nativeAxis(8) → 16`; class **128B** (108 > 96)  
-4. **Resolve backend (pool lock, brief):** `slabs16[index]` or lazy create path  
+4. **Resolve backend:** axis 16 → lock-free `slabs16[index]` (eager, immutable
+   slots); axis 32/64 → lazy create under `Pool::lock` / `slab_init_lock`  
 5. **Take slot (slab lock):** find free bit, mark freemap / availability; return
    **slot base**  
 6. **Publish header (pool, after slab returns):** write magic / sizes at base;
@@ -292,13 +293,14 @@ tests or docs almost always means forgetting the header.
 
 | Registry | When built | Contents |
 |----------|------------|----------|
-| `slabs16[12]` | With the pool (eager) | One `unique_ptr<AbstractSlab>` per ladder rung |
+| `slabs16[12]` | With the pool (eager) | One `unique_ptr<AbstractSlab>` per ladder rung; **never replaced/nulled** after ctor (`trim` only reclaims buffers inside each slab) |
 | `slabs32` / `slabs64` | Lazy via `getOrCreateLazy` | Same shape; empty until first use |
 | `large_slab` | With the pool | Single `SlabProxy` instance |
 
 **Routing:** `resolveSlab(alloc_size, axis)` runs `selectClassIndex`. A normal
 index picks a size-class slab; `kSlabIndexNpos` means footprint exceeds that
-axis’s max → `large_slab`.
+axis’s max → `large_slab`. Eager axis-16 lookups are **lock-free**; lazy axes
+still synchronize publish.
 
 **Lazy create sequence (intent):**
 
@@ -309,7 +311,8 @@ axis’s max → `large_slab`.
 5. Publish under `Pool::lock`  
 
 That keeps ordinary allocate/free routing critical sections short while avoiding
-duplicate lazy slabs under races.
+duplicate lazy slabs under races. Default (align ≤16) paths never take
+`Pool::lock` for resolve — only the per-slab freemap lock.
 
 `selectSlab` / `selectClassIndex` are pure classification helpers: usable from
 tests and constexpr-friendly call sites, and shared by allocate and free so both
@@ -724,7 +727,7 @@ instances share no locks — isolation is free at the domain boundary.
 
 | Lock | Protects | Hold time intent |
 |------|----------|------------------|
-| `Pool::lock` | Registry / routing snapshots | Brief — look up or publish a pointer |
+| `Pool::lock` | Lazy registry publish / snapshot (`slabs32`/`slabs64`) | Brief — look up or publish a pointer; **not** used for eager `slabs16` resolve |
 | `Pool::slab_init_lock` | Lazy slab construction | May cover heavy `Slab` ctor; not on every alloc |
 | Per-`Slab` `SpinLock` | Freemap, availability, address map | Brief — bit ops and map update |
 
@@ -732,7 +735,8 @@ instances share no locks — isolation is free at the domain boundary.
 
 Never take locks in opposing orders across threads:
 
-- Common allocate: `Pool::lock` (resolve) → drop → `Slab::lock` (slot)  
+- Common allocate (axis 16): lock-free resolve → `Slab::lock` (slot)  
+- Lazy allocate (axis 32/64): `Pool::lock` (and possibly `slab_init_lock`) → drop → `Slab::lock`  
 - Lazy publish: `slab_init_lock` → brief `Pool::lock` to install  
 - Avoid: holding `Slab::lock` then blocking on `Pool::lock` while another thread
   holds pool and waits for that slab  
