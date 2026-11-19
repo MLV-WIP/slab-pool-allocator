@@ -8,7 +8,7 @@
  * (where applicable) bare Slab. Reports ns/op and ratio vs ::new.
  *
  * Usage:
- *   bench_allocators [--align=8|64] [--iters=N] [--threads=N]
+ *   bench_allocators [--align=8|32|64] [--iters=N] [--threads=N]
  *                   [--scenario=...] [--backend=...] [--help]
  */
 
@@ -475,9 +475,9 @@ Options parse_args(int argc, char** argv)
     {
         opt.batch = 1;
     }
-    if (opt.alignment != 8 && opt.alignment != 64)
+    if (opt.alignment != 8 && opt.alignment != 32 && opt.alignment != 64)
     {
-        std::cerr << "--align must be 8 (default suite) or 64 (Pool vs ::new spot-check)\n";
+        std::cerr << "--align must be 8 (default suite) or 32|64 (Pool vs ::new spot-check)\n";
         opt.help = true;
     }
     return opt;
@@ -489,7 +489,7 @@ void print_help()
         "bench_allocators - compare allocation backends (on-demand; not a CI gate)\n"
         "\n"
         "Options:\n"
-        "  --align=8|64        Payload alignment (default 8). 64 runs Pool vs ::new spot-check only.\n"
+        "  --align=8|32|64     Payload alignment (default 8). 32/64 run Pool vs ::new spot-check only.\n"
         "  --iters=N           Timed alloc/free pairs per scenario (default release 300000)\n"
         "  --threads=N         Worker threads for multi-thread multi-size churn (default 1)\n"
         "  --batch=N           Per-thread live batch for threaded scenario (default 1024)\n"
@@ -1127,16 +1127,18 @@ void run_align8_suite(Options const& opt)
     }
 }
 
-void run_align64_spot(Options const& opt)
+void run_high_align_spot(Options const& opt)
 {
     constexpr std::size_t kSize = 16;
-    std::cout << "Align-64 spot-check (Pool axis/header tax vs ::new; size=16)\n";
+    std::cout << "Align-" << opt.alignment
+              << " spot-check (Pool axis/header tax vs ::new; size=16)\n";
     std::cout << "Only ::new and Pool participate; other --backend values are skipped.\n\n";
 
-    // Align-64 is a LIFO-only tax check.
+    // High-align spots are LIFO-only tax checks (axis 32 or 64).
     if (!has(opt.scenarios, Scenario::Lifo))
     {
-        std::cout << "Align-64 spot-check skipped (--scenario without lifo).\n\n";
+        std::cout << "Align-" << opt.alignment
+                  << " spot-check skipped (--scenario without lifo).\n\n";
         return;
     }
 
@@ -1160,12 +1162,15 @@ void run_align64_spot(Options const& opt)
     if (has(be, BackendId::PmrUnsync) || has(be, BackendId::PmrSync) ||
         has(be, BackendId::Slab16))
     {
-        note_skip("align=64 spot-check is Pool vs ::new only");
+        note_skip("align=" + std::to_string(opt.alignment) +
+                  " spot-check is Pool vs ::new only");
     }
     print_table("Warmed LIFO churn", rows);
     if (ran_pool)
     {
-        print_pool_stats("after align-64 LIFO churn", pool_b.pool);
+        print_pool_stats(
+            ("after align-" + std::to_string(opt.alignment) + " LIFO churn").c_str(),
+            pool_b.pool);
     }
     std::cout << "\n";
 }
@@ -1178,7 +1183,7 @@ int main(int argc, char** argv)
     if (opt.help)
     {
         print_help();
-        return opt.alignment == 8 || opt.alignment == 64 ? 0 : 2;
+        return (opt.alignment == 8 || opt.alignment == 32 || opt.alignment == 64) ? 0 : 2;
     }
 
     print_banner(opt);
@@ -1192,9 +1197,9 @@ int main(int argc, char** argv)
     }
     std::cout << "Absolute ns are host/toolchain-specific; re-check after upgrades.\n\n";
 
-    if (opt.alignment == 64)
+    if (opt.alignment == 32 || opt.alignment == 64)
     {
-        run_align64_spot(opt);
+        run_high_align_spot(opt);
     }
     else
     {

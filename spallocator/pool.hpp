@@ -86,6 +86,44 @@ namespace spallocator
     inline constexpr std::size_t kLadder64Count =
         sizeof(kLadder64) / sizeof(kLadder64[0]);
 
+    // Pool cold-start: which size-class engines map a first data block in
+    // Pool(). Engines for every axis are always constructed (immutable
+    // registries → lock-free resolve). Override via -D / ./configure.
+#ifndef SPALLOCATOR_PREALLOCATE_MAX_ELEM_SIZE
+#  define SPALLOCATOR_PREALLOCATE_MAX_ELEM_SIZE 256u
+#endif
+#ifndef SPALLOCATOR_PREALLOCATE_MAX_ALIGNMENT
+#  define SPALLOCATOR_PREALLOCATE_MAX_ALIGNMENT 16u
+#endif
+
+    inline constexpr std::size_t kPreallocateMaxElemSize =
+        SPALLOCATOR_PREALLOCATE_MAX_ELEM_SIZE;
+    inline constexpr std::size_t kPreallocateMaxAlignment =
+        SPALLOCATOR_PREALLOCATE_MAX_ALIGNMENT;
+
+    static_assert(
+        kPreallocateMaxAlignment == 16 || kPreallocateMaxAlignment == 32 ||
+            kPreallocateMaxAlignment == 64,
+        "kPreallocateMaxAlignment must be 16, 32, or 64");
+
+    // Preallocate a first data block when both thresholds pass (ElemSize is
+    // the ladder rung; Alignment is the slab axis). Default: axis 16 and
+    // ElemSize <= 256. Raise max alignment to also warm 32/64 axes.
+    constexpr bool shouldPreallocateFirstBlock(std::size_t elem_size,
+                                               std::size_t alignment) noexcept
+    {
+        return elem_size <= kPreallocateMaxElemSize &&
+               alignment <= kPreallocateMaxAlignment;
+    }
+
+    template<std::size_t ElemSize, std::size_t Alignment>
+    inline std::unique_ptr<AbstractSlab> makePoolSlab()
+    {
+        constexpr bool pre =
+            shouldPreallocateFirstBlock(ElemSize, Alignment);
+        return std::make_unique<Slab<ElemSize, Alignment>>(pre);
+    }
+
     // Map request alignment to a native slab axis (4/8 → 16).
     constexpr std::size_t nativeAxis(std::size_t alignment)
     {
@@ -204,10 +242,6 @@ namespace spallocator
         Pool& operator=(Pool&&) = delete;
 
         AbstractSlab* resolveSlab(std::size_t alloc_size, std::size_t axis);
-        AbstractSlab* getOrCreateLazy(std::size_t axis, std::size_t index);
-
-        static std::unique_ptr<AbstractSlab> makeLazySlab(std::size_t axis,
-                                                          std::size_t index);
 
         void note_alloc_ok() noexcept;
         void note_alloc_fail() noexcept;
@@ -225,16 +259,15 @@ namespace spallocator
     private: // data members
         PoolControlBlock* control_{nullptr};
 
-        // Eager axis-16 registry: filled in Pool() and never replaced/nulled.
-        // Hot resolve is lock-free; slot freemaps still use per-slab locks.
+        // Eager, immutable registries: every ladder rung is installed in
+        // Pool() and never replaced/nulled. Resolve is lock-free on all axes;
+        // per-slab locks still protect freemaps / data-block growth.
+        // Whether a class maps a first data block at birth is controlled by
+        // kPreallocateMaxElemSize / kPreallocateMaxAlignment.
         std::array<std::unique_ptr<AbstractSlab>, kLadder16Count> slabs16{};
-        // Lazy axes: publish under Pool::lock (see getOrCreateLazy).
         std::array<std::unique_ptr<AbstractSlab>, kLadder32Count> slabs32{};
         std::array<std::unique_ptr<AbstractSlab>, kLadder64Count> slabs64{};
         SlabProxy large_slab;
-
-        SpinLock lock;           // lazy registry publish / snapshot
-        SpinLock slab_init_lock; // serialize heavy lazy Slab construction
 
         std::atomic<std::uint64_t> alloc_ok_{0};
         std::atomic<std::uint64_t> alloc_fail_{0};
@@ -273,84 +306,6 @@ namespace spallocator
     // Pool
     // ---------------------------------------------------------------------------
 
-    inline std::unique_ptr<AbstractSlab> Pool::makeLazySlab(std::size_t axis,
-                                                            std::size_t index)
-    {
-        if (axis == 32)
-        {
-            switch (index)
-            {
-                case 0:  return std::make_unique<Slab<32, 32>>();
-                case 1:  return std::make_unique<Slab<64, 32>>();
-                case 2:  return std::make_unique<Slab<96, 32>>();
-                case 3:  return std::make_unique<Slab<128, 32>>();
-                case 4:  return std::make_unique<Slab<192, 32>>();
-                case 5:  return std::make_unique<Slab<256, 32>>();
-                case 6:  return std::make_unique<Slab<384, 32>>();
-                case 7:  return std::make_unique<Slab<512, 32>>();
-                case 8:  return std::make_unique<Slab<768, 32>>();
-                case 9:  return std::make_unique<Slab<1024, 32>>();
-                case 10: return std::make_unique<Slab<1536, 32>>();
-                case 11: return std::make_unique<Slab<2048, 32>>();
-                default: break;
-            }
-        }
-        else if (axis == 64)
-        {
-            switch (index)
-            {
-                case 0:  return std::make_unique<Slab<64, 64>>();
-                case 1:  return std::make_unique<Slab<128, 64>>();
-                case 2:  return std::make_unique<Slab<192, 64>>();
-                case 3:  return std::make_unique<Slab<256, 64>>();
-                case 4:  return std::make_unique<Slab<384, 64>>();
-                case 5:  return std::make_unique<Slab<512, 64>>();
-                case 6:  return std::make_unique<Slab<768, 64>>();
-                case 7:  return std::make_unique<Slab<1024, 64>>();
-                case 8:  return std::make_unique<Slab<1536, 64>>();
-                case 9:  return std::make_unique<Slab<2048, 64>>();
-                case 10: return std::make_unique<Slab<3072, 64>>();
-                case 11: return std::make_unique<Slab<4096, 64>>();
-                default: break;
-            }
-        }
-        throw std::invalid_argument(
-            std::format("Invalid lazy slab axis={} index={}", axis, index));
-    }
-
-
-    inline AbstractSlab* Pool::getOrCreateLazy(std::size_t axis, std::size_t index)
-    {
-        auto& registry = (axis == 32) ? slabs32 : slabs64;
-        {
-            std::scoped_lock<SpinLock> guard(lock);
-            if (registry[index])
-            {
-                return registry[index].get();
-            }
-        }
-
-        std::scoped_lock<SpinLock> init_guard(slab_init_lock);
-        {
-            std::scoped_lock<SpinLock> guard(lock);
-            if (registry[index])
-            {
-                return registry[index].get();
-            }
-        }
-
-        // Heavy construction while holding only slab_init_lock (not Pool::lock).
-        auto created = makeLazySlab(axis, index);
-
-        std::scoped_lock<SpinLock> guard(lock);
-        if (!registry[index])
-        {
-            registry[index] = std::move(created);
-        }
-        return registry[index].get();
-    }
-
-
     inline AbstractSlab* Pool::resolveSlab(std::size_t alloc_size, std::size_t axis)
     {
         const std::size_t index = selectClassIndex(alloc_size, axis);
@@ -359,16 +314,18 @@ namespace spallocator
             return &large_slab;
         }
 
-        // Axis 16 is eager and immutable for the pool lifetime: ctor installs
-        // every ladder rung; trim/reclaim only drops empty buffers inside each
-        // slab, never the unique_ptr slot. Locking here was pure double-lock
-        // tax on the default align 4/8/16 path (Pool::lock then slab_lock).
+        // All axis registries are eager and immutable for the pool lifetime.
+        // trim/reclaim only drops empty data blocks inside each engine, never
+        // the unique_ptr slot — so resolve stays lock-free on every axis.
         if (axis <= kSlabNativeAlignment)
         {
             return slabs16[index].get();
         }
-
-        return getOrCreateLazy(axis, index);
+        if (axis == 32)
+        {
+            return slabs32[index].get();
+        }
+        return slabs64[index].get();
     }
 
 
@@ -575,23 +532,18 @@ namespace spallocator
                 reclaimed += slab->reclaimEmptySlabs(keep_min);
             }
         }
-
-        // Lazy axes: hold init lock so unique_ptr slots are stable while we trim.
+        for (auto& slab : slabs32)
         {
-            std::scoped_lock<SpinLock> init_guard(slab_init_lock);
-            for (auto& slab : slabs32)
+            if (slab)
             {
-                if (slab)
-                {
-                    reclaimed += slab->reclaimEmptySlabs(keep_min);
-                }
+                reclaimed += slab->reclaimEmptySlabs(keep_min);
             }
-            for (auto& slab : slabs64)
+        }
+        for (auto& slab : slabs64)
+        {
+            if (slab)
             {
-                if (slab)
-                {
-                    reclaimed += slab->reclaimEmptySlabs(keep_min);
-                }
+                reclaimed += slab->reclaimEmptySlabs(keep_min);
             }
         }
 
@@ -611,8 +563,6 @@ namespace spallocator
                 total += slab->getAllocatedMemory();
             }
         }
-
-        std::scoped_lock<SpinLock> init_guard(slab_init_lock);
         for (auto& slab : slabs32)
         {
             if (slab)
@@ -712,19 +662,47 @@ namespace spallocator
     Pool::Pool()
         : control_(PoolControlBlock::create(this))
     {
-        // Eager native-16 ladder only; 32/64 axes are created on first use.
-        slabs16[0]  = std::make_unique<Slab<16, 16>>();
-        slabs16[1]  = std::make_unique<Slab<32, 16>>();
-        slabs16[2]  = std::make_unique<Slab<48, 16>>();
-        slabs16[3]  = std::make_unique<Slab<64, 16>>();
-        slabs16[4]  = std::make_unique<Slab<96, 16>>();
-        slabs16[5]  = std::make_unique<Slab<128, 16>>();
-        slabs16[6]  = std::make_unique<Slab<192, 16>>();
-        slabs16[7]  = std::make_unique<Slab<256, 16>>();
-        slabs16[8]  = std::make_unique<Slab<384, 16>>();
-        slabs16[9]  = std::make_unique<Slab<512, 16>>();
-        slabs16[10] = std::make_unique<Slab<768, 16>>();
-        slabs16[11] = std::make_unique<Slab<1024, 16>>();
+        // Every axis registry is filled here (immutable thereafter). First
+        // data-block mapping follows shouldPreallocateFirstBlock (defaults:
+        // axis ≤16 and ElemSize ≤256).
+        slabs16[0]  = makePoolSlab<16, 16>();
+        slabs16[1]  = makePoolSlab<32, 16>();
+        slabs16[2]  = makePoolSlab<48, 16>();
+        slabs16[3]  = makePoolSlab<64, 16>();
+        slabs16[4]  = makePoolSlab<96, 16>();
+        slabs16[5]  = makePoolSlab<128, 16>();
+        slabs16[6]  = makePoolSlab<192, 16>();
+        slabs16[7]  = makePoolSlab<256, 16>();
+        slabs16[8]  = makePoolSlab<384, 16>();
+        slabs16[9]  = makePoolSlab<512, 16>();
+        slabs16[10] = makePoolSlab<768, 16>();
+        slabs16[11] = makePoolSlab<1024, 16>();
+
+        slabs32[0]  = makePoolSlab<32, 32>();
+        slabs32[1]  = makePoolSlab<64, 32>();
+        slabs32[2]  = makePoolSlab<96, 32>();
+        slabs32[3]  = makePoolSlab<128, 32>();
+        slabs32[4]  = makePoolSlab<192, 32>();
+        slabs32[5]  = makePoolSlab<256, 32>();
+        slabs32[6]  = makePoolSlab<384, 32>();
+        slabs32[7]  = makePoolSlab<512, 32>();
+        slabs32[8]  = makePoolSlab<768, 32>();
+        slabs32[9]  = makePoolSlab<1024, 32>();
+        slabs32[10] = makePoolSlab<1536, 32>();
+        slabs32[11] = makePoolSlab<2048, 32>();
+
+        slabs64[0]  = makePoolSlab<64, 64>();
+        slabs64[1]  = makePoolSlab<128, 64>();
+        slabs64[2]  = makePoolSlab<192, 64>();
+        slabs64[3]  = makePoolSlab<256, 64>();
+        slabs64[4]  = makePoolSlab<384, 64>();
+        slabs64[5]  = makePoolSlab<512, 64>();
+        slabs64[6]  = makePoolSlab<768, 64>();
+        slabs64[7]  = makePoolSlab<1024, 64>();
+        slabs64[8]  = makePoolSlab<1536, 64>();
+        slabs64[9]  = makePoolSlab<2048, 64>();
+        slabs64[10] = makePoolSlab<3072, 64>();
+        slabs64[11] = makePoolSlab<4096, 64>();
     }
 
 

@@ -404,6 +404,7 @@ help:
 	@echo "Bench tips:"
 	@echo "  make bench BUILD_TYPE=release"
 	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'"
+	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--align=32'"
 	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--align=64'"
 	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'"
 	@echo "  make bench BUILD_TYPE=release BENCH_ARGS='--scenario=threaded --threads=4'  # batch=1024,size-mix=class"

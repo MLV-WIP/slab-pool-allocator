@@ -223,8 +223,8 @@ slot bases would not guarantee the user’s alignment. Separate
 
 ```
 Axis 16 (eager): 16 … 1024
-Axis 32 (lazy):  32 … 2048
-Axis 64 (lazy):  64 … 4096
+Axis 32:  32 … 2048
+Axis 64:  64 … 4096
 ```
 
 Request align 4/8 **over-aligns** into axis 16 (slots are at least 16-aligned).
@@ -237,7 +237,7 @@ first use.
 |------|--------|-----------|------|
 | `allocate(64)` | 8 | 72 | 96B class, axis 16 |
 | `allocate(64, 16)` | 16 | 80 | 96B class, axis 16 |
-| `allocate(64, 64)` | 64 | 128 | 128B class, axis 64 (lazy) |
+| `allocate(64, 64)` | 64 | 128 | 128B class, axis 64 |
 
 ---
 
@@ -252,10 +252,11 @@ of the current code; see [Thread safety](#thread-safety--lock-ordering).
    power-of-two align in `[4, 64]`  
 2. **Compute (pool):** `header_size = 8`, `alloc_size = 108`  
 3. **Classify (pool):** `nativeAxis(8) → 16`; class **128B** (108 > 96)  
-4. **Resolve backend:** axis 16 → lock-free `slabs16[index]` (eager, immutable
-   slots); axis 32/64 → lazy create under `Pool::lock` / `slab_init_lock`  
+4. **Resolve backend (lock-free):** pick eager registry slot for the axis
+   (`slabs16` / `slabs32` / `slabs64`); engines are installed at `Pool()` and
+   never replaced  
 5. **Take slot (slab lock):** find free bit, mark freemap / availability; return
-   **slot base**  
+   **slot base** (may map the first data block on a cold engine)  
 6. **Publish header (pool, after slab returns):** write magic / sizes at base;
    return `base + header_size` to the caller  
 
@@ -293,26 +294,32 @@ tests or docs almost always means forgetting the header.
 
 | Registry | When built | Contents |
 |----------|------------|----------|
-| `slabs16[12]` | With the pool (eager) | One `unique_ptr<AbstractSlab>` per ladder rung; **never replaced/nulled** after ctor (`trim` only reclaims buffers inside each slab) |
-| `slabs32` / `slabs64` | Lazy via `getOrCreateLazy` | Same shape; empty until first use |
+| `slabs16[12]` | With the pool (eager) | One size-class **engine** (`Slab`) per ladder rung; **never replaced/nulled** |
+| `slabs32` / `slabs64` | With the pool (eager) | Same shape for high-align axes |
 | `large_slab` | With the pool | Single `SlabProxy` instance |
 
+**Terminology (engine vs block vs slot):** a **Slab** here is the size-class
+engine for one `(ElemSize, Alignment)`. It owns zero or more **data blocks**
+(mapped buffers of slots); each **slot** is one `ElemSize` unit. Older APIs
+still say “slab” for a data block (`allocateNewSlab`, `getSlabCount`) — a
+rename pass is backlog, not required for correctness.
+
 **Routing:** `resolveSlab(alloc_size, axis)` runs `selectClassIndex`. A normal
-index picks a size-class slab; `kSlabIndexNpos` means footprint exceeds that
-axis’s max → `large_slab`. Eager axis-16 lookups are **lock-free**; lazy axes
-still synchronize publish.
+index picks a size-class engine; `kSlabIndexNpos` means footprint exceeds that
+axis’s max → `large_slab`. All registry lookups are **lock-free**.
 
-**Lazy create sequence (intent):**
+**Cold-start data blocks:** every engine exists after `Pool()`, but only some
+map a first data block at construction. Policy (override via `-D` /
+`./configure`):
 
-1. Under `Pool::lock`, if the slot is already populated, return it  
-2. Otherwise take `slab_init_lock` (heavy construction serialized here)  
-3. Double-check under `Pool::lock` (another thread may have won)  
-4. Construct `Slab<…>` **without** holding `Pool::lock`  
-5. Publish under `Pool::lock`  
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `kPreallocateMaxElemSize` | 256 | Preallocate when `ElemSize <=` this |
+| `kPreallocateMaxAlignment` | 16 | …and `Alignment <=` this (raise to 32/64 to warm high-align axes) |
 
-That keeps ordinary allocate/free routing critical sections short while avoiding
-duplicate lazy slabs under races. Default (align ≤16) paths never take
-`Pool::lock` for resolve — only the per-slab freemap lock.
+Other engines stay at zero blocks until the first `allocateItem` (under the
+per-slab lock). `trim` only reclaims empty **blocks** inside engines — never
+registry slots.
 
 `selectSlab` / `selectClassIndex` are pure classification helpers: usable from
 tests and constexpr-friendly call sites, and shared by allocate and free so both
@@ -727,19 +734,17 @@ instances share no locks — isolation is free at the domain boundary.
 
 | Lock | Protects | Hold time intent |
 |------|----------|------------------|
-| `Pool::lock` | Lazy registry publish / snapshot (`slabs32`/`slabs64`) | Brief — look up or publish a pointer; **not** used for eager `slabs16` resolve |
-| `Pool::slab_init_lock` | Lazy slab construction | May cover heavy `Slab` ctor; not on every alloc |
-| Per-`Slab` `SpinLock` | Freemap, availability, address map | Brief — bit ops and map update |
+| Per-`Slab` `SpinLock` | Freemap, availability, address map, data-block growth | Brief — bit ops, map update, optional first-block map |
+
+Pool no longer holds registry locks: all axis engines are installed in `Pool()`
+and the directory is immutable for the pool lifetime.
 
 ### Ordering intent
 
-Never take locks in opposing orders across threads:
-
-- Common allocate (axis 16): lock-free resolve → `Slab::lock` (slot)  
-- Lazy allocate (axis 32/64): `Pool::lock` (and possibly `slab_init_lock`) → drop → `Slab::lock`  
-- Lazy publish: `slab_init_lock` → brief `Pool::lock` to install  
-- Avoid: holding `Slab::lock` then blocking on `Pool::lock` while another thread
-  holds pool and waits for that slab  
+- Common allocate / free (any axis): lock-free resolve → `Slab::lock` (slot /
+  block growth)  
+- Avoid nesting unrelated slab locks across classes unless a future API requires
+  it (today’s hot path never does)  
 
 Exact sequences live in `pool.hpp` / `pool_lifetime.hpp` / `slab.hpp` — treat those as source of
 truth if this summary drifts.
@@ -887,7 +892,7 @@ Waste has three buckets:
 |-------|--------|
 | Per-slab locks | Different size classes proceed in parallel after routing |
 | Multiple pools | Isolate shards / tenants; reduce cross-talk and lock sharing |
-| Lazy 32/64 axes | No metadata cost until high-align traffic appears |
+| Eager engines + selective first-block | Lock-free resolve on all axes; cold RSS only for configured warm classes |
 | `trim` | Reclaim RSS after spikes without changing the hot path |
 | `SlabProxy` | Avoids forcing huge objects through size-class bookkeeping |
 
@@ -904,7 +909,8 @@ ns/op.
 ```bash
 make bench BUILD_TYPE=release
 make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
-make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # optional Pool vs ::new
+make bench BUILD_TYPE=release BENCH_ARGS='--align=32'   # Pool vs ::new axis-32 spot
+make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new axis-64 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
 ```
 
@@ -927,8 +933,9 @@ Filters (for focused timing or profiling):
 | `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
 | `--size-mix=` | `uniform` or `class` (default **class**) | `class` = equal weight per reachable axis-16 size class (exact-fit user size); better multi-slab coverage than uniform bytes |
 
-Default alignment is 8. `--align=64` is a Pool axis/header-tax spot-check only
-(not a full alignment matrix).
+Default alignment is 8 (full comparative suite). `--align=32` and `--align=64`
+are Pool vs `::new` LIFO spot-checks for high-align axis/header tax (not a full
+alignment matrix).
 
 `SlabTest.AllocFreeChurnMicrobench` remains a light GTest smoke/`RecordProperty`
 check for the slab engine; use `make bench` for comparative baselines.
@@ -943,6 +950,7 @@ check for the slab engine; use `make bench` for comparative baselines.
 ```bash
 make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'
 make profile BENCH_ARGS='--scenario=lifo --backend=pool --iters=2000000'
+make profile BENCH_ARGS='--scenario=lifo --backend=pool --align=32 --iters=2000000'
 # Full interactive report / GUI:
 #   perf report -i obj/profile/perf.data
 #   hotspot obj/profile/perf.data

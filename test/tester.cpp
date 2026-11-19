@@ -240,7 +240,7 @@ TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
     // Why: empty buffers are retained by default (monotonic growth); reclaim
     // must drop extras while keeping ≥ keep_min. Capacity is selectBufferSize
     // based so “fill one buffer + 1” still forces a second buffer after packing.
-    Slab<16, 16> slab;
+    Slab<16, 16> slab(/*preallocate_first_block=*/true);
     constexpr std::size_t kSlotsPerSlab = selectBufferSize<16>() / 16;
     EXPECT_EQ(slab.getSlabCount(), 1u);
     const std::size_t baseline = slab.getAllocatedMemory();
@@ -615,7 +615,7 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
     // a second live slab so we also check the map grows with live count only.
     constexpr std::size_t kLegacyFixedBytes = 128_KB;
 
-    Slab<16, 16> slab;
+    Slab<16, 16> slab(/*preallocate_first_block=*/true);
     EXPECT_EQ(slab.getSlabCount(), 1u);
     EXPECT_GT(slab.getAvailabilityMapBytes(), 0u);
     EXPECT_LT(slab.getAvailabilityMapBytes(), kLegacyFixedBytes);
@@ -683,8 +683,9 @@ TEST(SlabTest, CreateSlabs)
     // Smoke: getAllocSize/getAllocatedMemory match selectBufferSize for a
     // cross-section of classes, including multiplier-floored large sizes and
     // an odd ElemSize that is not a KiB multiple (KB-multiple assert removed).
+    // Pass preallocate_first_block=true so cold engines report one data block.
     {
-        Slab<64> slab;
+        Slab<64> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 64u);
         EXPECT_EQ(slab.getAllocSize(), selectBufferSize<64>());
         EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<64>());
@@ -692,14 +693,14 @@ TEST(SlabTest, CreateSlabs)
     }
 
     {
-        Slab<128> slab;
+        Slab<128> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 128u);
         EXPECT_EQ(slab.getAllocSize(), selectBufferSize<128>());
         EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<128>());
     }
 
     {
-        Slab<1_KB> slab;
+        Slab<1_KB> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 1_KB);
         EXPECT_EQ(slab.getAllocSize(), selectBufferSize<1_KB>());
         EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<1_KB>());
@@ -707,7 +708,7 @@ TEST(SlabTest, CreateSlabs)
     }
 
     {
-        Slab<2_KB> slab;
+        Slab<2_KB> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 2_KB);
         EXPECT_EQ(slab.getAllocSize(), selectBufferSize<2_KB>());
         EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<2_KB>());
@@ -715,7 +716,7 @@ TEST(SlabTest, CreateSlabs)
     }
 
     {
-        Slab<16_KB> slab;
+        Slab<16_KB> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 16_KB);
         EXPECT_EQ(slab.getAllocSize(), selectBufferSize<16_KB>());
         EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<16_KB>());
@@ -723,7 +724,7 @@ TEST(SlabTest, CreateSlabs)
     }
 
     {
-        Slab<12336> slab;
+        Slab<12336> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 12336u);
         EXPECT_EQ(slab.getAllocSize(), selectBufferSize<12336>());
         EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<12336>());
@@ -733,12 +734,65 @@ TEST(SlabTest, CreateSlabs)
 }
 
 
+TEST(SlabTest, ZeroBlockEngineGrowsOnFirstAlloc)
+{
+    // Why: Pool leaves large / high-align engines empty until first use.
+    // allocateItem must create the first data block without a prior warm map.
+    Slab<512, 16> slab(/*preallocate_first_block=*/false);
+    EXPECT_EQ(slab.getSlabCount(), 0u);
+    EXPECT_EQ(slab.getAllocatedMemory(), 0u);
+
+    auto* p = slab.allocateItem(512);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<512>());
+
+    slab.deallocateItem(p);
+    EXPECT_EQ(slab.getSlabCount(), 1u); // monotonic until reclaim
+    EXPECT_EQ(slab.reclaimEmptySlabs(/*keep_min=*/1), 0u);
+    EXPECT_EQ(slab.getSlabCount(), 1u);
+}
+
+
+TEST(PoolTest, ColdRetainedMatchesPreallocatePolicy)
+{
+    // Why: default policy warms axis-16 classes with ElemSize <= 256 only;
+    // larger axis-16 rungs and all 32/64 engines start with zero data blocks.
+    // Guarding the knobs documents the contract for -D overrides.
+    EXPECT_TRUE(shouldPreallocateFirstBlock(256, 16));
+    EXPECT_FALSE(shouldPreallocateFirstBlock(384, 16));
+    EXPECT_FALSE(shouldPreallocateFirstBlock(32, 32));
+    EXPECT_FALSE(shouldPreallocateFirstBlock(64, 64));
+    EXPECT_EQ(kPreallocateMaxElemSize, 256u);
+    EXPECT_EQ(kPreallocateMaxAlignment, 16u);
+
+    constexpr std::size_t expected =
+        selectBufferSize<16>() + selectBufferSize<32>() + selectBufferSize<48>() +
+        selectBufferSize<64>() + selectBufferSize<96>() + selectBufferSize<128>() +
+        selectBufferSize<192>() + selectBufferSize<256>();
+
+    Pool pool;
+    EXPECT_EQ(pool.getAllocatedMemory(), expected);
+
+    // Touch a cold large axis-16 class and a high-align class; both grow on demand.
+    auto* large = pool.allocate(400); // footprint 408 → 512B axis 16
+    ASSERT_NE(large, nullptr);
+    EXPECT_GT(pool.getAllocatedMemory(), expected);
+    pool.deallocate(large);
+
+    auto* hi = pool.allocate(16, 32);
+    ASSERT_NE(hi, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(hi) % 32, 0u);
+    pool.deallocate(hi);
+}
+
+
 TEST(SlabTest, AllocateItems)
 {
     // Why: growth must happen only after a buffer is full, and retained empty
     // buffers stay mapped until trim/reclaim (monotonic). Drive fills from
     // selectBufferSize so expectations track packing knobs.
-    Slab<128> slab;
+    Slab<128> slab(/*preallocate_first_block=*/true);
 
     constexpr std::size_t kBuf = selectBufferSize<128>();
     constexpr std::size_t kSlots = kBuf / 128;
@@ -1395,7 +1449,8 @@ TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
         pool.deallocate(p);
     }
 
-    // Re-allocate into the same axis-64 size class (lazy slab already live).
+    // Re-allocate into the same axis-64 size class (engine was eager; block may
+    // have been created on the first round).
     for (int i = 0; i < 32; ++i)
     {
         auto* p = pool.allocate(64, 64);

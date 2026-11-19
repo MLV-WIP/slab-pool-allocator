@@ -159,13 +159,16 @@ namespace spallocator
         std::size_t getAvailabilityMapBytes() const { return slab_available_map.bytes(); }
         std::size_t getSlabCount() const { return slab_data.size(); }
 
-        // Delete fully empty slab buffers; always retain at least keep_min
-        // slabs (clamped to ≥ 1). Not called from the alloc/free hot path.
+        // Delete fully empty data blocks; always retain at least keep_min
+        // blocks (clamped to ≥ 1). Not called from the alloc/free hot path.
         std::size_t reclaimEmptySlabs(std::size_t keep_min = 1) override;
 
         std::optional<std::size_t> findSlabForItem(std::byte* item) const;
 
-        Slab();
+        // preallocate_first_block: map one data block at construction (warm
+        // start). false leaves the engine empty until the first allocateItem
+        // (Pool uses this for large / high-align classes — see pool.hpp).
+        explicit Slab(bool preallocate_first_block = false);
         ~Slab() override;
 
     private: // methods
@@ -613,12 +616,17 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    Slab<ElemSize, Alignment>::Slab()
+    Slab<ElemSize, Alignment>::Slab(bool preallocate_first_block)
     {
-        debug_println("Slab created with element size: {}, alignment: {}, allocation size: {}",
-                      getElemSize(), getAlignment(), getAllocSize());
+        debug_println(
+            "Slab created with element size: {}, alignment: {}, allocation size: {}, "
+            "preallocate_first_block={}",
+            getElemSize(), getAlignment(), getAllocSize(), preallocate_first_block);
 
-        allocateNewSlab();
+        if (preallocate_first_block)
+        {
+            allocateNewSlab();
+        }
     }
 
     template<std::size_t ElemSize, std::size_t Alignment>
