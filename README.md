@@ -242,6 +242,8 @@ Recorded for later (not scheduled). See also
 
 - Consider dropping fixed size-class slots in favor of shaping buffers to
   `(element size + header) × N` (or similar multiples)
+- Dedicated bump / size-based arena facility — **deferred** (use arena `~Pool`
+  for bulk reclaim today; see IMPLEMENTATION backlog for revival shape)
 - Consider a C99-compliant wrapper API for callers that want the pool interface
   from C (opaque handle ≈ `PoolHandle`)
 - Abstract the lock primitive so a build can choose `SpinLock` or another

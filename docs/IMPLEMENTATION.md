@@ -1039,7 +1039,7 @@ Also tracked on the
 |------|--------|
 | Non–fixed-class buffer shaping | Drop ladders entirely; buffers already exact-pack within classes (`kSlabTargetBytes` / multiplier) |
 | Pool lifetime vs smart pointers | **Done** — ControlBlock / Handle / BlockToken; orderly + arena + heap retire |
-| Bump / size-based arena facility | Sequential allocate, no individual reuse, bulk reclaim - distinct from recycling `Pool` (see [CONCEPTS - Choosing a memory strategy](CONCEPTS.md#choosing-a-memory-strategy)) |
+| Bump / size-based arena facility | **Deferred** — true bump (cursor, empty individual free) does not map onto slab recycling; do not ship as a Pool façade or dual-mode `Slab`. Closest shipped path: arena `~Pool` bulk reclaim. If revived: peer domain to `Pool`, private chunk list or extracted buffer-ownership substrate (not freemap/headers). Unlock when allocate-forward / free-never needs exceed what arena `~Pool` covers. See [CONCEPTS - Choosing a memory strategy](CONCEPTS.md#choosing-a-memory-strategy). |
 | PMR `memory_resource` adapter | **Done** — `PoolMemoryResource` in `pool_pmr.hpp` (additive; virtual cost); keep `PoolAllocator` as the primary / non-virtual STL path |
 | Baseline ratio benches | **Shipped** — `make bench` (`bench/bench_allocators.cpp`); re-check after toolchain upgrades |
 | C99 wrapper | Opaque pool handle API for C callers |

@@ -686,7 +686,7 @@ that meets the workload; re-check after compiler or standard-library upgrades.
 | General-purpose alloc/free; no special lifetime story | `new` / `delete`, `std::allocator`, containers as usual | Highly tuned; zero maintenance in *your* code |
 | STL containers with a shared runtime resource; stack buffers; easy composition | `std::pmr` (`monotonic_buffer_resource`, `synchronized_pool_resource` / `unsynchronized_pool_resource`, custom `memory_resource`) | Value-based allocators; virtual dispatch is usually cheap vs allocation itself |
 | Concurrent service churn across many sizes; shardable domains; RAII / STL on a pool; optional arena bulk reclaim | **`spallocator::Pool`** (this library) | Size-class recycling slabs + large fallback + smart pointers / `PoolAllocator` |
-| Bounded phase (request / scene / level); allocate forward; almost no individual free; reclaim everything at end | Bump / size-based arena (not shipped here yet; see backlog) | Fastest shape when reuse is unnecessary - sequential allocate, bulk free |
+| Bounded phase (request / scene / level); allocate forward; almost no individual free; reclaim everything at end | **Arena `~Pool`** (shipped bulk reclaim); dedicated bump facility **deferred** | Bump placement (cursor, no reuse) is not slab recycling - they only share buffer-growth / domain-destroy. Use orderly teardown when `~T()` must run; see backlog if a true bump peer is revived |
 
 If profiling cannot show a win over the standard library (or over `std::pmr`
 pool resources) for your sizes and thread model, stay with the standard tools.
@@ -699,7 +699,7 @@ line up with - or deliberately differ from - this codebase:
 | Pattern (Roy) | Role | Here |
 |---------------|------|------|
 | **Chunked pool** (`ChunkSizedAllocator`-style size categories, smallest fit, overflow path) | Academic multi-size pool | Production analogue: size-class `Slab`s + `SlabProxy`, with **reuse**, growth, headers, and `trim` |
-| **Size-based bump arena** (sequential allocate, empty individual free, destroy domain to reclaim) | Scene / level / bounded N | Closest today: arena `~Pool` bulk reclaim. A dedicated bump facility remains design backlog - this `Pool` still classifies and recycles on the hot path |
+| **Size-based bump arena** (sequential allocate, empty individual free, destroy domain to reclaim) | Scene / level / bounded N | Closest shipped: arena `~Pool` bulk reclaim. Dedicated bump **deferred** (peer domain later, not a Pool façade / dual-mode `Slab`) - this `Pool` still classifies and recycles on the hot path |
 | **Deferred reclamation** | Finalize and/or reclaim a group at a chosen moment | Arena path: skip per-object finalization in `PoolDeleter` when `!alive`, reclaim storage with the pool. Prefer orderly teardown when `~T()` must run |
 | **Traditional (type-based) allocator** | Compile-time allocator in the container type | `PoolAllocator<T>` (POCCA/POCMA/POCS false; equality by control block) |
 | **PMR (`memory_resource`)** | Runtime resource pointer; easy to compose | `PoolMemoryResource` in `pool_pmr.hpp` (additive include). Prefer `PoolAllocator<T>` when the type can bake the allocator in (no virtual dispatch) |
