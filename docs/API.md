@@ -4,8 +4,10 @@ Public surface of the library: what each type and function does, parameters,
 return values, failure modes, thread-safety, and usage examples.
 
 Architecture and trade-offs live in [IMPLEMENTATION.md](IMPLEMENTATION.md).
-Conceptual / learning material lives in [CONCEPTS.md](CONCEPTS.md). Build
-instructions stay in the [root README](../README.md).
+Conceptual / learning material lives in [CONCEPTS.md](CONCEPTS.md). Locked
+vocabulary (Pool → Slab → **Block** → Slot) lives in
+[terminology-glossary.md](terminology-glossary.md). Build instructions stay in
+the [root README](../README.md).
 
 Unless noted, types are in namespace `spallocator`. General locking and
 liveness utilities live in the [mlvlib](https://github.com/MLV-WIP/mlvlib)
@@ -70,9 +72,10 @@ convenience and defines allocator-only size caps.
   mlvlib::SpinLock / helpers       (submodule; SpinLock used by Pool/Slab)
 ```
 
-`Pool` and `Slab` are separate concepts: the pool is the disposable / isolatable
-allocation domain you construct and pass around; each slab is a fixed-size slot
-recycler the pool routes into. See [CONCEPTS.md](CONCEPTS.md) for the distinction.
+`Pool` and `Slab` are separate concepts: the Pool is the disposable / isolatable
+allocation domain you construct and pass around; each Slab is a size-class
+engine (Slots in zero or more **Blocks**) the Pool routes into. See
+[CONCEPTS.md](CONCEPTS.md) and [terminology-glossary.md](terminology-glossary.md).
 
 Typical includes for pool allocation plus factories:
 
@@ -163,7 +166,7 @@ PoolControlBlock* control() const noexcept;  // diagnostics
 
 | | |
 |--|--|
-| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); all axis engines installed; first data blocks follow preallocate knobs (default: axis ≤16 and ElemSize ≤256). |
+| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); all axis Slabs installed; first **Blocks** follow preallocate knobs (default: axis ≤16 and ElemSize ≤256). |
 | **`~Pool`** | Marks the control block dead, then destroys slabs. Safe with outstanding `PoolBlockToken`s (arena observers). |
 | **Thread safety** | Construct/destroy from one thread; do not use the pool concurrently with its destructor. |
 | **Copy / move** | Deleted. |
@@ -380,7 +383,7 @@ Prefer `try_deallocate` from `noexcept` contexts (`PoolDeleter`,
 `PoolAllocator::deallocate`). Prefer throwing `deallocate` when the caller can
 handle errors as exceptions.
 
-Freeing a slot does **not** necessarily return slab buffers to the OS; see
+Freeing a Slot does **not** necessarily return Slab **Blocks** to the OS; see
 [`trim`](#trim).
 
 ```cpp
@@ -396,24 +399,25 @@ if (!pool.try_deallocate(q)) {
 std::size_t trim(std::size_t keep_min = 1);
 ```
 
-Reclaims **fully empty** size-class slab buffers so peak RSS can drop after a
-burst. Default growth is monotonic: ordinary free reuses slots but keeps empty
-buffers mapped.
+Reclaims **fully empty** size-class **Blocks** so peak RSS can drop after a
+burst. Default growth is monotonic: ordinary free reuses Slots but keeps empty
+Blocks mapped. (Under the hood each Slab’s transitional `reclaimEmptySlabs`
+counts/deletes Blocks.)
 
 | Parameter | Description |
 |-----------|-------------|
-| `keep_min` | Minimum number of slab buffers to retain **per size class** after reclaim. Clamped to at least `1` so the next allocation in that class stays warm. |
+| `keep_min` | Minimum number of **Blocks** to retain **per size class** after reclaim. Clamped to at least `1` so the next allocation in that class stays warm. |
 
 | | |
 |--|--|
-| **Returns** | Number of slab buffers deleted across size classes. |
+| **Returns** | Number of **Blocks** deleted across size classes. |
 | **Throws** | Does not throw under normal operation. |
 | **Thread safety** | Safe. |
-| **Note** | Does not affect in-flight allocations. `SlabProxy` large blocks are already returned on each free. |
+| **Note** | Does not affect in-flight allocations. `SlabProxy` large allocations are already returned on each free. |
 
 ```cpp
 // After a spike of short-lived allocations:
-pool.trim();      // keep ≥1 buffer per class
+pool.trim();      // keep ≥1 Block per class
 pool.trim(2);     // keep a slightly larger warm set
 ```
 
@@ -425,16 +429,16 @@ std::size_t getAllocatedMemory();
 
 | | |
 |--|--|
-| **Returns** | Sum of bytes in **retained size-class slab buffers** currently held by the pool (not a live “bytes in use by clients” counter, and not counting transient `SlabProxy` blocks). |
+| **Returns** | Sum of bytes in **retained size-class Blocks** currently held by the pool (not a live “bytes in use by clients” counter, and not counting transient `SlabProxy` allocations). |
 | **Thread safety** | Safe. |
-| **Use** | Approximate RSS contribution of pooled slabs; pair with `trim` when investigating retention. |
+| **Use** | Approximate RSS contribution of pooled Slabs; pair with `trim` when investigating retention. |
 
 ### `stats` / `PoolStats`
 
 ```cpp
 struct PoolStats {
     std::uint64_t live_allocations;     // outstanding successful allocs
-    std::uint64_t retained_slab_bytes;  // size-class buffers held (same basis as getAllocatedMemory)
+    std::uint64_t retained_slab_bytes;  // size-class Block bytes held (same basis as getAllocatedMemory; rename backlog)
     std::uint64_t alloc_ok;
     std::uint64_t alloc_fail;           // size/align/cap/slab failures
     std::uint64_t free_ok;              // successful non-null frees
@@ -449,7 +453,7 @@ PoolStats stats();
 | | |
 |--|--|
 | **Returns** | Best-effort snapshot of counters and high-water marks (HWMs). Not a single transactional freeze under concurrency. |
-| **`live_*` vs `retained_*`** | Live = outstanding client allocations. Retained = bytes in size-class slab buffers still mapped (may stay high after free until `trim`). |
+| **`live_*` vs `retained_*`** | Live = outstanding client allocations. Retained = bytes in size-class **Blocks** still mapped (may stay high after free until `trim`). |
 | **`live_hwm`** | Best-effort peak live count: cheap relaxed max on each successful allocate, and refreshed in `stats()`. |
 | **`retained_hwm`** | Advanced when `stats()` or `trim()` observes a higher retained total (not on every allocate). |
 | **`alloc_ok` / `free_ok` / `*_fail`** | Hot-path tallies; **off by default** (`SPALLOCATOR_POOL_COUNTERS=0`) so allocate/free avoid extra atomic RMWs. Enable with `-DSPALLOCATOR_POOL_COUNTERS=1` or `./configure --enable-pool-counters`. When disabled, these fields read as 0. `kPoolCountersEnabled` reports the build setting. |
@@ -490,20 +494,21 @@ want to assert which class a footprint would hit.
 
 **Header:** `spallocator/slab.hpp`
 
-A **slab** is a fixed-size slot recycler: buffers carved into equal cells, with
+A **Slab** is a size-class engine: **Blocks** carved into equal **Slots**, with
 bitmaps (and related maps) tracking free vs in-use. That is a storage strategy,
-not a lifetime domain — the **pool** owns which slabs exist and when they go
+not a lifetime domain — the **Pool** owns which Slabs exist and when they go
 away. `SlabProxy` implements the same backend interface for oversized requests
-via system `new[]` / `delete[]` (no slot recycling).
+via system `new[]` / `delete[]` (no Block/Slot recycling).
 
 Application code usually stays on `Pool` and the smart-pointer helpers. Use slab
 types directly only when embedding a single size class or extending the
 allocator. Conceptual background:
-[CONCEPTS.md — Slab](CONCEPTS.md#what-is-a-slab-and-why-use-one).
+[CONCEPTS.md — Slab](CONCEPTS.md#what-is-a-slab-and-why-use-one);
+[terminology-glossary.md](terminology-glossary.md).
 
 ### `AbstractSlab`
 
-Polymorphic interface shared by size-class slabs and the large-allocation proxy.
+Polymorphic interface shared by size-class Slabs and the large-allocation proxy.
 
 ```cpp
 class AbstractSlab {
@@ -518,10 +523,10 @@ public:
 
 | Method | Description |
 |--------|-------------|
-| `allocateItem(size)` | Allocate a block of at least `size` bytes from this slab backend. For `Slab`, `size` must fit the template slot size. Returns a **slot base** pointer (Pool then advances past its header). |
-| `deallocateItem(item)` | Free a pointer previously returned by `allocateItem`. Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
-| `reclaimEmptySlabs(keep_min)` | Drop fully empty buffers; keep at least `keep_min` (default 1). Default base implementation is a no-op; `Slab` overrides. Returns how many buffers were deleted. |
-| `getAllocatedMemory()` | Bytes retained by this slab object’s buffers (default `0`). |
+| `allocateItem(size)` | Allocate at least `size` bytes from this backend. For `Slab`, `size` must fit the template Slot size. Returns a **slot base** (exact cell start inside a Block) — *not* the user pointer; the Pool writes its header at the base and returns `base + header_size` to the caller. |
+| `deallocateItem(item)` | Free a **slot base** previously returned by `allocateItem` (not a user pointer). Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
+| `reclaimEmptySlabs(keep_min)` | Drop fully empty **Blocks**; keep at least `keep_min` (default 1). Name is transitional until `reclaimEmptyBlocks`. Default base implementation is a no-op; `Slab` overrides. Returns how many Blocks were deleted. |
+| `getAllocatedMemory()` | Bytes retained by this Slab’s **Blocks** (default `0`). |
 
 Copy/move of `AbstractSlab` are deleted.
 
@@ -532,22 +537,22 @@ template<std::size_t ElemSize, std::size_t Alignment = 16>
 class Slab : public AbstractSlab;
 ```
 
-Fixed-size slot allocator: each slot is `ElemSize` bytes and `Alignment`-aligned
+Fixed-size Slot allocator: each Slot is `ElemSize` bytes and `Alignment`-aligned
 (`Alignment` must be 16, 32, or 64; `ElemSize` must be a multiple of
 `Alignment`). Maintains freemap bitsets, a growable availability map, and a
-base-address map for frees.
+base-address map for frees. Owns zero or more **Blocks**.
 
 | Method | Description |
 |--------|-------------|
-| `allocateItem` / `deallocateItem` | See `AbstractSlab`; guarded by the slab’s `SpinLock`. |
-| `getElemSize()` / `getAlignment()` / `getAllocSize()` | Compile-time slot size, alignment, and buffer bytes (`selectBufferSize`: exact multiple of `ElemSize`; see `kSlabTargetBytes` / `kSlabTargetMultiplier`). |
-| `getAllocatedMemory()` | `slab_count × buffer_size` currently retained. |
+| `allocateItem` / `deallocateItem` | See `AbstractSlab`; guarded by the Slab’s `SpinLock`. Slot base in / out — Pool owns the user-pointer offset. |
+| `getElemSize()` / `getAlignment()` / `getAllocSize()` | Compile-time Slot size, alignment, and **Block** bytes (`selectBufferSize`: transitional name; exact multiple of `ElemSize`; see `kSlabTargetBytes` / `kSlabTargetMultiplier`). |
+| `getAllocatedMemory()` | `block_count × block_size` currently retained (implemented as `getSlabCount() × getAllocSize()` today). |
 | `getAvailabilityMapBytes()` | Bytes used by the growable availability bitset (diagnostics). |
-| `getSlabCount()` | Number of buffers currently held. |
-| `reclaimEmptySlabs(keep_min)` | Deletes empty buffers (swap-with-last), retaining ≥ `keep_min`. |
-| `findSlabForItem(item)` | Optional index of the buffer owning `item`, if it is an exact slot base in this slab. |
+| `getSlabCount()` | Number of **Blocks** currently held (transitional name until `getBlockCount`). |
+| `reclaimEmptySlabs(keep_min)` | Deletes empty **Blocks** (swap-with-last), retaining ≥ `keep_min` (transitional name until `reclaimEmptyBlocks`). |
+| `findSlabForItem(item)` | Optional index of the **Block** owning `item`, if it is an exact **slot base** in this Slab (transitional name until `findBlockForSlot` / similar). |
 
-Empty buffers remain mapped after free until reclaim/`Pool::trim` — intentional
+Empty Blocks remain mapped after free until reclaim/`Pool::trim` — intentional
 monotonic growth for alloc/free latency.
 
 ### `SlabProxy`
@@ -558,12 +563,12 @@ class SlabProxy : public AbstractSlab;
 
 Large / overflow path: each `allocateItem` is a distinct aligned `new[]`;
 `deallocateItem` always `delete[]`s that pointer. No freemap, no retention
-across frees. Pool still attaches its usual allocation header on the returned
-user pointer.
+across frees. Returns a **slot base** equivalent (allocation base); the Pool
+still attaches its usual allocation header and returns the **user pointer**.
 
 ### `DynBitset`
 
-Growable bitset used internally for “does this buffer still have free slots?”
+Growable bitset used internally for “does this Block still have free Slots?”
 metadata. Not part of the stable application-facing API; listed so readers of
 `slab.hpp` know what it is. Prefer `Pool` / `Slab` accessors for diagnostics.
 

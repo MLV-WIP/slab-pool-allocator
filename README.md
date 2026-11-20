@@ -6,13 +6,15 @@ A C++ memory **pool** backed by **slab** size-class storage — for production s
 
 A memory **pool** (disposable / isolatable allocation domain) backed by **slabs** (fixed-size slot recyclers). Pool and slab are separate ideas — the pool owns lifetime and routing; slabs implement size-class storage.
 
+**Terminology:** Pool → Slab (size-class engine) → **Block** (mapped chunk) → Slot. See [docs/terminology-glossary.md](docs/terminology-glossary.md) and [docs/CONCEPTS.md](docs/CONCEPTS.md#terminology).
+
 **Readiness:** The pool, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. Pool lifetime vs clients is defined: orderly RAII (pointers first), optional arena bulk reclaim (`unique_pool_ptr` no-ops when the pool is already dead), and `PoolHandle::create()` for heap domains that retire when idle. Short critical sections use `mlvlib::SpinLock` (from the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule). Known follow-ons (per-class metrics, freelist) are listed under Future Work.
 
 **Directory map:**
 ```
 spallocator/          # header-only allocator library
 mlvlib/               # git submodule — general utils (SpinLock, LifetimeObserver, helpers)
-docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md
+docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md, terminology-glossary.md
 test/                 # Google Test suite (tester.cpp)
 demos/                # example programs
 bench/                # on-demand allocator comparison (`make bench`)
@@ -190,7 +192,7 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 | Operation | Complexity | Notes |
 |-----------|------------|-------|
 | Allocation | O(1) amortized | Two-level bitmap optimization |
-| Deallocation | O(log n) | Address map lookup (n = slabs) |
+| Deallocation | O(log n) | Address map lookup (n = Blocks in that Slab) |
 | SpinLock lock/unlock | O(1) | No contention case |
 
 **Space Overhead**: Default header is 8 bytes (`header_size = max(8, alignment)`), so ~6% for a 128-byte user request before bitset amortization. Details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#memory-layout).
@@ -210,6 +212,7 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 | **[docs/API.md](docs/API.md)** | Public API reference: contracts, thread-safety, short usage snippets (including helpers) |
 | **[docs/CONCEPTS.md](docs/CONCEPTS.md)** | Conceptual / learning-oriented guide (pools, slabs, lifetime patterns, teaching path) |
 | **[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** | Architecture, design trade-offs, and production readiness |
+| **[docs/terminology-glossary.md](docs/terminology-glossary.md)** | Locked Pool / Slab / Block / Slot vocabulary (Phase 1+) |
 | **[SpinLock Analysis](mlvlib/docs/deepdive/SpinLock_Analysis.md)** | SpinLock correctness and performance deep dive (linked from IMPLEMENTATION) |
 
 The repo-root [`IMPLEMENTATION.md`](IMPLEMENTATION.md) redirects here. Source headers also carry design comments.
