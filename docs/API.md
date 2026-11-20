@@ -40,6 +40,7 @@ convenience and defines allocator-only size caps.
   - [`make_pool_unique`](#make_pool_unique)
   - [`make_pool_shared`](#make_pool_shared)
 - [PoolAllocator](#poolallocator)
+- [PoolMemoryResource](#poolmemoryresource)
 - [Helpers & mlvlib](#helpers--mlvlib)
 - [Contracts cheat-sheet](#contracts-cheat-sheet)
 
@@ -53,6 +54,7 @@ convenience and defines allocator-only size caps.
 | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolBlockToken`, `PoolControlBlock` |
 | `spallocator/slab.hpp` | `AbstractSlab`, `Slab`, `SlabProxy`, `DynBitset` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
+| `spallocator/pool_pmr.hpp` | `PoolMemoryResource` (`std::pmr::memory_resource`; additive — not pulled by `spallocator.hpp`) |
 | `spallocator/helper.hpp` | Pool size caps; re-exports mlvlib helpers into `spallocator` |
 | `mlvlib/spinlock.hpp` | `mlvlib::SpinLock` (submodule; used by Pool/Slab) |
 | `mlvlib/lifetimeobserver.hpp` | `mlvlib::LifetimeObserver` (submodule; optional) |
@@ -64,7 +66,7 @@ convenience and defines allocator-only size caps.
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                    ▼
      Slab<…> (fixed-size slots)          SlabProxy (large new[])
-  Smart pointers / PoolAllocator ──► PoolBlockToken / PoolHandle
+  Smart pointers / PoolAllocator / PoolMemoryResource ──► PoolBlockToken / PoolHandle
   mlvlib::SpinLock / helpers       (submodule; SpinLock used by Pool/Slab)
 ```
 
@@ -132,8 +134,8 @@ Why pools exist as a concept: [CONCEPTS.md — Pool](CONCEPTS.md#what-is-a-pool-
 
 ```
 Axis 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Axis 32 (lazy):  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Axis 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Axis 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+Axis 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 ```
 
 If the footprint exceeds the maximum class on that axis, the pool uses
@@ -161,7 +163,7 @@ PoolControlBlock* control() const noexcept;  // diagnostics
 
 | | |
 |--|--|
-| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); axis-16 slabs prepared; axis 32/64 lazy. |
+| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); all axis engines installed; first data blocks follow preallocate knobs (default: axis ≤16 and ElemSize ≤256). |
 | **`~Pool`** | Marks the control block dead, then destroys slabs. Safe with outstanding `PoolBlockToken`s (arena observers). |
 | **Thread safety** | Construct/destroy from one thread; do not use the pool concurrently with its destructor. |
 | **Copy / move** | Deleted. |
@@ -349,7 +351,7 @@ a pointer to that payload (past the hidden header).
 
 ```cpp
 std::byte* p = pool.allocate(100);        // align 8 → typically 8-byte header
-std::byte* q = pool.allocate(64, 64);     // axis-64 lazy size class
+std::byte* q = pool.allocate(64, 64);     // axis-64 size class
 ```
 
 ### `deallocate` / `try_deallocate`
@@ -448,8 +450,10 @@ PoolStats stats();
 |--|--|
 | **Returns** | Best-effort snapshot of counters and high-water marks (HWMs). Not a single transactional freeze under concurrency. |
 | **`live_*` vs `retained_*`** | Live = outstanding client allocations. Retained = bytes in size-class slab buffers still mapped (may stay high after free until `trim`). |
+| **`live_hwm`** | Best-effort peak live count: cheap relaxed max on each successful allocate, and refreshed in `stats()`. |
 | **`retained_hwm`** | Advanced when `stats()` or `trim()` observes a higher retained total (not on every allocate). |
-| **Thread safety** | Safe; counters use relaxed atomics. |
+| **`alloc_ok` / `free_ok` / `*_fail`** | Hot-path tallies; **off by default** (`SPALLOCATOR_POOL_COUNTERS=0`) so allocate/free avoid extra atomic RMWs. Enable with `-DSPALLOCATOR_POOL_COUNTERS=1` or `./configure --enable-pool-counters`. When disabled, these fields read as 0. `kPoolCountersEnabled` reports the build setting. |
+| **Thread safety** | Safe; enabled counters use relaxed atomics. |
 
 ```cpp
 auto s = pool.stats();
@@ -740,6 +744,52 @@ v.push_back(42);
 
 ---
 
+## PoolMemoryResource
+
+**Header:** `spallocator/pool_pmr.hpp` (include explicitly; not part of
+`spallocator.hpp`, so non-PMR clients avoid `<memory_resource>`).
+
+`std::pmr::memory_resource` backed by a pool domain. Prefer
+`PoolAllocator<T>` when the container type can bake the allocator in (no
+virtual dispatch). Use this for polymorphic `std::pmr` containers and runtime
+composition (for example a tracing decorator over the resource).
+
+Same arena model as `PoolAllocator`: holds a `PoolBlockToken`; allocate throws
+`bad_alloc` if `!alive`; deallocate no-ops if dead.
+
+```cpp
+class PoolMemoryResource : public std::pmr::memory_resource {
+public:
+    explicit PoolMemoryResource(PoolBlockToken token) noexcept;
+    explicit PoolMemoryResource(Pool& pool) noexcept;
+    explicit PoolMemoryResource(PoolHandle const& handle) noexcept;
+
+    PoolBlockToken const& token() const noexcept;
+};
+```
+
+| Surface | Behavior |
+|---------|----------|
+| Constructors | `PoolBlockToken`, `Pool&`, or `PoolHandle` (token = `block_refs` pin). |
+| `allocate(bytes, alignment)` | Alignment below `kMinAlignment` (4) is raised to 4. Non-power-of-two or `> kMaxAlignment` (64) throws `bad_alloc`. Dead pool throws `bad_alloc`. Pool contract failures (`invalid_argument` / `out_of_range`) are mapped to `bad_alloc` (PMR contract). |
+| `deallocate(p, bytes, alignment)` | `noexcept`. Null is a no-op. Bad pointers **abort** while alive; **no-op** if `!alive` (arena). `bytes` / `alignment` are unused (pool frees by header). |
+| `is_equal` | True iff `other` is a `PoolMemoryResource` on the same `PoolControlBlock*`. |
+
+```cpp
+#include <memory_resource>
+#include "spallocator/pool_pmr.hpp"
+
+spallocator::Pool pool;
+spallocator::PoolMemoryResource resource(pool);
+std::pmr::vector<int> v{&resource};
+v.push_back(42);
+```
+
+Demo: `demos/demo_pool_pmr.cpp` (also shows an in-demo tracing decorator).
+Bench token: `--backend=pool_pmr` on `make bench`.
+
+---
+
 ## Helpers & mlvlib
 
 **Allocator helper header:** `spallocator/helper.hpp`
@@ -772,12 +822,24 @@ against the submodule root.
 | `Pool::try_deallocate` | `false` | Same |
 | `Pool::trim` / `getAllocatedMemory` | — | Safe |
 | `PoolDeleter` / `PoolAllocator::deallocate` | `abort` on bad pointer if alive; no-op if dead | Pool-safe; pointer handoff is the caller’s protocol |
+| `PoolMemoryResource::allocate` | `bad_alloc` (dead / unsupported align / mapped Pool throws) | Same as Pool |
+| `PoolMemoryResource::deallocate` | `abort` on bad pointer if alive; no-op if dead | Same as PoolAllocator |
 | `PoolHandle::create` / handle drop | may `delete` heap pool when idle | Destroy/create from one thread |
 | `make_pool_unique` construction | throw; slot returned | Pool-safe |
 | `LifetimeObserver::isAlive` | — | Race-free liveness bit |
 | Object members after `isAlive` | — | Complete on one strand; cross-thread needs shared sync with destroy |
 | `SpinLock::lock` / `unlock` | — | Mutual exclusion + TSan annotations when built with TSan |
 | `runtime_assert` | abort (debug only) | N/A |
+
+**Prose contracts today:** alignment must be a power of two in
+`[kMinAlignment, kMaxAlignment]`; size caps throw; bad frees throw or abort
+on noexcept paths. These remain documentation + runtime checks.
+
+**C++26 language contracts:** intentional follow-on for `pre` / `post` /
+`contract_assert` on allocate/deallocate when the toolchain actually accepts
+contract syntax. `./configure` may already select `-std=c++26` while contract
+keywords are still unsupported — do not gate the library on them yet. See
+[IMPLEMENTATION.md — Future work](IMPLEMENTATION.md#future-work).
 
 See also: [IMPLEMENTATION.md](IMPLEMENTATION.md) for header layout and lock
 ordering; [CONCEPTS.md](CONCEPTS.md) for when to choose each tool.

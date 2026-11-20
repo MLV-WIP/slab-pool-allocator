@@ -33,6 +33,7 @@
 #ifndef SLAB_HPP_
 #define SLAB_HPP_
 
+#include <array>
 #include <bit>
 #include <bitset>
 #include <cstddef>
@@ -143,6 +144,12 @@ namespace spallocator
     };
 
 
+    // Incomplete until after Slab; C++17 vector permits this while ~Slab /
+    // method bodies are defined only once SlotFreemap is complete.
+    template<std::size_t N>
+    class SlotFreemap;
+
+
     // Compound key: every slot is Alignment-aligned because the buffer uses
     // align_val_t{Alignment} and ElemSize is a multiple of Alignment.
     template<std::size_t ElemSize, std::size_t Alignment = 16>
@@ -159,13 +166,16 @@ namespace spallocator
         std::size_t getAvailabilityMapBytes() const { return slab_available_map.bytes(); }
         std::size_t getSlabCount() const { return slab_data.size(); }
 
-        // Delete fully empty slab buffers; always retain at least keep_min
-        // slabs (clamped to ≥ 1). Not called from the alloc/free hot path.
+        // Delete fully empty data blocks; always retain at least keep_min
+        // blocks (clamped to ≥ 1). Not called from the alloc/free hot path.
         std::size_t reclaimEmptySlabs(std::size_t keep_min = 1) override;
 
         std::optional<std::size_t> findSlabForItem(std::byte* item) const;
 
-        Slab();
+        // preallocate_first_block: map one data block at construction (warm
+        // start). false leaves the engine empty until the first allocateItem
+        // (Pool uses this for large / high-align classes — see pool.hpp).
+        explicit Slab(bool preallocate_first_block = false);
         ~Slab() override;
 
     private: // methods
@@ -193,9 +203,9 @@ namespace spallocator
             "slab buffer must hold at least kSlabTargetMultiplier slots");
 
         std::vector<std::byte*> slab_data;
-        // Per-slab slot maps stay std::bitset (compile-time slot count).
-        // Convention: bit set ⇒ slot occupied; clear ⇒ free.
-        std::vector<std::bitset<slots_per_buffer>> slab_map;
+        // Per-buffer slot freemap (SlotFreemap): compile-time slot count,
+        // word array storage. Convention: bit set ⇒ occupied; clear ⇒ free.
+        std::vector<SlotFreemap<slots_per_buffer>> slab_map;
         static constexpr std::size_t max_slabs{kMaxClassBytes / slab_alloc_size};
         static_assert(max_slabs >= 1,
             "kMaxClassBytes must allow at least one buffer of this ElemSize");
@@ -234,6 +244,35 @@ namespace spallocator
         SlabProxy& operator=(SlabProxy&&) = delete;
 
     private: // data members
+    };
+
+
+    // Per-buffer slot freemap: fixed uint64_t words instead of std::bitset.
+    // Convention: set ⇒ occupied, clear ⇒ free. Direct word access avoids bitset
+    // shift + to_ullong on the find-next-clear hot path.
+    template<std::size_t N>
+    class SlotFreemap
+    {
+    public:
+        static constexpr std::size_t kBitCount = N;
+        static constexpr std::size_t kWordBits = 64;
+        static constexpr std::size_t kWordCount = (N + kWordBits - 1) / kWordBits;
+
+        constexpr std::size_t size() const noexcept { return N; }
+
+        bool test(std::size_t i) const noexcept;
+        void set(std::size_t i) noexcept;
+        void reset(std::size_t i) noexcept;
+        bool none() const noexcept;
+        bool all() const noexcept;
+
+        // Next clear bit at or after `start`. Returns N if none.
+        std::size_t find_next_clear(std::size_t start) const noexcept;
+
+        const std::array<std::uint64_t, kWordCount>& words() const noexcept;
+
+    private:
+        std::array<std::uint64_t, kWordCount> words_{};
     };
 
 
@@ -315,29 +354,120 @@ namespace spallocator
     }
 
 
+    // ---------------------------------------------------------------------------
+    // SlotFreemap
+    // ---------------------------------------------------------------------------
+
+    template<std::size_t N>
+    inline bool SlotFreemap<N>::test(std::size_t i) const noexcept
+    {
+        return (words_[i / kWordBits] >> (i % kWordBits)) & 1ull;
+    }
+
+    template<std::size_t N>
+    inline void SlotFreemap<N>::set(std::size_t i) noexcept
+    {
+        words_[i / kWordBits] |= (std::uint64_t{1} << (i % kWordBits));
+    }
+
+    template<std::size_t N>
+    inline void SlotFreemap<N>::reset(std::size_t i) noexcept
+    {
+        words_[i / kWordBits] &= ~(std::uint64_t{1} << (i % kWordBits));
+    }
+
+    template<std::size_t N>
+    inline bool SlotFreemap<N>::none() const noexcept
+    {
+        for (std::size_t w = 0; w < kWordCount; ++w)
+        {
+            if (words_[w] != 0)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    template<std::size_t N>
+    inline bool SlotFreemap<N>::all() const noexcept
+    {
+        constexpr std::size_t full_words = N / kWordBits;
+        for (std::size_t w = 0; w < full_words; ++w)
+        {
+            if (words_[w] != ~std::uint64_t{0})
+            {
+                return false;
+            }
+        }
+        if constexpr ((N % kWordBits) != 0)
+        {
+            const std::uint64_t mask =
+                (std::uint64_t{1} << (N % kWordBits)) - std::uint64_t{1};
+            if ((words_[full_words] & mask) != mask)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    template<std::size_t N>
+    inline std::size_t SlotFreemap<N>::find_next_clear(std::size_t start) const noexcept
+    {
+        if (start >= N)
+        {
+            return N;
+        }
+
+        std::size_t word = start / kWordBits;
+        std::size_t bit0 = start % kWordBits;
+        for (; word < kWordCount; ++word, bit0 = 0)
+        {
+            const std::size_t base = word * kWordBits;
+            const std::size_t bits_in_word =
+                (base + kWordBits <= N) ? kWordBits : (N - base);
+            const std::uint64_t width_mask =
+                (bits_in_word == kWordBits)
+                    ? ~std::uint64_t{0}
+                    : ((std::uint64_t{1} << bits_in_word) - std::uint64_t{1});
+            const std::uint64_t skip_mask =
+                (bit0 == 0) ? ~std::uint64_t{0} : (~std::uint64_t{0} << bit0);
+            const std::uint64_t free_word =
+                (~words_[word]) & width_mask & skip_mask;
+            if (free_word != 0)
+            {
+                return base + static_cast<std::size_t>(std::countr_zero(free_word));
+            }
+        }
+        return N;
+    }
+
+    template<std::size_t N>
+    inline const std::array<std::uint64_t, SlotFreemap<N>::kWordCount>&
+    SlotFreemap<N>::words() const noexcept
+    {
+        return words_;
+    }
+
+
     // Helper for debug output (used by Slab definitions below)
     template<std::size_t N>
-    std::string printHex(const std::bitset<N>& bits)
+    std::string printHex(const SlotFreemap<N>& bits)
     {
         std::string out;
-
-        // Process in 32-bit chunks from high to low
         for (std::size_t chunk = (N + 31) / 32; chunk-- > 0; )
         {
-            std::size_t start = chunk * 32;
-            std::size_t end = std::min(start + 32, N);
-
-            // Extract 32-bit value
-            uint32_t value = 0;
+            const std::size_t start = chunk * 32;
+            const std::size_t end = std::min(start + 32, N);
+            std::uint32_t value = 0;
             for (std::size_t i = start; i < end; ++i)
             {
-                if (bits[i])
+                if (bits.test(i))
                 {
                     value |= (1U << (i - start));
                 }
             }
-
-            // Print with separator
             if (chunk < (N + 31) / 32 - 1)
             {
                 out += " ";
@@ -348,9 +478,15 @@ namespace spallocator
     }
 
 
-    // Next clear bit (free slot) at or after `start`. Returns N if none.
-    // Word walk + std::countr_zero — same CTZ hardware as libstdc++
-    // bitset::_Find_next, without relying on that GNU extension.
+    // Next clear bit — SlotFreemap path (production freemap).
+    template<std::size_t N>
+    std::size_t find_next_clear_bit(const SlotFreemap<N>& occupied, std::size_t start)
+    {
+        return occupied.find_next_clear(start);
+    }
+
+
+    // Kept for BitsetSearchTest / algorithm parity checks.
     // Freemap convention: set ⇒ occupied, clear ⇒ free.
     template<std::size_t N>
     std::size_t find_next_clear_bit(const std::bitset<N>& occupied, std::size_t start)
@@ -362,8 +498,6 @@ namespace spallocator
 
         using word_t = unsigned long long;
         constexpr std::size_t kWordBits = std::numeric_limits<word_t>::digits; // 64
-        // Low-kWordBits (or N, if smaller) mask for to_ullong extraction.
-        // Built from an ullong ctor — bitset::set is not constexpr until C++23.
         constexpr std::size_t kMaskBits = N < kWordBits ? N : kWordBits;
         constexpr word_t kLowWordBits =
             (kMaskBits == kWordBits)
@@ -381,7 +515,6 @@ namespace spallocator
                     ? ~word_t{0}
                     : ((word_t{1} << bits_in_word) - word_t{1});
 
-            // Extract occupied bits [base, base+bits_in_word) as a machine word.
             const word_t occupied_word =
                 ((occupied >> base) & kLowWordMask).to_ullong() & width_mask;
 
@@ -441,16 +574,25 @@ namespace spallocator
                 if (slab_available_map.test(slab_index))
                 {
                     auto& slab_slots = slab_map[slab_index];
-                    // Forward from the cursor; if that misses and the cursor was
-                    // mid-buffer, wrap within this buffer before leaving it.
-                    std::size_t item_index =
-                        find_next_clear_bit(slab_slots, slot_start);
-                    if (item_index >= slab_slots.size() && slot_start > 0)
+                    // Next-fit fast path: if the cursor slot is free, take it
+                    // without a freemap word scan (common for LIFO / local churn).
+                    std::size_t item_index = slab_slots.size();
+                    if (slot_start < slab_slots.size() && !slab_slots.test(slot_start))
                     {
-                        item_index = find_next_clear_bit(slab_slots, 0);
-                        if (item_index >= slot_start)
+                        item_index = slot_start;
+                    }
+                    else
+                    {
+                        // Forward from the cursor; if that misses and the cursor
+                        // was mid-buffer, wrap within this buffer before leaving.
+                        item_index = find_next_clear_bit(slab_slots, slot_start);
+                        if (item_index >= slab_slots.size() && slot_start > 0)
                         {
-                            item_index = slab_slots.size(); // already scanned
+                            item_index = find_next_clear_bit(slab_slots, 0);
+                            if (item_index >= slot_start)
+                            {
+                                item_index = slab_slots.size(); // already scanned
+                            }
                         }
                     }
                     if (item_index < slab_slots.size())
@@ -502,6 +644,23 @@ namespace spallocator
     template<std::size_t ElemSize, std::size_t Alignment>
     std::optional<std::size_t> Slab<ElemSize, Alignment>::findSlabForItem(std::byte* item) const
     {
+        // Single-buffer fast path: skip the address map (common steady state).
+        if (slab_data.size() == 1)
+        {
+            std::byte* const slab_start = slab_data[0];
+            std::byte* const slab_end = slab_start + slab_alloc_size;
+            if (item >= slab_start && item < slab_end)
+            {
+                return 0;
+            }
+            debug_println(
+                "Item {} is not within sole slab range {} - {}; treating as unknown pointer",
+                static_cast<void*>(item),
+                static_cast<void*>(slab_start),
+                static_cast<void*>(slab_end));
+            return std::nullopt;
+        }
+
         auto it = base_address_map.upper_bound(item);
         if (it != base_address_map.begin())
         {
@@ -587,12 +746,17 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    Slab<ElemSize, Alignment>::Slab()
+    Slab<ElemSize, Alignment>::Slab(bool preallocate_first_block)
     {
-        debug_println("Slab created with element size: {}, alignment: {}, allocation size: {}",
-                      getElemSize(), getAlignment(), getAllocSize());
+        debug_println(
+            "Slab created with element size: {}, alignment: {}, allocation size: {}, "
+            "preallocate_first_block={}",
+            getElemSize(), getAlignment(), getAllocSize(), preallocate_first_block);
 
-        allocateNewSlab();
+        if (preallocate_first_block)
+        {
+            allocateNewSlab();
+        }
     }
 
     template<std::size_t ElemSize, std::size_t Alignment>

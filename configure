@@ -20,6 +20,7 @@ CXXFLAGS=""
 BUILD_TYPE="release"
 ENABLE_TESTS="yes"
 ENABLE_DEMO="yes"
+ENABLE_BENCH="yes"
 GTEST_DIR=""
 ENABLE_ASAN="auto"
 ENABLE_LSAN="auto"
@@ -30,6 +31,9 @@ ENABLE_COVERAGE="auto"
 VERBOSE="no"
 SLAB_TARGET_BYTES="8192"
 SLAB_TARGET_MULTIPLIER="16"
+PREALLOCATE_MAX_ELEM_SIZE="256"
+PREALLOCATE_MAX_ALIGNMENT="16"
+ENABLE_POOL_COUNTERS="no"           # hot-path alloc_ok/free_ok tallies
 MAX_ALLOCATION_MIB="1024"           # 1 GiB
 MAX_CLASS_MIB="4096"                # 4 GiB
 # Empty => auto-select newest of c++26/c++23/c++20. Set via --with-cxxstd=.
@@ -78,6 +82,8 @@ Optional Features:
   --disable-tests         do not build test suite
   --enable-demo           build demo programs [default: yes]
   --disable-demo          do not build demo programs
+  --enable-bench          enable on-demand allocator bench target [default: yes]
+  --disable-bench         disable make bench
   --enable-asan           enable AddressSanitizer [default: auto]
   --disable-asan          disable AddressSanitizer
   --enable-lsan           enable LeakSanitizer [default: auto]
@@ -110,6 +116,16 @@ Optional Packages:
   --with-max-class-mib=N
                           compile-time max retained per size class in MiB
                           [default: 4096]
+  --with-preallocate-max-elem-size=N
+                          Pool cold-start: map a first data block for ladder
+                          rungs with ElemSize <= N (0 disables all prealloc)
+                          [default: 256]
+  --with-preallocate-max-alignment=N
+                          Pool cold-start: also require Alignment <= N
+                          (16, 32, or 64). Raise to warm high-align axes.
+                          [default: 16]
+  --enable-pool-counters  Count alloc_ok/free_ok/*_fail on every op (slower)
+  --disable-pool-counters Leave success/fail tallies at 0 (default; faster)
 
 Examples:
   ./configure
@@ -148,6 +164,18 @@ for arg in "$@"; do
             ;;
         --disable-demo)
             ENABLE_DEMO="no"
+            ;;
+        --enable-bench)
+            ENABLE_BENCH="yes"
+            ;;
+        --disable-bench)
+            ENABLE_BENCH="no"
+            ;;
+        --enable-pool-counters)
+            ENABLE_POOL_COUNTERS="yes"
+            ;;
+        --disable-pool-counters)
+            ENABLE_POOL_COUNTERS="no"
             ;;
         --enable-asan)
             ENABLE_ASAN="yes"
@@ -209,6 +237,12 @@ for arg in "$@"; do
         --with-max-class-mib=*)
             MAX_CLASS_MIB="${arg#*=}"
             ;;
+        --with-preallocate-max-elem-size=*)
+            PREALLOCATE_MAX_ELEM_SIZE="${arg#*=}"
+            ;;
+        --with-preallocate-max-alignment=*)
+            PREALLOCATE_MAX_ALIGNMENT="${arg#*=}"
+            ;;
         *)
             print_error "Unknown option: $arg"
             usage
@@ -245,6 +279,16 @@ fi
 # 1 MiB already exceeds helper.hpp floors (4096+64 / 16*4096).
 if [ "$MAX_CLASS_MIB" -lt "$MAX_ALLOCATION_MIB" ]; then
     print_error "--with-max-class-mib ($MAX_CLASS_MIB) must be >= --with-max-allocation-mib ($MAX_ALLOCATION_MIB)"
+    exit 1
+fi
+if ! [[ "$PREALLOCATE_MAX_ELEM_SIZE" =~ ^[0-9]+$ ]]; then
+    print_error "--with-preallocate-max-elem-size must be a non-negative integer (got: $PREALLOCATE_MAX_ELEM_SIZE)"
+    exit 1
+fi
+if [ "$PREALLOCATE_MAX_ALIGNMENT" != "16" ] && \
+   [ "$PREALLOCATE_MAX_ALIGNMENT" != "32" ] && \
+   [ "$PREALLOCATE_MAX_ALIGNMENT" != "64" ]; then
+    print_error "--with-preallocate-max-alignment must be 16, 32, or 64 (got: $PREALLOCATE_MAX_ALIGNMENT)"
     exit 1
 fi
 MAX_ALLOCATION_BYTES=$((MAX_ALLOCATION_MIB * 1024 * 1024))
@@ -672,6 +716,7 @@ if [ "$ENABLE_TESTS" = "yes" ]; then
 echo "  Google Test:          $DETECTED_GTEST"
 fi
 echo "  Build demo:           $ENABLE_DEMO"
+echo "  Bench target:         $ENABLE_BENCH"
 echo "  AddressSanitizer:     $ENABLE_ASAN"
 echo "  LeakSanitizer:        $ENABLE_LSAN"
 echo "  MemorySanitizer:      $ENABLE_MSAN"
@@ -680,6 +725,9 @@ echo "  ThreadSanitizer:      $ENABLE_TSAN"
 echo "  Code coverage:        $ENABLE_COVERAGE"
 echo "  Slab target bytes:    $SLAB_TARGET_BYTES"
 echo "  Slab target mult:     $SLAB_TARGET_MULTIPLIER"
+echo "  Prealloc max elem:    $PREALLOCATE_MAX_ELEM_SIZE"
+echo "  Prealloc max align:   $PREALLOCATE_MAX_ALIGNMENT"
+echo "  Pool counters:        $ENABLE_POOL_COUNTERS"
 echo "  Max allocation MiB:   $MAX_ALLOCATION_MIB ($MAX_ALLOCATION_BYTES bytes)"
 echo "  Max class MiB:        $MAX_CLASS_MIB ($MAX_CLASS_BYTES bytes)"
 echo ""
@@ -688,7 +736,12 @@ echo ""
 print_info "Generating config.mk..."
 
 # Append size knobs as -D so headers' #ifndef defaults are overridden.
-SIZE_CXXFLAGS="-DSPALLOCATOR_SLAB_TARGET_BYTES=$SLAB_TARGET_BYTES -DSPALLOCATOR_SLAB_TARGET_MULTIPLIER=$SLAB_TARGET_MULTIPLIER -DSPALLOCATOR_MAX_ALLOCATION_BYTES=$MAX_ALLOCATION_BYTES -DSPALLOCATOR_MAX_CLASS_BYTES=$MAX_CLASS_BYTES"
+# Only force -D=1 when enabled. Default-off relies on pool.hpp's #ifndef 0 so
+# the tester can -U/-D=1 without clashing with a command-line =0 from config.mk.
+SIZE_CXXFLAGS="-DSPALLOCATOR_SLAB_TARGET_BYTES=$SLAB_TARGET_BYTES -DSPALLOCATOR_SLAB_TARGET_MULTIPLIER=$SLAB_TARGET_MULTIPLIER -DSPALLOCATOR_PREALLOCATE_MAX_ELEM_SIZE=$PREALLOCATE_MAX_ELEM_SIZE -DSPALLOCATOR_PREALLOCATE_MAX_ALIGNMENT=$PREALLOCATE_MAX_ALIGNMENT -DSPALLOCATOR_MAX_ALLOCATION_BYTES=$MAX_ALLOCATION_BYTES -DSPALLOCATOR_MAX_CLASS_BYTES=$MAX_CLASS_BYTES"
+if [ "$ENABLE_POOL_COUNTERS" = "yes" ]; then
+    SIZE_CXXFLAGS="$SIZE_CXXFLAGS -DSPALLOCATOR_POOL_COUNTERS=1"
+fi
 if [ -n "$CXXFLAGS" ]; then
     USER_CXXFLAGS_VALUE="$CXXFLAGS $SIZE_CXXFLAGS"
 else
@@ -711,6 +764,7 @@ CXXSTD := $CXXSTD
 BUILD_TYPE := $BUILD_TYPE
 ENABLE_TESTS := $ENABLE_TESTS
 ENABLE_DEMO := $ENABLE_DEMO
+ENABLE_BENCH := $ENABLE_BENCH
 VERBOSE := $VERBOSE
 
 # Google Test
@@ -724,9 +778,12 @@ ENABLE_UBSAN := $ENABLE_UBSAN
 ENABLE_TSAN := $ENABLE_TSAN
 ENABLE_COVERAGE := $ENABLE_COVERAGE
 
-# Slab buffer packing (compile-time)
+# Slab buffer packing / Pool cold-start preallocate (compile-time)
 SLAB_TARGET_BYTES := $SLAB_TARGET_BYTES
 SLAB_TARGET_MULTIPLIER := $SLAB_TARGET_MULTIPLIER
+PREALLOCATE_MAX_ELEM_SIZE := $PREALLOCATE_MAX_ELEM_SIZE
+PREALLOCATE_MAX_ALIGNMENT := $PREALLOCATE_MAX_ALIGNMENT
+ENABLE_POOL_COUNTERS := $ENABLE_POOL_COUNTERS
 
 # User-specified flags (+ slab packing -D knobs)
 USER_CXXFLAGS := $USER_CXXFLAGS_VALUE
@@ -751,6 +808,9 @@ echo "  make coverage     - Run tests and print coverage summary"
 fi
 if [ "$ENABLE_DEMO" = "yes" ]; then
 echo "  make demo         - Run demo program"
+fi
+if [ "$ENABLE_BENCH" = "yes" ]; then
+echo "  make bench        - On-demand allocator comparison (prefer BUILD_TYPE=release)"
 fi
 echo "  make clean        - Clean build artifacts"
 echo "  make install      - Install (to $PREFIX)"

@@ -15,6 +15,7 @@ mlvlib/               # git submodule — general utils (SpinLock, LifetimeObser
 docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md
 test/                 # Google Test suite (tester.cpp)
 demos/                # example programs
+bench/                # on-demand allocator comparison (`make bench`)
 README.md             # this overview + build/run
 ```
 
@@ -24,6 +25,7 @@ README.md             # this overview + build/run
 - **Slab size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB; large fallback via `SlabProxy`
 - **Thread-safe routing** — pool + per-slab locking
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolBlockToken`)
+- **Optional PMR bridge** — `PoolMemoryResource` in `pool_pmr.hpp` for `std::pmr` containers (prefer `PoolAllocator` when types can bake it in)
 - **Defined pool lifetime** — orderly RAII, arena bulk reclaim, or `PoolHandle::create()` auto-retire
 - **mlvlib dependency** — `SpinLock`, helpers, and optional `LifetimeObserver` via the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule
 - **Modern C++20+** — templates, atomics, ranges, concepts; C++23/26 when the toolchain allows
@@ -53,6 +55,14 @@ make
 
 # Run the unit test suite
 make test
+
+# On-demand allocator comparison (not part of make test; prefer release)
+make bench BUILD_TYPE=release
+# make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
+# make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new spot-check
+# make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
+# Focused perf record/report (BUILD_TYPE=profile: -O3 + frame pointers + -g)
+# make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'
 ```
 
 Binaries land under `obj/<build_type>/` (default `obj/addrsan/`), with convenience symlinks in `obj/`:
@@ -70,6 +80,7 @@ Binaries land under `obj/<build_type>/` (default `obj/addrsan/`), with convenien
 ```bash
 make BUILD_TYPE=debug       # unoptimized debug
 make BUILD_TYPE=release     # optimized (-O3 -DNDEBUG) + coverage (CI default)
+make BUILD_TYPE=profile     # like release + -g -fno-omit-frame-pointer (for perf)
 make BUILD_TYPE=addrsan     # AddressSanitizer + LSan + UBSan (default)
 make BUILD_TYPE=memsan      # MemorySanitizer (Clang; needs host MSan runtime — not in CI)
 make BUILD_TYPE=threadsan   # ThreadSanitizer + UBSan
@@ -80,6 +91,16 @@ make coverage               # run tests and print coverage summary (release)
 
 Google Test is required for `make test`. If GTest is not found, tests are disabled automatically.
 
+### Benchmarks
+
+On-demand harness in `bench/` (not built by default `make`, not a CI gate):
+
+| Program | Source | What it compares |
+|---------|--------|------------------|
+| `bench_allocators` | `bench/bench_allocators.cpp` | `::operator new`, `Pool`, `pool_pmr`, `std::pmr` pool resources, bare `Slab<16,16>` |
+
+Reports ns/op and **ratio vs `::new`**. Prefer `BUILD_TYPE=release` (`make bench` forces coverage off). Filter with `--scenario=` / `--backend=` for focused runs; `--pool-stats` for optional `PoolStats` dumps. For `perf` stacks use `make profile` (`BUILD_TYPE=profile`: `-O3` + frame pointers + `-g`). See [docs/IMPLEMENTATION.md — Performance](docs/IMPLEMENTATION.md#performance).
+
 ### Demos
 
 Sources live in `demos/`. After `make`:
@@ -87,17 +108,20 @@ Sources live in `demos/`. After `make`:
 | Program | Source | What it shows |
 |---------|--------|----------------|
 | `demo_spalloc_shared_ptr` | `demos/demo_spalloc_shared_ptr.cpp` | `make_pool_shared`, sharing, `PoolAllocator` with `std::vector` |
+| `demo_pool_pmr` | `demos/demo_pool_pmr.cpp` | `PoolMemoryResource` + `pmr::vector`, vs `PoolAllocator`, tracing decorator |
 
 `LifetimeObserver` demos and tests live in [mlvlib](https://github.com/MLV-WIP/mlvlib).
 
 ```bash
-# Build everything, then run the shared_ptr demo (Makefile `demo` target)
+# Build everything, then run both demos (Makefile `demo` target)
 make demo
 
-# Or run the binary directly (default build type = addrsan)
+# Or run a binary directly (default build type = addrsan)
 ./obj/addrsan/demo_spalloc_shared_ptr
+./obj/addrsan/demo_pool_pmr
 # Same via obj/ symlink
 ./obj/demo_spalloc_shared_ptr
+./obj/demo_pool_pmr
 ```
 
 ### Basic Usage
@@ -141,6 +165,7 @@ int main() {
 | **SlabProxy** | `spallocator/slab.hpp` | Large / overflow path via system `new[]` / `delete[]` |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a pool domain |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
+| **PoolMemoryResource** | `spallocator/pool_pmr.hpp` | Optional `std::pmr::memory_resource` adapter (additive header) |
 | **PoolHandle** | `spallocator/pool_lifetime.hpp` | Heap domain handle; `create()` retires when idle |
 | **Helper** | `spallocator/helper.hpp` | Pool size caps; re-exports general helpers from mlvlib |
 | **SpinLock** | `mlvlib/spinlock.hpp` (submodule) | Short-section lock used by Pool/Slab (`mlvlib::SpinLock`) |
@@ -191,7 +216,7 @@ The repo-root [`IMPLEMENTATION.md`](IMPLEMENTATION.md) redirects here. Source he
 
 ## Testing
 
-The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, smart-pointer exception safety, and `PoolAllocator` / STL integration. SpinLock and LifetimeObserver tests live in mlvlib.
+The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, smart-pointer exception safety, `PoolAllocator` / STL integration, and `PoolMemoryResource` / `std::pmr`. SpinLock and LifetimeObserver tests live in mlvlib.
 
 ```bash
 make test
@@ -217,6 +242,8 @@ Recorded for later (not scheduled). See also
 
 - Consider dropping fixed size-class slots in favor of shaping buffers to
   `(element size + header) × N` (or similar multiples)
+- Dedicated bump / size-based arena facility — **deferred** (use arena `~Pool`
+  for bulk reclaim today; see IMPLEMENTATION backlog for revival shape)
 - Consider a C99-compliant wrapper API for callers that want the pool interface
   from C (opaque handle ≈ `PoolHandle`)
 - Abstract the lock primitive so a build can choose `SpinLock` or another
@@ -227,6 +254,7 @@ Recorded for later (not scheduled). See also
 - [Bonwick (1994) - The Slab Allocator](https://www.usenix.org/legacy/publications/library/proceedings/bos94/full_papers/bonwick.ps) - Original USENIX paper
 - [Linux SLAB/SLUB/SLOB](https://www.kernel.org/doc/gorman/html/understand/understand011.html) - Kernel implementations
 - [memcached](https://memcached.org/) - Popularized slab allocation for user-space
+- Patrice Roy - *C++ Memory Management* (Packt, 2025) - arenas, deferred reclamation, allocators/PMR; strategy mapping in [docs/CONCEPTS.md](docs/CONCEPTS.md#choosing-a-memory-strategy)
 
 ## License
 
