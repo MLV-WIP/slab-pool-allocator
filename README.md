@@ -25,6 +25,7 @@ README.md             # this overview + build/run
 - **Slab size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB; large fallback via `SlabProxy`
 - **Thread-safe routing** — pool + per-slab locking
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolBlockToken`)
+- **Optional PMR bridge** — `PoolMemoryResource` in `pool_pmr.hpp` for `std::pmr` containers (prefer `PoolAllocator` when types can bake it in)
 - **Defined pool lifetime** — orderly RAII, arena bulk reclaim, or `PoolHandle::create()` auto-retire
 - **mlvlib dependency** — `SpinLock`, helpers, and optional `LifetimeObserver` via the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule
 - **Modern C++20+** — templates, atomics, ranges, concepts; C++23/26 when the toolchain allows
@@ -96,9 +97,9 @@ On-demand harness in `bench/` (not built by default `make`, not a CI gate):
 
 | Program | Source | What it compares |
 |---------|--------|------------------|
-| `bench_allocators` | `bench/bench_allocators.cpp` | `::operator new`, `Pool`, `std::pmr` pool resources, bare `Slab<16,16>` |
+| `bench_allocators` | `bench/bench_allocators.cpp` | `::operator new`, `Pool`, `pool_pmr`, `std::pmr` pool resources, bare `Slab<16,16>` |
 
-Reports ns/op and **ratio vs `::new`**. Prefer `BUILD_TYPE=release` (`make bench` forces coverage off). Filter with `--scenario=` / `--backend=` for focused runs. For `perf` stacks use `make profile` (`BUILD_TYPE=profile`: `-O3` + frame pointers + `-g`). See [docs/IMPLEMENTATION.md — Performance](docs/IMPLEMENTATION.md#performance).
+Reports ns/op and **ratio vs `::new`**. Prefer `BUILD_TYPE=release` (`make bench` forces coverage off). Filter with `--scenario=` / `--backend=` for focused runs; `--pool-stats` for optional `PoolStats` dumps. For `perf` stacks use `make profile` (`BUILD_TYPE=profile`: `-O3` + frame pointers + `-g`). See [docs/IMPLEMENTATION.md — Performance](docs/IMPLEMENTATION.md#performance).
 
 ### Demos
 
@@ -107,17 +108,20 @@ Sources live in `demos/`. After `make`:
 | Program | Source | What it shows |
 |---------|--------|----------------|
 | `demo_spalloc_shared_ptr` | `demos/demo_spalloc_shared_ptr.cpp` | `make_pool_shared`, sharing, `PoolAllocator` with `std::vector` |
+| `demo_pool_pmr` | `demos/demo_pool_pmr.cpp` | `PoolMemoryResource` + `pmr::vector`, vs `PoolAllocator`, tracing decorator |
 
 `LifetimeObserver` demos and tests live in [mlvlib](https://github.com/MLV-WIP/mlvlib).
 
 ```bash
-# Build everything, then run the shared_ptr demo (Makefile `demo` target)
+# Build everything, then run both demos (Makefile `demo` target)
 make demo
 
-# Or run the binary directly (default build type = addrsan)
+# Or run a binary directly (default build type = addrsan)
 ./obj/addrsan/demo_spalloc_shared_ptr
+./obj/addrsan/demo_pool_pmr
 # Same via obj/ symlink
 ./obj/demo_spalloc_shared_ptr
+./obj/demo_pool_pmr
 ```
 
 ### Basic Usage
@@ -161,6 +165,7 @@ int main() {
 | **SlabProxy** | `spallocator/slab.hpp` | Large / overflow path via system `new[]` / `delete[]` |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a pool domain |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
+| **PoolMemoryResource** | `spallocator/pool_pmr.hpp` | Optional `std::pmr::memory_resource` adapter (additive header) |
 | **PoolHandle** | `spallocator/pool_lifetime.hpp` | Heap domain handle; `create()` retires when idle |
 | **Helper** | `spallocator/helper.hpp` | Pool size caps; re-exports general helpers from mlvlib |
 | **SpinLock** | `mlvlib/spinlock.hpp` (submodule) | Short-section lock used by Pool/Slab (`mlvlib::SpinLock`) |
@@ -211,7 +216,7 @@ The repo-root [`IMPLEMENTATION.md`](IMPLEMENTATION.md) redirects here. Source he
 
 ## Testing
 
-The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, smart-pointer exception safety, and `PoolAllocator` / STL integration. SpinLock and LifetimeObserver tests live in mlvlib.
+The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, smart-pointer exception safety, `PoolAllocator` / STL integration, and `PoolMemoryResource` / `std::pmr`. SpinLock and LifetimeObserver tests live in mlvlib.
 
 ```bash
 make test

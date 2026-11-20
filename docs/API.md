@@ -40,6 +40,7 @@ convenience and defines allocator-only size caps.
   - [`make_pool_unique`](#make_pool_unique)
   - [`make_pool_shared`](#make_pool_shared)
 - [PoolAllocator](#poolallocator)
+- [PoolMemoryResource](#poolmemoryresource)
 - [Helpers & mlvlib](#helpers--mlvlib)
 - [Contracts cheat-sheet](#contracts-cheat-sheet)
 
@@ -53,6 +54,7 @@ convenience and defines allocator-only size caps.
 | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolBlockToken`, `PoolControlBlock` |
 | `spallocator/slab.hpp` | `AbstractSlab`, `Slab`, `SlabProxy`, `DynBitset` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
+| `spallocator/pool_pmr.hpp` | `PoolMemoryResource` (`std::pmr::memory_resource`; additive — not pulled by `spallocator.hpp`) |
 | `spallocator/helper.hpp` | Pool size caps; re-exports mlvlib helpers into `spallocator` |
 | `mlvlib/spinlock.hpp` | `mlvlib::SpinLock` (submodule; used by Pool/Slab) |
 | `mlvlib/lifetimeobserver.hpp` | `mlvlib::LifetimeObserver` (submodule; optional) |
@@ -64,7 +66,7 @@ convenience and defines allocator-only size caps.
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                    ▼
      Slab<…> (fixed-size slots)          SlabProxy (large new[])
-  Smart pointers / PoolAllocator ──► PoolBlockToken / PoolHandle
+  Smart pointers / PoolAllocator / PoolMemoryResource ──► PoolBlockToken / PoolHandle
   mlvlib::SpinLock / helpers       (submodule; SpinLock used by Pool/Slab)
 ```
 
@@ -742,6 +744,52 @@ v.push_back(42);
 
 ---
 
+## PoolMemoryResource
+
+**Header:** `spallocator/pool_pmr.hpp` (include explicitly; not part of
+`spallocator.hpp`, so non-PMR clients avoid `<memory_resource>`).
+
+`std::pmr::memory_resource` backed by a pool domain. Prefer
+`PoolAllocator<T>` when the container type can bake the allocator in (no
+virtual dispatch). Use this for polymorphic `std::pmr` containers and runtime
+composition (for example a tracing decorator over the resource).
+
+Same arena model as `PoolAllocator`: holds a `PoolBlockToken`; allocate throws
+`bad_alloc` if `!alive`; deallocate no-ops if dead.
+
+```cpp
+class PoolMemoryResource : public std::pmr::memory_resource {
+public:
+    explicit PoolMemoryResource(PoolBlockToken token) noexcept;
+    explicit PoolMemoryResource(Pool& pool) noexcept;
+    explicit PoolMemoryResource(PoolHandle const& handle) noexcept;
+
+    PoolBlockToken const& token() const noexcept;
+};
+```
+
+| Surface | Behavior |
+|---------|----------|
+| Constructors | `PoolBlockToken`, `Pool&`, or `PoolHandle` (token = `block_refs` pin). |
+| `allocate(bytes, alignment)` | Alignment below `kMinAlignment` (4) is raised to 4. Non-power-of-two or `> kMaxAlignment` (64) throws `bad_alloc`. Dead pool throws `bad_alloc`. Pool contract failures (`invalid_argument` / `out_of_range`) are mapped to `bad_alloc` (PMR contract). |
+| `deallocate(p, bytes, alignment)` | `noexcept`. Null is a no-op. Bad pointers **abort** while alive; **no-op** if `!alive` (arena). `bytes` / `alignment` are unused (pool frees by header). |
+| `is_equal` | True iff `other` is a `PoolMemoryResource` on the same `PoolControlBlock*`. |
+
+```cpp
+#include <memory_resource>
+#include "spallocator/pool_pmr.hpp"
+
+spallocator::Pool pool;
+spallocator::PoolMemoryResource resource(pool);
+std::pmr::vector<int> v{&resource};
+v.push_back(42);
+```
+
+Demo: `demos/demo_pool_pmr.cpp` (also shows an in-demo tracing decorator).
+Bench token: `--backend=pool_pmr` on `make bench`.
+
+---
+
 ## Helpers & mlvlib
 
 **Allocator helper header:** `spallocator/helper.hpp`
@@ -774,6 +822,8 @@ against the submodule root.
 | `Pool::try_deallocate` | `false` | Same |
 | `Pool::trim` / `getAllocatedMemory` | — | Safe |
 | `PoolDeleter` / `PoolAllocator::deallocate` | `abort` on bad pointer if alive; no-op if dead | Pool-safe; pointer handoff is the caller’s protocol |
+| `PoolMemoryResource::allocate` | `bad_alloc` (dead / unsupported align / mapped Pool throws) | Same as Pool |
+| `PoolMemoryResource::deallocate` | `abort` on bad pointer if alive; no-op if dead | Same as PoolAllocator |
 | `PoolHandle::create` / handle drop | may `delete` heap pool when idle | Destroy/create from one thread |
 | `make_pool_unique` construction | throw; slot returned | Pool-safe |
 | `LifetimeObserver::isAlive` | — | Race-free liveness bit |

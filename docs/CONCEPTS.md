@@ -477,7 +477,8 @@ resource lifetime.
 |--------|------|
 | `make_pool_unique` | Exclusive ownership; `PoolDeleter` runs `~T()` and returns memory (or no-ops if the pool already died — arena) |
 | `make_pool_shared` | Shared ownership; pool object + heap CB via `PoolDeleter` |
-| `PoolAllocator<T>` | Lets STL containers (`vector`, maps’ nodes, etc.) draw from the pool |
+| `PoolAllocator<T>` | Lets STL containers (`vector`, maps’ nodes, etc.) draw from the pool (preferred type-based path) |
+| `PoolMemoryResource` | `std::pmr::memory_resource` adapter for polymorphic / composable PMR use (`pool_pmr.hpp`) |
 | `PoolHandle` | Optional heap domain pin; `create()` auto-retires the pool when handles and live allocs are both zero |
 
 Arrays destroy elements in **reverse** construction order — the same rule as
@@ -622,6 +623,7 @@ profile **slabs** for size-class recycling behavior.
 | Demo / test | Concepts |
 |-------------|----------|
 | `demo_spalloc_shared_ptr` | Pool as domain + shared ownership + STL allocator |
+| `demo_pool_pmr` | `PoolMemoryResource` + `pmr::vector`, vs `PoolAllocator`, tracing decorator |
 | mlvlib `demo_lifetime_observer` | Single-strand vs cross-thread liveness |
 | `make test` | Slab growth/trim, pool routing/alignment, threads, locks |
 
@@ -700,7 +702,7 @@ line up with - or deliberately differ from - this codebase:
 | **Size-based bump arena** (sequential allocate, empty individual free, destroy domain to reclaim) | Scene / level / bounded N | Closest today: arena `~Pool` bulk reclaim. A dedicated bump facility remains design backlog - this `Pool` still classifies and recycles on the hot path |
 | **Deferred reclamation** | Finalize and/or reclaim a group at a chosen moment | Arena path: skip per-object finalization in `PoolDeleter` when `!alive`, reclaim storage with the pool. Prefer orderly teardown when `~T()` must run |
 | **Traditional (type-based) allocator** | Compile-time allocator in the container type | `PoolAllocator<T>` (POCCA/POCMA/POCS false; equality by control block) |
-| **PMR (`memory_resource`)** | Runtime resource pointer; easy to compose | Not shipped yet; `PoolAllocator` remains the primary STL path (no virtual on that path) |
+| **PMR (`memory_resource`)** | Runtime resource pointer; easy to compose | `PoolMemoryResource` in `pool_pmr.hpp` (additive include). Prefer `PoolAllocator<T>` when the type can bake the allocator in (no virtual dispatch) |
 
 **Alignment note:** Roy's academic chunked example often rounds categories to
 powers of two so contiguous slots stay aligned. This library instead uses

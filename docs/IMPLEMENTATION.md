@@ -74,7 +74,7 @@ you need the “why pools / why slabs” story without code structure.
               │
               └── per-slab SpinLock, bitsets, base_address_map
 
-  Smart pointers / PoolAllocator ──► clients via PoolBlockToken / PoolHandle
+  Smart pointers / PoolAllocator / PoolMemoryResource ──► clients via PoolBlockToken / PoolHandle
   LifetimeObserver                 (stand-alone; not part of Pool)
 ```
 
@@ -505,6 +505,7 @@ not change slab internals; they enforce RAII and exception safety on top.
 | `make_pool_unique` | Placement `new`; on ctor throw, return slot (**strong guarantee**); overloads for `Pool&` / `PoolHandle` / token |
 | `make_pool_shared` | Placement `new` + `shared_ptr(p, PoolDeleter)`; object in pool, CB on heap |
 | `PoolAllocator` | Stateful token; no POCCA/POCMA/POCS; equal iff **same control block**; allocate throws `bad_alloc` if `!alive`; deallocate no-ops if dead |
+| `PoolMemoryResource` | Additive `pool_pmr.hpp`; same token/arena model; virtual `memory_resource` for `std::pmr` composition |
 
 ### `PoolAllocator` design decisions
 
@@ -914,22 +915,25 @@ make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new axis-64 
 make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
 ```
 
-Compares `::operator new`, `spallocator::Pool`, `std::pmr::unsynchronized_pool_resource`,
+Compares `::operator new`, `spallocator::Pool`, `spallocator::PoolMemoryResource`
+(`--backend=pool_pmr`; virtual dispatch over Pool),
+`std::pmr::unsynchronized_pool_resource`,
 `std::pmr::synchronized_pool_resource` (multi-thread), and bare `Slab<16,16>`
 (16B churn). Prints **ns/op** and **ratio vs `::new`** for warmed LIFO churn,
 randomized multi-size mix (uniform user sizes in `[16, 1024]`), alloc-then-free-all,
 and optional multi-thread multi-size churn (`--threads=N`). Size picks use
 per-thread `std::minstd_rand` seeded from a fixed key plus worker index
-(repeatable). After Pool / Slab scenarios, prints `PoolStats` or slab retained
-bytes. Absolute ns are host/toolchain-specific; re-run after compiler or
-stdlib upgrades and compare ratios on the same machine.
+(repeatable). Pass `--pool-stats` to dump `PoolStats` / slab retained bytes
+after scenarios (off by default). Absolute ns are host/toolchain-specific;
+re-run after compiler or stdlib upgrades and compare ratios on the same machine.
 
 Filters (for focused timing or profiling):
 
 | Flag | Values | Notes |
 |------|--------|-------|
 | `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all`. `bulk` is alloc-then-free-all (grows many slab buffers) |
-| `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk` |
+| `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `pool_pmr`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk`. `pool_pmr` shows PMR virtual tax vs raw `pool` |
+| `--pool-stats` | (flag) | Opt-in `[PoolStats]` / slab retained dumps after scenarios |
 | `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
 | `--size-mix=` | `uniform` or `class` (default **class**) | `class` = equal weight per reachable axis-16 size class (exact-fit user size); better multi-slab coverage than uniform bytes |
 
@@ -1036,7 +1040,7 @@ Also tracked on the
 | Non–fixed-class buffer shaping | Drop ladders entirely; buffers already exact-pack within classes (`kSlabTargetBytes` / multiplier) |
 | Pool lifetime vs smart pointers | **Done** — ControlBlock / Handle / BlockToken; orderly + arena + heap retire |
 | Bump / size-based arena facility | Sequential allocate, no individual reuse, bulk reclaim - distinct from recycling `Pool` (see [CONCEPTS - Choosing a memory strategy](CONCEPTS.md#choosing-a-memory-strategy)) |
-| PMR `memory_resource` adapter | Optional `std::pmr` bridge; keep `PoolAllocator` as the primary / non-virtual STL path |
+| PMR `memory_resource` adapter | **Done** — `PoolMemoryResource` in `pool_pmr.hpp` (additive; virtual cost); keep `PoolAllocator` as the primary / non-virtual STL path |
 | Baseline ratio benches | **Shipped** — `make bench` (`bench/bench_allocators.cpp`); re-check after toolchain upgrades |
 | C99 wrapper | Opaque pool handle API for C callers |
 | Pluggable lock primitive | Compile-time choice of `SpinLock` vs `std::mutex` (or similar) for Pool/Slab |
@@ -1050,6 +1054,7 @@ Also tracked on the
 |----------|--------|
 | `test/tester.cpp` | Slab growth/trim/`DynBitset` scaling, pool routing/alignment/header validation, multi-thread pool use, smart-pointer exception safety, PoolHandle/BlockToken lifetime, SpinLock contention, LifetimeObserver (including concurrent `isAlive`) |
 | `demos/demo_spalloc_shared_ptr.cpp` | Pool as domain + `make_pool_shared` + `PoolAllocator` with STL containers |
+| `demos/demo_pool_pmr.cpp` | `PoolMemoryResource` + `pmr::vector`, vs `PoolAllocator`, in-demo tracing decorator |
 | mlvlib `demos/demo_lifetime_observer.cpp` | Single-strand vs mutex-guarded cross-thread observer patterns |
 
 Prefer `make test` under `addrsan` for day-to-day; add `threadsan` when touching
