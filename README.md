@@ -6,13 +6,15 @@ A C++ memory **pool** backed by **slab** size-class storage — for production s
 
 A memory **pool** (disposable / isolatable allocation domain) backed by **slabs** (fixed-size slot recyclers). Pool and slab are separate ideas — the pool owns lifetime and routing; slabs implement size-class storage.
 
+**Terminology:** Pool → Slab (size-class engine) → **Block** (mapped chunk) → Slot. See [docs/terminology-glossary.md](docs/terminology-glossary.md) and [docs/CONCEPTS.md](docs/CONCEPTS.md#terminology).
+
 **Readiness:** The pool, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. Pool lifetime vs clients is defined: orderly RAII (pointers first), optional arena bulk reclaim (`unique_pool_ptr` no-ops when the pool is already dead), and `PoolHandle::create()` for heap domains that retire when idle. Short critical sections use `mlvlib::SpinLock` (from the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule). Known follow-ons (per-class metrics, freelist) are listed under Future Work.
 
 **Directory map:**
 ```
 spallocator/          # header-only allocator library
 mlvlib/               # git submodule — general utils (SpinLock, LifetimeObserver, helpers)
-docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md
+docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md, terminology-glossary.md
 test/                 # Google Test suite (tester.cpp)
 demos/                # example programs
 bench/                # on-demand allocator comparison (`make bench`)
@@ -24,7 +26,7 @@ README.md             # this overview + build/run
 - **Pool as allocation domain** — construct, share `Pool&` / `PoolHandle`, destroy to dispose; shard pools to isolate or reduce contention
 - **Slab size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB; large fallback via `SlabProxy`
 - **Thread-safe routing** — pool + per-slab locking
-- **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolBlockToken`)
+- **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolLifetimeToken`)
 - **Optional PMR bridge** — `PoolMemoryResource` in `pool_pmr.hpp` for `std::pmr` containers (prefer `PoolAllocator` when types can bake it in)
 - **Defined pool lifetime** — orderly RAII, arena bulk reclaim, or `PoolHandle::create()` auto-retire
 - **mlvlib dependency** — `SpinLock`, helpers, and optional `LifetimeObserver` via the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule
@@ -160,7 +162,7 @@ int main() {
 | Component | File | Description |
 |-----------|------|-------------|
 | **Pool** | `spallocator/pool.hpp` | Allocation domain: route by footprint/alignment, header protocol, `trim`, dispose as a unit |
-| **Pool lifetime** | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolBlockToken`, `PoolControlBlock` (also via `pool.hpp`) |
+| **Pool lifetime** | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolLifetimeToken`, `PoolControlBlock` (also via `pool.hpp`) |
 | **Slab** | `spallocator/slab.hpp` | Fixed-size slot recycler for one size class (bitmaps, growth, reclaim) |
 | **SlabProxy** | `spallocator/slab.hpp` | Large / overflow path via system `new[]` / `delete[]` |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a pool domain |
@@ -173,15 +175,15 @@ int main() {
 
 ### Size Classes
 
-Per-alignment ladders (`Slab<ElemSize, Alignment>`). Align 4/8 use the 16-byte axis.
+Per-alignment ladders (`Slab<ElemSize, Alignment>`). Align 4/8 use the 16-byte alignment class.
 
 ```
-Axis 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Axis 32 (lazy):  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Axis 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Alignment class 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
+Alignment class 32 (lazy):  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+Alignment class 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 ```
 
-Beyond an axis max → `SlabProxy` (always 64-byte aligned `new[]`).
+Beyond an alignment-class max → `SlabProxy` (always 64-byte aligned `new[]`).
 
 Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs are selected by **total footprint** (requested size + allocation header), not the user size alone — see [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
@@ -190,7 +192,7 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 | Operation | Complexity | Notes |
 |-----------|------------|-------|
 | Allocation | O(1) amortized | Two-level bitmap optimization |
-| Deallocation | O(log n) | Address map lookup (n = slabs) |
+| Deallocation | O(log n) | Address map lookup (n = Blocks in that Slab) |
 | SpinLock lock/unlock | O(1) | No contention case |
 
 **Space Overhead**: Default header is 8 bytes (`header_size = max(8, alignment)`), so ~6% for a 128-byte user request before bitset amortization. Details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#memory-layout).
@@ -210,6 +212,7 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 | **[docs/API.md](docs/API.md)** | Public API reference: contracts, thread-safety, short usage snippets (including helpers) |
 | **[docs/CONCEPTS.md](docs/CONCEPTS.md)** | Conceptual / learning-oriented guide (pools, slabs, lifetime patterns, teaching path) |
 | **[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** | Architecture, design trade-offs, and production readiness |
+| **[docs/terminology-glossary.md](docs/terminology-glossary.md)** | Locked Pool / Slab / Block / Slot vocabulary (Phase 1+) |
 | **[SpinLock Analysis](mlvlib/docs/deepdive/SpinLock_Analysis.md)** | SpinLock correctness and performance deep dive (linked from IMPLEMENTATION) |
 
 The repo-root [`IMPLEMENTATION.md`](IMPLEMENTATION.md) redirects here. Source headers also carry design comments.

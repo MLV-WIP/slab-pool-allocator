@@ -56,7 +56,7 @@ inline constexpr int kDefaultThreadedBatch = 1024;
 enum class SizeMix
 {
     Uniform, // uniform user bytes in [kUserSizeMin, kUserSizeMax]
-    Class,   // uniform over reachable axis-16 size classes (exact-fit user size)
+    Class,   // uniform over reachable alignment-class-16 size classes (exact-fit user size)
 };
 
 // Per-worker std::minstd_rand (fast LCG from <random>). Deterministic seed per
@@ -82,7 +82,7 @@ inline std::size_t pool_header_size(std::size_t alignment)
     return alignment < 8 ? 8 : alignment;
 }
 
-// Exact-fit user sizes that land on each reachable native-axis class when
+// Exact-fit user sizes that land on each reachable native alignment-class ladder when
 // footprint = user + header. With align 8 (header 8) and user ≥ 16, class 16
 // is unreachable; classes 32..1024 are.
 inline std::size_t pick_user_size(std::minstd_rand& rng, SizeMix mix,
@@ -133,7 +133,7 @@ void print_pool_stats(std::string_view label, spallocator::Pool& pool)
     std::cout << "  [PoolStats] " << label << "\n"
               << "    live_allocations=" << s.live_allocations
               << " live_hwm=" << s.live_hwm << "\n"
-              << "    retained_slab_bytes=" << s.retained_slab_bytes
+              << "    retained_mapped_bytes=" << s.retained_mapped_bytes
               << " retained_hwm=" << s.retained_hwm << "\n"
               << "    alloc_ok=" << s.alloc_ok
               << " alloc_fail=" << s.alloc_fail
@@ -149,7 +149,7 @@ void print_pool_stats(std::string_view label, spallocator::Pool& pool)
 void print_slab16_stats(std::string_view label, spallocator::Slab<16, 16>& slab)
 {
     std::cout << "  [Slab<16,16>] " << label << "\n"
-              << "    slab_count=" << slab.getSlabCount()
+              << "    slab_count=" << slab.getBlockCount()
               << " retained_bytes=" << slab.getAllocatedMemory()
               << " availability_map_bytes=" << slab.getAvailabilityMapBytes()
               << "\n";
@@ -514,7 +514,7 @@ void print_help()
         "  --threads=N         Worker threads for multi-thread multi-size churn (default 1)\n"
         "  --batch=N           Per-thread live batch for threaded scenario (default 1024)\n"
         "  --size-mix=MIX      uniform | class (default class). Class = equal weight per\n"
-        "                      reachable axis-16 size class (exact-fit user size).\n"
+        "                      reachable alignment-class-16 size class (exact-fit user size).\n"
         "  --scenario=LIST     lifo,multi,bulk,threaded,all (comma-separated; default all)\n"
         "  --backend=LIST      new,pool,pmr_unsync,pmr_sync,slab16,pool_pmr,all\n"
         "                      (comma-separated; default all)\n"
@@ -1226,7 +1226,7 @@ void run_align8_suite(Options const& opt)
                 {
                     print_pool_stats("after multi-thread multi-size", pool_b.pool);
                     std::cout << "    (peak live ≈ " << peak_live
-                              << "; retained_slab_bytes reflects multi-buffer growth)\n";
+                              << "; retained_mapped_bytes reflects multi-buffer growth)\n";
                 }
                 if (ran_pool_pmr)
                 {
@@ -1243,10 +1243,10 @@ void run_high_align_spot(Options const& opt)
 {
     constexpr std::size_t kSize = 16;
     std::cout << "Align-" << opt.alignment
-              << " spot-check (Pool axis/header tax vs ::new; size=16)\n";
+              << " spot-check (Pool alignment-class/header tax vs ::new; size=16)\n";
     std::cout << "Only ::new and Pool participate; other --backend values are skipped.\n\n";
 
-    // High-align spots are LIFO-only tax checks (axis 32 or 64).
+    // High-align spots are LIFO-only tax checks (alignment class 32 or 64).
     if (!has(opt.scenarios, Scenario::Lifo))
     {
         std::cout << "Align-" << opt.alignment

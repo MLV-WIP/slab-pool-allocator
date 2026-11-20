@@ -11,6 +11,9 @@ isolation* boundary for a set of allocations. A slab is a *layout and recycling*
 strategy for fixed-size slots. This library’s `Pool` type *uses* many `Slab`s
 (plus a large-allocation path); neither concept subsumes the other.
 
+**Terminology:** Pool → **Slab** (size-class engine) → **Block** (mapped chunk) →
+**Slot**. See [terminology-glossary.md](terminology-glossary.md).
+
 For signatures, parameters, and contracts, see [API.md](API.md). Build and run
 instructions stay in the [root README](../README.md).
 
@@ -30,13 +33,14 @@ to weaken them.
 - [Size classes & fragmentation](#size-classes--fragmentation)
 - [Headers beside the payload](#headers-beside-the-payload)
 - [Slots, bitsets, and growth](#slots-bitsets-and-growth)
-- [Finding a pointer’s slab](#finding-a-pointers-slab)
+- [Finding a pointer’s owning Block](#finding-a-pointers-owning-block)
 - [Locking & contention](#locking--contention)
 - [RAII on a custom pool](#raii-on-a-custom-pool)
 - [Observing lifetime without owning](#observing-lifetime-without-owning)
 - [Putting the pieces together](#putting-the-pieces-together)
 - [Concepts illustrated](#concepts-illustrated)
 - [Choosing a memory strategy](#choosing-a-memory-strategy)
+- [Terminology](#terminology)
 - [Further reading](#further-reading)
 
 ---
@@ -107,7 +111,7 @@ individual allocation site.
 - You want multiple independent allocators (shards) rather than one process-wide
   heap  
 - You need a handle to pass into factories / STL allocators (`Pool&`,
-  `PoolHandle`, or `PoolBlockToken`)  
+  `PoolHandle`, or `PoolLifetimeToken`)  
 
 ### When you may not need a named pool
 
@@ -126,9 +130,9 @@ API: [API.md — Pool](API.md#pool).
 
 ## What is a slab, and why use one?
 
-A **slab** is a storage strategy: take a large buffer, carve it into equal
-**slots** of one size, and recycle those slots. Allocation is “find a free
-slot”; free is “mark that slot free again.”
+A **slab** is a storage strategy: take one or more large **Blocks** (mapped
+chunks), carve each into equal **Slots** of one size, and recycle those Slots.
+Allocation is “find a free Slot”; free is “mark that Slot free again.”
 
 The classic references are kernel object caches (Bonwick’s SLAB; Linux
 SLAB/SLUB) and user-space size-class caches (for example memcached). Games and
@@ -151,7 +155,7 @@ almost any size. That flexibility costs:
 
 If the hot path allocates and frees the *same few sizes* millions of times, you
 pay general-purpose overhead for a special-case workload. A slab turns that into
-bit flips (or freelist pops) inside a pre-sized buffer.
+bit flips (or freelist pops) inside a pre-sized Block.
 
 ### When slabs help
 
@@ -180,17 +184,21 @@ API: [API.md — Slab & SlabProxy](API.md#slab--slabproxy).
 ## How this library composes them
 
 ```text
-  Pool                          ← lifetime / routing / isolation boundary
-    ├── Slab<16>, Slab<32>, …   ← fixed-size slot recycling per size class
-    ├── Slab<…, 32>, Slab<…, 64> (high-align axes; engines eager, blocks on demand)
-    └── SlabProxy               ← oversized: system new[] / delete[]
+  Pool                            ← lifetime / routing / isolation boundary
+    ├── Slab<ElemSize, Align>     ← size-class engine (alignment class 16 / 32 / 64)
+    │     └── Block               ← one mapped chunk
+    │           └── Slot          ← one ElemSize cell (freemap unit)
+    └── SlabProxy                 ← oversized: system new[] / delete[] (no Block/Slot recycle)
+
+  Item (allocateItem) = backend allocation at the slab layer (= slot base for Slab).
+  User pointer (Pool::allocate) = slot base + header.
 ```
 
 | Concept | Role here |
 |---------|-----------|
-| **`Pool`** | Public facade: choose a backend by footprint + alignment, write the allocation header, own the registry of slabs, provide `trim` / accounting, synchronize routing |
-| **`Slab`** | Per–size-class engine: buffers, freemap bits, address map, per-slab lock, growth / reclaim |
-| **`SlabProxy`** | Same *interface* as a slab backend, different *strategy* (no slot recycling) |
+| **`Pool`** | Public facade: choose a backend by footprint + alignment, write the allocation header, own the set of slabs, provide `trim` / accounting, synchronize routing |
+| **`Slab`** | Per–size-class engine: zero or more **Blocks**, freemap bits, address map, per-slab lock, growth / reclaim |
+| **`SlabProxy`** | Same *interface* as a slab backend, different *strategy* (no Block/Slot recycling) |
 
 Destroying a `Pool` destroys its slabs and drops that whole allocation domain.
 Using several `Pool` instances isolates domains (for example per shard). Speeding
@@ -217,9 +225,9 @@ space (a 33-byte need may jump to 64). **Intermediate classes** (48, 96, 192,
 384, 768) reduce that waste while keeping the number of classes manageable.
 
 ```
-Axis 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Axis 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Axis 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Alignment class 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
+Alignment class 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+Alignment class 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 ```
 
 ### Internal vs external fragmentation
@@ -227,7 +235,7 @@ Axis 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 | Term | Meaning | In this design |
 |------|---------|----------------|
 | **Internal fragmentation** | Unused bytes *inside* an allocated slot | Slot size − (user bytes + header). You “over-buy” a cell. |
-| **External fragmentation** | Free memory exists but cannot satisfy the next request | Largely avoided *within* a size class: every free slot is the right shape for that class. Cross-class unused buffers are a different RSS concern (`trim`). |
+| **External fragmentation** | Free memory exists but cannot satisfy the next request | Largely avoided *within* a size class: every free Slot is the right shape for that class. Cross-class unused Blocks are a different RSS concern (`trim`). |
 
 ### Footprint, not bare user size
 
@@ -252,16 +260,16 @@ If you compare “100 vs 128” without the header, you mis-predict the class an
 mis-estimate waste. Always reason in footprints when studying behavior or
 writing tests.
 
-### Alignment axes
+### Alignment classes
 
 Alignment is part of the size-class story:
 
-- Request align **4 or 8** shares the native **16-byte** axis (slots may be
+- Request align **4 or 8** shares the native **16-byte** alignment class (slots may be
   over-aligned; that is fine).  
 - Align **32** or **64** uses a **separate ladder** so the user pointer can meet
   a stricter align while the header still fits in front.  
-- Those higher axes are created **lazily** — you do not pay for them until
-  something asks.  
+- Higher alignment-class **engines** are installed with the Pool; **Blocks** on
+  those ladders often map on first use (prealloc knobs control warm start).  
 
 Contracts for `allocate(size, alignment)`: [API.md — Pool](API.md#pool).
 
@@ -271,16 +279,16 @@ Real allocators see the same skew repeatedly: **most calls** are small objects;
 **most bytes** sit in fewer large ones. A process-global malloc (jemalloc /
 TCMalloc style) answers with a dense small-size class table. This library is a
 **named domain** pool: a coarser jemalloc-shaped geometric ladder on the hot
-axis, then a large fallback, is intentional — not a goal to match TCMalloc’s
+alignment class, then a large fallback, is intentional — not a goal to match TCMalloc’s
 class count.
 
 Practical takeaways:
 
-- Keep the shipped axis-16 shape unless a **client size histogram** says
+- Keep the shipped alignment-class-16 shape unless a **client size histogram** says
   otherwise; densifying without data buys RSS and engine count for little gain.
-- If you do retune spacing, bias the **bottom** of axis 16 (header-inflated
+- If you do retune spacing, bias the **bottom** of alignment class 16 (header-inflated
   small footprints), not the rare large end.
-- Default cold-start prealloc (axis ≤16, ElemSize ≤256) warms where call rate
+- Default cold-start prealloc (alignment class ≤16, ElemSize ≤256) warms where call rate
   concentrates; raising it is an RSS vs first-touch tradeoff, not a research
   mandate.
 
@@ -321,7 +329,7 @@ recovers the slot base, and asks the owning slab backend to free that base (or
 - Do not free interior pointers (`p + 1`) — free must see a real user pointer
   from `allocate` / a factory.  
 - Header width grows with alignment (`max(8, alignment)`), which is why
-  high-align requests change footprint and sometimes axis.  
+  high-align requests change footprint and sometimes alignment class.  
 
 Byte-level layout: [IMPLEMENTATION.md — Memory layout](IMPLEMENTATION.md#memory-layout).
 
@@ -333,49 +341,49 @@ bytes for a simpler public operation.
 
 ## Slots, bitsets, and growth
 
-### One buffer, many cells
+### One Block, many Slots
 
-A size-class slab owns one or more large buffers (often on the order of 4 KiB
-for small classes). Each buffer is a row of equal slots. Tracking which slots
-are free is the core data-structure problem.
+A size-class **Slab** owns zero or more **Blocks** (mapped chunks, often on the
+order of 4–8 KiB for small classes). Each Block is a row of equal **Slots**.
+Tracking which Slots are free is the core data-structure problem.
 
 ### Why bitsets?
 
-A **bitset** stores one bit per slot: free or in use.
+A **bitset** stores one bit per Slot: free or in use.
 
-Compare metadata cost for a 4 KiB buffer of 16-byte slots (256 cells):
+Compare metadata cost for a 4 KiB Block of 16-byte Slots (256 cells):
 
 | Scheme | Rough metadata |
 |--------|----------------|
 | Bitset | 256 bits = **32 bytes** |
 | `bool` array | 256 bytes |
-| Intrusive freelist of pointers | Often 8 bytes × free slots, plus poorer locality |
+| Intrusive freelist of pointers | Often 8 bytes × free Slots, plus poorer locality |
 
-Bits are tiny and scan well on modern CPUs. “Find a free slot” walks those bits
+Bits are tiny and scan well on modern CPUs. “Find a free Slot” walks those bits
 (with a next-fit cursor and word/CTZ search in this project) instead of popping
 an O(1) freelist node.
 
 ### Two-level filtering
 
-Naïvely scanning every slot in every buffer would be wasteful. A coarse
-**availability map** answers: “does this buffer still have *any* free slot?”
-Fully full buffers are skipped. Only then does the allocator search bits inside
-a candidate buffer.
+Naïvely scanning every Slot in every Block would be wasteful. A coarse
+**availability map** answers: “does this Block still have *any* free Slot?”
+Fully full Blocks are skipped. Only then does the allocator search bits inside
+a candidate Block.
 
 That pattern — coarse filter, then fine structure — shows up often (page tables,
 OS allocators, databases).
 
 ### Growth and reclaim
 
-When every buffer for a class is full, that **slab** allocates another buffer.
-When a buffer becomes completely empty, the slab **keeps it mapped by default**
+When every Block for a class is full, that **Slab** allocates another **Block**.
+When a Block becomes completely empty, the Slab **keeps it mapped by default**
 (monotonic growth):
 
 - Pros: alloc/free avoid mmap/munmap thrash; the next burst is warm  
 - Cons: RSS stays at the high-water mark until you ask to shrink  
 
-Reclaim is exposed on the **pool** as `Pool::trim()`, which asks each size-class
-slab to drop empty buffers — a pool-level policy knob over slab-level storage.
+Reclaim is exposed on the **Pool** as `Pool::trim()`, which asks each size-class
+Slab to drop empty Blocks — a pool-level policy knob over slab-level storage.
 Large (`SlabProxy`) allocations already return memory on each free.
 
 ### Next-fit cursor vs freelist
@@ -391,13 +399,15 @@ cost — see IMPLEMENTATION Future Work.
 
 ---
 
-## Finding a pointer’s slab
+## Finding a pointer’s owning Block
 
 ### The question free must answer
 
-Given a user pointer, which buffer owns it? Buffers are address **intervals**
-`[base, base + length)`. Looking up “which interval contains this address?” is
-a standard problem.
+Given a user pointer (after the Pool recovers the **slot base**), which **Block**
+owns it? Blocks are address **intervals** `[base, base + length)`. Looking up
+“which interval contains this address?” is a standard problem. That is distinct
+from “which **Slab** (size-class engine) handles this class?” — routing answers
+the latter; address lookup answers the former.
 
 ### Approaches
 
@@ -407,10 +417,10 @@ a standard problem.
 | Hash of bases | Fast when you only ever free exact bases | O(1) average; awkward for interior checks |
 | Linear scan of bases | Simple | O(m) — fine only for tiny m |
 
-This project uses an ordered map keyed by slab base addresses. The *concept*
+This project uses an ordered map keyed by Block base addresses. The *concept*
 matters more than the container choice: free must identify a **slot base**, not
 an arbitrary interior address. Interior frees are rejected so a misaligned free
-cannot flip a neighboring object’s freemap bit.
+cannot flip a neighboring object’s freemap bit. (`findBlockForSlot` answers “which Block owns this slot base?”)
 
 **Teaching angle:** ownership maps and interval trees appear in kernels (vma
 trees), JITs, and sanitizers — same shape of question.
@@ -430,7 +440,7 @@ story — and that granularity mirrors the pool-vs-slab split.
 ### Two levels
 
 1. **Pool lock** — short critical sections for routing (“which slab handles this
-   footprint?”) and size-class routing (including high-align 32/64-axis
+   footprint?”) and size-class routing (including high-align 32/64-class
    slabs).  
 2. **Per-slab lock** — protects that size class’s bitsets and address map.  
 
@@ -532,7 +542,7 @@ payloads; for types with meaningful destructors, prefer orderly teardown (or
 accept that `~T()` will not run). Do not rely on one arena-reclaimed object
 observing another during skipped finalization - there is no destruction order.
 
-`PoolDeleter` is **stateful** (it holds a `PoolBlockToken`). Empty / EBO-friendly
+`PoolDeleter` is **stateful** (it holds a `PoolLifetimeToken`). Empty / EBO-friendly
 deleters are preferable when size matters, but the token is required so arena
 `~Pool` can be observed safely without parking the control block in the slab.
 That size cost is intentional.
@@ -546,7 +556,7 @@ That can be attractive for **type-specific** pools (custom `new`/`delete` on a
 
 This library’s default path stays **generic**: `make_pool_unique` /
 `make_pool_shared` + `PoolDeleter` work for any `T` under the pool’s alignment
-cap and remain arena-observable via `PoolBlockToken`. Replacing that with
+cap and remain arena-observable via `PoolLifetimeToken`. Replacing that with
 destroying delete is an explicit **non-goal** for the generic pool; it remains
 a possible future for a narrowly typed facade, not for `Pool` itself.
 Details: [IMPLEMENTATION.md — Smart pointers](IMPLEMENTATION.md#smart-pointers-design).
@@ -742,9 +752,9 @@ line up with - or deliberately differ from - this codebase:
 
 **Alignment note:** Roy's academic chunked example often rounds categories to
 powers of two so contiguous slots stay aligned. This library instead uses
-explicit `Slab<ElemSize, Alignment>` axes and a pool header of
+explicit `Slab<ElemSize, Alignment>` alignment classes and a pool header of
 `max(8, alignment)`, so high-align traffic does not share a layout that cannot
-recover axis and slot base on free.
+recover alignment class and slot base on free.
 
 **Synchronization note:** allocation APIs must be thread-safe. Roy's samples
 often use `std::mutex` and warn that lock cost on free can erase gains. This
@@ -757,8 +767,19 @@ More design detail:
 
 ---
 
+## Terminology
+
+Locked stack: **Pool** → **Slab** (size-class engine) → **Block** (mapped chunk)
+→ **Slot**. **Item** = external/backend allocation name (`allocateItem`); for a
+`Slab` that Item is a **slot base**. Lifetime: `PoolLifetimeToken`;
+`PoolControlBlock` kept. Full glossary:
+[terminology-glossary.md](terminology-glossary.md).
+
+---
+
 ## Further reading
 
+- [terminology-glossary.md](terminology-glossary.md) — locked Pool / Slab / Block / Slot vocabulary  
 - Patrice Roy - *C++ Memory Management* (Packt, 2025), especially Ch. 10
   (arenas / chunked pools), Ch. 11 (deferred reclamation), and Ch. 14
   (traditional allocators and PMR). Sample code:

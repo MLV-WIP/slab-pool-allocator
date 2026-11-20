@@ -273,11 +273,11 @@ TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
     // a free slot *behind* it must not win the next allocate — otherwise LIFO
     // churn re-scans the front of the freemap every time.
     //
-    // Slot indices are derived from selectBufferSize<>() so the scenario stays
+    // Slot indices are derived from selectBlockSize<>() so the scenario stays
     // valid across kSlabTargetBytes / multiplier configure knobs (old tests
     // hard-coded 200/50 for a 256-slot 4 KiB buffer).
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
+    constexpr std::size_t kSlots = selectBlockSize<16>() / 16;
     static_assert(kSlots >= 16);
     constexpr std::size_t kCursor = kSlots / 2;
     constexpr std::size_t kEarlier = kCursor / 4;
@@ -296,7 +296,7 @@ TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
     std::byte* next = slab.allocateItem(16);
     EXPECT_EQ(next, base + kCursor * 16); // continues forward, ignores hole
     items.push_back(next);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 
     for (auto* p : items)
     {
@@ -317,7 +317,7 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
     // Fill the whole buffer, park the cursor near the end, free a low slot,
     // then prove the next alloc returns that low slot without adding a buffer.
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
+    constexpr std::size_t kSlots = selectBlockSize<16>() / 16;
     static_assert(kSlots >= 16);
     constexpr std::size_t kHigh = kSlots - 6;
     constexpr std::size_t kLow = 10;
@@ -327,7 +327,7 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
     {
         items.push_back(slab.allocateItem(16));
     }
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     std::byte* const base = items.front();
 
     // Re-take kHigh so the cursor sits at kHigh + 1 (past the only soon-free hole).
@@ -340,7 +340,7 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
 
     std::byte* wrapped = slab.allocateItem(16);
     EXPECT_EQ(wrapped, base + kLow * 16);
-    EXPECT_EQ(slab.getSlabCount(), 1u); // wrap, do not grow
+    EXPECT_EQ(slab.getBlockCount(), 1u); // wrap, do not grow
     items[kLow] = wrapped;
 
     for (auto* p : items)
@@ -352,25 +352,25 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
 
 TEST(SlabTest, NextFitSurvivesReclaim)
 {
-    // Why: reclaimEmptySlabs swap-with-last invalidates buffer indices, so the
+    // Why: reclaimEmptyBlocks swap-with-last invalidates Block indices, so the
     // next-fit cursor must be reset. After growing to two buffers, freeing all,
     // and reclaiming one, alloc/free on the survivor must still work.
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
+    constexpr std::size_t kSlots = selectBlockSize<16>() / 16;
     std::vector<std::byte*> items;
     items.reserve(kSlots + 1);
     for (std::size_t i = 0; i < kSlots + 1; ++i)
     {
         items.push_back(slab.allocateItem(16));
     }
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
 
     for (auto* p : items)
     {
         slab.deallocateItem(p);
     }
-    EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.reclaimEmptyBlocks(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 
     auto* p = slab.allocateItem(16);
     ASSERT_NE(p, nullptr);
@@ -383,10 +383,10 @@ TEST(SlabTest, NextFitSurvivesReclaim)
 // not in this suite. Prefer BUILD_TYPE=release for any timing numbers.
 TEST(SlabTest, AllocFreeChurnMicrobench)
 {
-    // Warm a full buffer then LIFO churn; slot count follows selectBufferSize
+    // Warm a full buffer then LIFO churn; slot count follows selectBlockSize
     // so the warm-up still saturates exactly one buffer under any packing knobs.
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = selectBufferSize<16>() / 16;
+    constexpr std::size_t kSlots = selectBlockSize<16>() / 16;
 #if defined(NDEBUG)
     constexpr int kIters = 500000;
 #else
@@ -420,19 +420,19 @@ TEST(SlabTest, AllocFreeChurnMicrobench)
     RecordProperty("total_ms", static_cast<int>(ns / 1'000'000));
     RecordProperty("ns_per_alloc_free", static_cast<int>(ns_per_op));
     // Sanity: churn must complete and stay on the warmed single buffer.
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     EXPECT_GT(ns, 0);
 }
 
 
-TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
+TEST(SlabTest, ReclaimEmptyBlocksReturnsBuffers)
 {
     // Why: empty buffers are retained by default (monotonic growth); reclaim
-    // must drop extras while keeping ≥ keep_min. Capacity is selectBufferSize
+    // must drop extras while keeping ≥ keep_min. Capacity is selectBlockSize
     // based so “fill one buffer + 1” still forces a second buffer after packing.
     Slab<16, 16> slab(/*preallocate_first_block=*/true);
-    constexpr std::size_t kSlotsPerSlab = selectBufferSize<16>() / 16;
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    constexpr std::size_t kSlotsPerSlab = selectBlockSize<16>() / 16;
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     const std::size_t baseline = slab.getAllocatedMemory();
 
     std::vector<std::byte*> items;
@@ -441,7 +441,7 @@ TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
     {
         items.push_back(slab.allocateItem(16));
     }
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
     EXPECT_EQ(slab.getAllocatedMemory(), baseline * 2);
 
     for (auto* p : items)
@@ -449,11 +449,11 @@ TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
         slab.deallocateItem(p);
     }
     // Monotonic by default: empty slabs stay until reclaim.
-    EXPECT_EQ(slab.getSlabCount(), 2u);
-    EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
+    EXPECT_EQ(slab.reclaimEmptyBlocks(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     EXPECT_EQ(slab.getAllocatedMemory(), baseline);
-    EXPECT_EQ(slab.reclaimEmptySlabs(), 0u);
+    EXPECT_EQ(slab.reclaimEmptyBlocks(), 0u);
 
     // Live allocations block reclaim of their slab.
     auto* live = slab.allocateItem(16);
@@ -462,13 +462,13 @@ TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
     {
         items.push_back(slab.allocateItem(16));
     }
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
     for (auto* p : items)
     {
         slab.deallocateItem(p);
     }
-    EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.reclaimEmptyBlocks(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     slab.deallocateItem(live);
 }
 
@@ -670,8 +670,8 @@ TEST(PoolTest, StatsTracksAllocFreeAndLiveHwm)
     EXPECT_EQ(empty.free_ok, 0u);
     EXPECT_EQ(empty.free_fail, 0u);
     EXPECT_EQ(empty.live_hwm, 0u);
-    EXPECT_GE(empty.retained_slab_bytes, 0u);
-    EXPECT_GE(empty.retained_hwm, empty.retained_slab_bytes);
+    EXPECT_GE(empty.retained_mapped_bytes, 0u);
+    EXPECT_GE(empty.retained_hwm, empty.retained_mapped_bytes);
 
     auto* a = pool.allocate(16);
     auto* b = pool.allocate(16);
@@ -679,7 +679,7 @@ TEST(PoolTest, StatsTracksAllocFreeAndLiveHwm)
     EXPECT_EQ(mid.live_allocations, 2u);
     EXPECT_EQ(mid.alloc_ok, 2u);
     EXPECT_EQ(mid.live_hwm, 2u);
-    EXPECT_GE(mid.retained_hwm, mid.retained_slab_bytes);
+    EXPECT_GE(mid.retained_hwm, mid.retained_mapped_bytes);
 
     pool.deallocate(a);
     PoolStats after_one = pool.stats();
@@ -791,12 +791,12 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
 {
     // Why: Pool::trim is the ops path to return peak RSS after load drops.
     // Grow the 32 B size class past one buffer, free everything, then trim
-    // back to the eager baseline. Slot count uses selectBufferSize<32>().
+    // back to the eager baseline. Slot count uses selectBlockSize<32>().
     Pool pool;
     const std::size_t before = pool.getAllocatedMemory();
 
-    // allocate(16) → footprint 24 → 32 B class on axis 16.
-    constexpr std::size_t kSlotsPerSlab = selectBufferSize<32>() / 32;
+    // allocate(16) → footprint 24 → 32 B class on alignment class 16.
+    constexpr std::size_t kSlotsPerSlab = selectBlockSize<32>() / 32;
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab + 1; ++i)
@@ -818,18 +818,18 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
 
 TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
 {
-    // Why: DynBitset must stay tiny vs the old fixed bitset<max_slabs>
+    // Why: DynBitset must stay tiny vs the old fixed bitset<max_blocks>
     // (~128 KiB when buffers were 4 KiB). Filling one packed buffer + 1 forces
     // a second live slab so we also check the map grows with live count only.
     constexpr std::size_t kLegacyFixedBytes = 128_KB;
 
     Slab<16, 16> slab(/*preallocate_first_block=*/true);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     EXPECT_GT(slab.getAvailabilityMapBytes(), 0u);
     EXPECT_LT(slab.getAvailabilityMapBytes(), kLegacyFixedBytes);
     EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
 
-    constexpr std::size_t kSlotsPerSlab = selectBufferSize<16>() / 16;
+    constexpr std::size_t kSlotsPerSlab = selectBlockSize<16>() / 16;
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab; ++i)
@@ -837,9 +837,9 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
         items.push_back(slab.allocateItem(16));
         ASSERT_NE(items.back(), nullptr);
     }
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     items.push_back(slab.allocateItem(16));
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
     EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
 
     for (auto* p : items)
@@ -849,38 +849,38 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
 }
 
 
-TEST(SlabTest, SelectBufferSizeExactPackAndFloors)
+TEST(SlabTest, SelectBlockSizeExactPackAndFloors)
 {
     // Why: buffer packing must leave zero unused tail bytes (old fixed 4 KiB
     // buffers wasted up to 6.25% on 384/768) and honor both knobs:
     //   slots = max(kSlabTargetMultiplier, kSlabTargetBytes / ElemSize)
     //   buffer = slots * ElemSize
     // Classes below were the worst historical tails under 4 KiB buffers.
-    EXPECT_EQ(selectBufferSize<48>() % 48u, 0u);
-    EXPECT_EQ(selectBufferSize<96>() % 96u, 0u);
-    EXPECT_EQ(selectBufferSize<192>() % 192u, 0u);
-    EXPECT_EQ(selectBufferSize<384>() % 384u, 0u);
-    EXPECT_EQ(selectBufferSize<768>() % 768u, 0u);
+    EXPECT_EQ(selectBlockSize<48>() % 48u, 0u);
+    EXPECT_EQ(selectBlockSize<96>() % 96u, 0u);
+    EXPECT_EQ(selectBlockSize<192>() % 192u, 0u);
+    EXPECT_EQ(selectBlockSize<384>() % 384u, 0u);
+    EXPECT_EQ(selectBlockSize<768>() % 768u, 0u);
 
     // Soft target wins when target/ElemSize > multiplier (may be slightly
     // under kSlabTargetBytes for odd ElemSize — that is intentional exact pack).
-    EXPECT_EQ(selectBufferSize<16>(),
+    EXPECT_EQ(selectBlockSize<16>(),
               (kSlabTargetBytes / 16) * 16);
-    EXPECT_EQ(selectBufferSize<48>(),
+    EXPECT_EQ(selectBlockSize<48>(),
               (kSlabTargetBytes / 48) * 48);
-    EXPECT_EQ(selectBufferSize<384>(),
+    EXPECT_EQ(selectBlockSize<384>(),
               (kSlabTargetBytes / 384) * 384);
 
     // Hard floor: large classes must not starve at 4 slots (old ElemSize*4);
     // they get exactly kSlabTargetMultiplier slots.
-    EXPECT_EQ(selectBufferSize<1_KB>(), kSlabTargetMultiplier * 1_KB);
-    EXPECT_EQ(selectBufferSize<4096>(), kSlabTargetMultiplier * 4096u);
+    EXPECT_EQ(selectBlockSize<1_KB>(), kSlabTargetMultiplier * 1_KB);
+    EXPECT_EQ(selectBlockSize<4096>(), kSlabTargetMultiplier * 4096u);
 
     // Slab<> must publish the same size the freemap/bitset was compiled with.
     Slab<48, 16> s48;
     Slab<384, 16> s384;
-    EXPECT_EQ(s48.getAllocSize(), selectBufferSize<48>());
-    EXPECT_EQ(s384.getAllocSize(), selectBufferSize<384>());
+    EXPECT_EQ(s48.getAllocSize(), selectBlockSize<48>());
+    EXPECT_EQ(s384.getAllocSize(), selectBlockSize<384>());
     EXPECT_EQ(s48.getAllocSize() / 48u, kSlabTargetBytes / 48u);
     EXPECT_GE(s384.getAllocSize() / 384u, kSlabTargetMultiplier);
 }
@@ -888,54 +888,54 @@ TEST(SlabTest, SelectBufferSizeExactPackAndFloors)
 
 TEST(SlabTest, CreateSlabs)
 {
-    // Smoke: getAllocSize/getAllocatedMemory match selectBufferSize for a
+    // Smoke: getAllocSize/getAllocatedMemory match selectBlockSize for a
     // cross-section of classes, including multiplier-floored large sizes and
     // an odd ElemSize that is not a KiB multiple (KB-multiple assert removed).
     // Pass preallocate_first_block=true so cold engines report one data block.
     {
         Slab<64> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 64u);
-        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<64>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<64>());
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<64>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<64>());
         EXPECT_EQ(slab.getAllocSize() % 64u, 0u);
     }
 
     {
         Slab<128> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 128u);
-        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<128>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<128>());
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<128>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<128>());
     }
 
     {
         Slab<1_KB> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 1_KB);
-        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<1_KB>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<1_KB>());
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<1_KB>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<1_KB>());
         EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 1_KB);
     }
 
     {
         Slab<2_KB> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 2_KB);
-        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<2_KB>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<2_KB>());
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<2_KB>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<2_KB>());
         EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 2_KB);
     }
 
     {
         Slab<16_KB> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 16_KB);
-        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<16_KB>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<16_KB>());
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<16_KB>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<16_KB>());
         EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 16_KB);
     }
 
     {
         Slab<12336> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 12336u);
-        EXPECT_EQ(slab.getAllocSize(), selectBufferSize<12336>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<12336>());
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<12336>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<12336>());
         EXPECT_EQ(slab.getAllocSize() % 12336u, 0u);
     }
 
@@ -947,25 +947,25 @@ TEST(SlabTest, ZeroBlockEngineGrowsOnFirstAlloc)
     // Why: Pool leaves large / high-align engines empty until first use.
     // allocateItem must create the first data block without a prior warm map.
     Slab<512, 16> slab(/*preallocate_first_block=*/false);
-    EXPECT_EQ(slab.getSlabCount(), 0u);
+    EXPECT_EQ(slab.getBlockCount(), 0u);
     EXPECT_EQ(slab.getAllocatedMemory(), 0u);
 
     auto* p = slab.allocateItem(512);
     ASSERT_NE(p, nullptr);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
-    EXPECT_EQ(slab.getAllocatedMemory(), selectBufferSize<512>());
+    EXPECT_EQ(slab.getBlockCount(), 1u);
+    EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<512>());
 
     slab.deallocateItem(p);
-    EXPECT_EQ(slab.getSlabCount(), 1u); // monotonic until reclaim
-    EXPECT_EQ(slab.reclaimEmptySlabs(/*keep_min=*/1), 0u);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u); // monotonic until reclaim
+    EXPECT_EQ(slab.reclaimEmptyBlocks(/*keep_min=*/1), 0u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 }
 
 
 TEST(PoolTest, ColdRetainedMatchesPreallocatePolicy)
 {
-    // Why: default policy warms axis-16 classes with ElemSize <= 256 only;
-    // larger axis-16 rungs and all 32/64 engines start with zero data blocks.
+    // Why: default policy warms alignment-class-16 classes with ElemSize <= 256 only;
+    // larger alignment-class-16 rungs and all 32/64 engines start with zero data blocks.
     // Guarding the knobs documents the contract for -D overrides.
     EXPECT_TRUE(shouldPreallocateFirstBlock(256, 16));
     EXPECT_FALSE(shouldPreallocateFirstBlock(384, 16));
@@ -975,15 +975,15 @@ TEST(PoolTest, ColdRetainedMatchesPreallocatePolicy)
     EXPECT_EQ(kPreallocateMaxAlignment, 16u);
 
     constexpr std::size_t expected =
-        selectBufferSize<16>() + selectBufferSize<32>() + selectBufferSize<48>() +
-        selectBufferSize<64>() + selectBufferSize<96>() + selectBufferSize<128>() +
-        selectBufferSize<192>() + selectBufferSize<256>();
+        selectBlockSize<16>() + selectBlockSize<32>() + selectBlockSize<48>() +
+        selectBlockSize<64>() + selectBlockSize<96>() + selectBlockSize<128>() +
+        selectBlockSize<192>() + selectBlockSize<256>();
 
     Pool pool;
     EXPECT_EQ(pool.getAllocatedMemory(), expected);
 
-    // Touch a cold large axis-16 class and a high-align class; both grow on demand.
-    auto* large = pool.allocate(400); // footprint 408 → 512B axis 16
+    // Touch a cold large alignment-class-16 class and a high-align class; both grow on demand.
+    auto* large = pool.allocate(400); // footprint 408 → 512B alignment class 16
     ASSERT_NE(large, nullptr);
     EXPECT_GT(pool.getAllocatedMemory(), expected);
     pool.deallocate(large);
@@ -999,13 +999,13 @@ TEST(SlabTest, AllocateItems)
 {
     // Why: growth must happen only after a buffer is full, and retained empty
     // buffers stay mapped until trim/reclaim (monotonic). Drive fills from
-    // selectBufferSize so expectations track packing knobs.
+    // selectBlockSize so expectations track packing knobs.
     Slab<128> slab(/*preallocate_first_block=*/true);
 
-    constexpr std::size_t kBuf = selectBufferSize<128>();
+    constexpr std::size_t kBuf = selectBlockSize<128>();
     constexpr std::size_t kSlots = kBuf / 128;
     EXPECT_EQ(slab.getAllocatedMemory(), kBuf);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 
     std::vector<std::byte*> items;
     items.reserve(2 * kSlots + 1);
@@ -1015,21 +1015,21 @@ TEST(SlabTest, AllocateItems)
         EXPECT_NE(p, nullptr);
         items.push_back(p);
     }
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 
     // One past capacity → second buffer.
     items.push_back(slab.allocateItem(120));
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
     EXPECT_EQ(slab.getAllocatedMemory(), 2 * kBuf);
 
     for (std::size_t i = 1; i < kSlots; ++i)
     {
         items.push_back(slab.allocateItem(120));
     }
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
 
     items.push_back(slab.allocateItem(120));
-    EXPECT_EQ(slab.getSlabCount(), 3u);
+    EXPECT_EQ(slab.getBlockCount(), 3u);
     EXPECT_EQ(slab.getAllocatedMemory(), 3 * kBuf);
 
     for (auto* p : items)
@@ -1116,76 +1116,76 @@ TEST(PoolTest, Selector)
 {
     Pool pool;
 
-    // Default selectSlab(size) ⇒ axis 16
-    EXPECT_EQ(pool.selectSlab(16), 0u);
-    EXPECT_EQ(pool.selectSlab(32), 1u);
-    EXPECT_EQ(pool.selectSlab(48), 2u);
-    EXPECT_EQ(pool.selectSlab(64), 3u);
-    EXPECT_EQ(pool.selectSlab(96), 4u);
-    EXPECT_EQ(pool.selectSlab(128), 5u);
-    EXPECT_EQ(pool.selectSlab(192), 6u);
-    EXPECT_EQ(pool.selectSlab(256), 7u);
-    EXPECT_EQ(pool.selectSlab(384), 8u);
-    EXPECT_EQ(pool.selectSlab(512), 9u);
-    EXPECT_EQ(pool.selectSlab(768), 10u);
-    EXPECT_EQ(pool.selectSlab(1024), 11u);
-    EXPECT_EQ(pool.selectSlab(1500), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(pool.selectSlab(2000), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(pool.selectSlab(3000), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(pool.selectSlab(4000), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(pool.selectSlab(5000), std::numeric_limits<std::size_t>::max());
+    // Default selectClassIndex(size, kSlabNativeAlignment) ⇒ class 16
+    EXPECT_EQ(selectClassIndex(16, kSlabNativeAlignment), 0u);
+    EXPECT_EQ(selectClassIndex(32, kSlabNativeAlignment), 1u);
+    EXPECT_EQ(selectClassIndex(48, kSlabNativeAlignment), 2u);
+    EXPECT_EQ(selectClassIndex(64, kSlabNativeAlignment), 3u);
+    EXPECT_EQ(selectClassIndex(96, kSlabNativeAlignment), 4u);
+    EXPECT_EQ(selectClassIndex(128, kSlabNativeAlignment), 5u);
+    EXPECT_EQ(selectClassIndex(192, kSlabNativeAlignment), 6u);
+    EXPECT_EQ(selectClassIndex(256, kSlabNativeAlignment), 7u);
+    EXPECT_EQ(selectClassIndex(384, kSlabNativeAlignment), 8u);
+    EXPECT_EQ(selectClassIndex(512, kSlabNativeAlignment), 9u);
+    EXPECT_EQ(selectClassIndex(768, kSlabNativeAlignment), 10u);
+    EXPECT_EQ(selectClassIndex(1024, kSlabNativeAlignment), 11u);
+    EXPECT_EQ(selectClassIndex(1500, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(2000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(3000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(4000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(5000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
 
-    EXPECT_EQ(pool.selectSlab(1), 0u);
-    EXPECT_EQ(pool.selectSlab(15), 0u);
-    EXPECT_EQ(pool.selectSlab(17), 1u);
-    EXPECT_EQ(pool.selectSlab(31), 1u);
-    EXPECT_EQ(pool.selectSlab(33), 2u);
-    EXPECT_EQ(pool.selectSlab(47), 2u);
-    EXPECT_EQ(pool.selectSlab(49), 3u);
-    EXPECT_EQ(pool.selectSlab(63), 3u);
-    EXPECT_EQ(pool.selectSlab(65), 4u);
-    EXPECT_EQ(pool.selectSlab(95), 4u);
-    EXPECT_EQ(pool.selectSlab(97), 5u);
-    EXPECT_EQ(pool.selectSlab(127), 5u);
-    EXPECT_EQ(pool.selectSlab(129), 6u);
-    EXPECT_EQ(pool.selectSlab(191), 6u);
-    EXPECT_EQ(pool.selectSlab(193), 7u);
-    EXPECT_EQ(pool.selectSlab(255), 7u);
-    EXPECT_EQ(pool.selectSlab(257), 8u);
-    EXPECT_EQ(pool.selectSlab(383), 8u);
-    EXPECT_EQ(pool.selectSlab(385), 9u);
-    EXPECT_EQ(pool.selectSlab(511), 9u);
-    EXPECT_EQ(pool.selectSlab(513), 10u);
-    EXPECT_EQ(pool.selectSlab(767), 10u);
-    EXPECT_EQ(pool.selectSlab(769), 11u);
-    EXPECT_EQ(pool.selectSlab(1023), 11u);
-    EXPECT_EQ(pool.selectSlab(1025), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(1, kSlabNativeAlignment), 0u);
+    EXPECT_EQ(selectClassIndex(15, kSlabNativeAlignment), 0u);
+    EXPECT_EQ(selectClassIndex(17, kSlabNativeAlignment), 1u);
+    EXPECT_EQ(selectClassIndex(31, kSlabNativeAlignment), 1u);
+    EXPECT_EQ(selectClassIndex(33, kSlabNativeAlignment), 2u);
+    EXPECT_EQ(selectClassIndex(47, kSlabNativeAlignment), 2u);
+    EXPECT_EQ(selectClassIndex(49, kSlabNativeAlignment), 3u);
+    EXPECT_EQ(selectClassIndex(63, kSlabNativeAlignment), 3u);
+    EXPECT_EQ(selectClassIndex(65, kSlabNativeAlignment), 4u);
+    EXPECT_EQ(selectClassIndex(95, kSlabNativeAlignment), 4u);
+    EXPECT_EQ(selectClassIndex(97, kSlabNativeAlignment), 5u);
+    EXPECT_EQ(selectClassIndex(127, kSlabNativeAlignment), 5u);
+    EXPECT_EQ(selectClassIndex(129, kSlabNativeAlignment), 6u);
+    EXPECT_EQ(selectClassIndex(191, kSlabNativeAlignment), 6u);
+    EXPECT_EQ(selectClassIndex(193, kSlabNativeAlignment), 7u);
+    EXPECT_EQ(selectClassIndex(255, kSlabNativeAlignment), 7u);
+    EXPECT_EQ(selectClassIndex(257, kSlabNativeAlignment), 8u);
+    EXPECT_EQ(selectClassIndex(383, kSlabNativeAlignment), 8u);
+    EXPECT_EQ(selectClassIndex(385, kSlabNativeAlignment), 9u);
+    EXPECT_EQ(selectClassIndex(511, kSlabNativeAlignment), 9u);
+    EXPECT_EQ(selectClassIndex(513, kSlabNativeAlignment), 10u);
+    EXPECT_EQ(selectClassIndex(767, kSlabNativeAlignment), 10u);
+    EXPECT_EQ(selectClassIndex(769, kSlabNativeAlignment), 11u);
+    EXPECT_EQ(selectClassIndex(1023, kSlabNativeAlignment), 11u);
+    EXPECT_EQ(selectClassIndex(1025, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
 
-    // Align 4/8 map to axis 16
-    EXPECT_EQ(nativeAxis(4), 16u);
-    EXPECT_EQ(nativeAxis(8), 16u);
-    EXPECT_EQ(nativeAxis(16), 16u);
-    EXPECT_EQ(nativeAxis(32), 32u);
-    EXPECT_EQ(nativeAxis(64), 64u);
-    EXPECT_EQ(pool.selectSlab(64, 8), pool.selectSlab(64));
-    EXPECT_EQ(pool.selectSlab(64, 4), pool.selectSlab(64));
+    // Align 4/8 map to alignment class 16
+    EXPECT_EQ(nativeAlignmentClass(4), 16u);
+    EXPECT_EQ(nativeAlignmentClass(8), 16u);
+    EXPECT_EQ(nativeAlignmentClass(16), 16u);
+    EXPECT_EQ(nativeAlignmentClass(32), 32u);
+    EXPECT_EQ(nativeAlignmentClass(64), 64u);
+    EXPECT_EQ(selectClassIndex(64, nativeAlignmentClass(8)), selectClassIndex(64, kSlabNativeAlignment));
+    EXPECT_EQ(selectClassIndex(64, nativeAlignmentClass(4)), selectClassIndex(64, kSlabNativeAlignment));
 
-    // Explicit axis 32 ladder (incl. denser top)
-    EXPECT_EQ(pool.selectSlab(32, 32), 0u);
-    EXPECT_EQ(pool.selectSlab(96, 32), 2u);
-    EXPECT_EQ(pool.selectSlab(1024, 32), 9u);
-    EXPECT_EQ(pool.selectSlab(1536, 32), 10u);
-    EXPECT_EQ(pool.selectSlab(2048, 32), 11u);
-    EXPECT_EQ(pool.selectSlab(2049, 32), std::numeric_limits<std::size_t>::max());
+    // Explicit alignment-class-32 ladder (incl. denser top)
+    EXPECT_EQ(selectClassIndex(32, 32), 0u);
+    EXPECT_EQ(selectClassIndex(96, 32), 2u);
+    EXPECT_EQ(selectClassIndex(1024, 32), 9u);
+    EXPECT_EQ(selectClassIndex(1536, 32), 10u);
+    EXPECT_EQ(selectClassIndex(2048, 32), 11u);
+    EXPECT_EQ(selectClassIndex(2049, 32), std::numeric_limits<std::size_t>::max());
 
-    // Explicit axis 64 ladder
-    EXPECT_EQ(pool.selectSlab(64, 64), 0u);
-    EXPECT_EQ(pool.selectSlab(1024, 64), 7u);
-    EXPECT_EQ(pool.selectSlab(1536, 64), 8u);
-    EXPECT_EQ(pool.selectSlab(2048, 64), 9u);
-    EXPECT_EQ(pool.selectSlab(3072, 64), 10u);
-    EXPECT_EQ(pool.selectSlab(4096, 64), 11u);
-    EXPECT_EQ(pool.selectSlab(4097, 64), std::numeric_limits<std::size_t>::max());
+    // Explicit alignment-class-64 ladder
+    EXPECT_EQ(selectClassIndex(64, 64), 0u);
+    EXPECT_EQ(selectClassIndex(1024, 64), 7u);
+    EXPECT_EQ(selectClassIndex(1536, 64), 8u);
+    EXPECT_EQ(selectClassIndex(2048, 64), 9u);
+    EXPECT_EQ(selectClassIndex(3072, 64), 10u);
+    EXPECT_EQ(selectClassIndex(4096, 64), 11u);
+    EXPECT_EQ(selectClassIndex(4097, 64), std::numeric_limits<std::size_t>::max());
 }
 
 
@@ -1308,7 +1308,7 @@ TEST(PoolMemoryResourceTest, ArenaAllocateThrowsDeallocateNoops)
         PoolMemoryResource live(pool);
         dangling = live.allocate(32, 8);
         EXPECT_NE(dangling, nullptr);
-        return PoolMemoryResource(pool.block_token());
+        return PoolMemoryResource(pool.lifetime_token());
     }()};
 
     // Pool already destroyed; token observes !alive.
@@ -1718,7 +1718,7 @@ TEST(PoolTest, HighAlignmentFactories)
 }
 
 
-// High-align size classes reuse slots; over-axis-max uses SlabProxy.
+// High-align size classes reuse slots; over-alignment-class-max uses SlabProxy.
 TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
 {
     Pool pool;
@@ -1735,7 +1735,7 @@ TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
         pool.deallocate(p);
     }
 
-    // Re-allocate into the same axis-64 size class (engine was eager; block may
+    // Re-allocate into the same alignment-class-64 size class (engine was eager; block may
     // have been created on the first round).
     for (int i = 0; i < 32; ++i)
     {
@@ -1744,7 +1744,7 @@ TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
         pool.deallocate(p);
     }
 
-    // Footprint > 4096 on axis 64 → Proxy (still 64-byte aligned storage).
+    // Footprint > 4096 on alignment class 64 → Proxy (still 64-byte aligned storage).
     auto* big = pool.allocate(4100, 64);
     EXPECT_NE(big, nullptr);
     EXPECT_EQ(reinterpret_cast<std::uintptr_t>(big) % 64, 0u);

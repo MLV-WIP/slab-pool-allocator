@@ -60,9 +60,9 @@ namespace spallocator
 
     // Alignment contract for Pool::allocate:
     // - Powers of two in [kMinAlignment, kMaxAlignment]
-    // - Request aligns 4/8 map to native axis 16 (slot over-align is fine)
-    // - Axes 16 / 32 / 64 use Slab<ElemSize, Alignment> size ladders
-    // - Beyond that axis's max footprint → SlabProxy (always align_val_t{64})
+    // - Request aligns 4/8 map to native alignment class 16 (slot over-align is fine)
+    // - Alignment classes 16 / 32 / 64 use Slab<ElemSize, Alignment> size ladders
+    // - Beyond that alignment class's max footprint → SlabProxy (always align_val_t{64})
     // - Returned memory is exclusively owned until matching deallocate;
     //   do not free non-pool pointers or mutate the hidden header
     inline constexpr std::size_t kMinAlignment = 4;
@@ -87,8 +87,8 @@ namespace spallocator
         sizeof(kLadder64) / sizeof(kLadder64[0]);
 
     // Pool cold-start: which size-class engines map a first data block in
-    // Pool(). Engines for every axis are always constructed (immutable
-    // registries → lock-free resolve). Override via -D / ./configure.
+    // Pool(). Engines for every alignment class are always constructed (immutable
+    // for the pool lifetime → lock-free resolve). Override via -D / ./configure.
 #ifndef SPALLOCATOR_PREALLOCATE_MAX_ELEM_SIZE
 #  define SPALLOCATOR_PREALLOCATE_MAX_ELEM_SIZE 256u
 #endif
@@ -107,8 +107,8 @@ namespace spallocator
         "kPreallocateMaxAlignment must be 16, 32, or 64");
 
     // Preallocate a first data block when both thresholds pass (ElemSize is
-    // the ladder rung; Alignment is the slab axis). Default: axis 16 and
-    // ElemSize <= 256. Raise max alignment to also warm 32/64 axes.
+    // the ladder rung; Alignment is the alignment class). Default: alignment class 16 and
+    // ElemSize <= 256. Raise max alignment to also warm 32/64 classes.
     constexpr bool shouldPreallocateFirstBlock(std::size_t elem_size,
                                                std::size_t alignment) noexcept
     {
@@ -117,15 +117,15 @@ namespace spallocator
     }
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    inline std::unique_ptr<AbstractSlab> makePoolSlab()
+    inline std::unique_ptr<ISlab> makePoolSlab()
     {
         constexpr bool pre =
             shouldPreallocateFirstBlock(ElemSize, Alignment);
         return std::make_unique<Slab<ElemSize, Alignment>>(pre);
     }
 
-    // Map request alignment to a native slab axis (4/8 → 16).
-    constexpr std::size_t nativeAxis(std::size_t alignment)
+    // Map request alignment to a native alignment class (4/8 → 16).
+    constexpr std::size_t nativeAlignmentClass(std::size_t alignment)
     {
         if (alignment <= kSlabNativeAlignment)
         {
@@ -134,29 +134,29 @@ namespace spallocator
         return alignment;
     }
 
-    constexpr std::size_t axisMaxElem(std::size_t axis)
+    constexpr std::size_t alignmentClassMaxElem(std::size_t alignment_class)
     {
-        if (axis <= kSlabNativeAlignment)
+        if (alignment_class <= kSlabNativeAlignment)
         {
             return 1024;
         }
-        if (axis == 32)
+        if (alignment_class == 32)
         {
             return 2048;
         }
-        return 4096; // axis 64
+        return 4096; // alignment class 64
     }
 
-    constexpr std::size_t selectClassIndex(std::size_t alloc_size, std::size_t axis)
+    constexpr std::size_t selectClassIndex(std::size_t alloc_size, std::size_t alignment_class)
     {
         const std::size_t* ladder = nullptr;
         std::size_t count = 0;
-        if (axis <= kSlabNativeAlignment)
+        if (alignment_class <= kSlabNativeAlignment)
         {
             ladder = kLadder16;
             count = kLadder16Count;
         }
-        else if (axis == 32)
+        else if (alignment_class == 32)
         {
             ladder = kLadder32;
             count = kLadder32Count;
@@ -192,13 +192,13 @@ namespace spallocator
     struct PoolStats
     {
         std::uint64_t live_allocations{0};     // outstanding successful allocs
-        std::uint64_t retained_slab_bytes{0};  // size-class buffers held (not "in use")
+        std::uint64_t retained_mapped_bytes{0};  // mapped Block bytes held (not live "in use")
         std::uint64_t alloc_ok{0};             // 0 unless kPoolCountersEnabled
         std::uint64_t alloc_fail{0};           // size/align/cap/slab throws
         std::uint64_t free_ok{0};              // successful non-null frees
         std::uint64_t free_fail{0};            // try_deallocate returned false
         std::uint64_t live_hwm{0};             // peak live_allocations (relaxed max)
-        std::uint64_t retained_hwm{0};         // peak retained_slab_bytes observed
+        std::uint64_t retained_hwm{0};         // peak retained_mapped_bytes observed
     };
 
 
@@ -233,16 +233,14 @@ namespace spallocator
         PoolHandle handle();
 
         // Deleter/allocator token (block_refs only).
-        PoolBlockToken block_token();
+        PoolLifetimeToken lifetime_token();
 
         PoolControlBlock* control() const noexcept { return control_; }
 
         Pool();
         ~Pool();
 
-        // Default: axis 16. Pass alignment (or use selectClassIndex) for 32/64.
-        constexpr std::size_t selectSlab(std::size_t size) const { return selectClassIndex(size, kSlabNativeAlignment); }
-        constexpr std::size_t selectSlab(std::size_t size, std::size_t alignment) const { return selectClassIndex(size, nativeAxis(alignment)); }
+        // Class selection: use free function selectClassIndex(footprint, alignment_class).
 
     private: // methods
         Pool(const Pool&) = delete;
@@ -250,7 +248,7 @@ namespace spallocator
         Pool(Pool&&) = delete;
         Pool& operator=(Pool&&) = delete;
 
-        AbstractSlab* resolveSlab(std::size_t alloc_size, std::size_t axis);
+        ISlab* resolveSlab(std::size_t alloc_size, std::size_t alignment_class);
 
         void note_alloc_ok() noexcept;
         void note_alloc_fail() noexcept;
@@ -270,13 +268,13 @@ namespace spallocator
         PoolControlBlock* control_{nullptr};
 
         // Eager, immutable registries: every ladder rung is installed in
-        // Pool() and never replaced/nulled. Resolve is lock-free on all axes;
+        // Pool() and never replaced/nulled. Resolve is lock-free on all alignment classes;
         // per-slab locks still protect freemaps / data-block growth.
         // Whether a class maps a first data block at birth is controlled by
         // kPreallocateMaxElemSize / kPreallocateMaxAlignment.
-        std::array<std::unique_ptr<AbstractSlab>, kLadder16Count> slabs16{};
-        std::array<std::unique_ptr<AbstractSlab>, kLadder32Count> slabs32{};
-        std::array<std::unique_ptr<AbstractSlab>, kLadder64Count> slabs64{};
+        std::array<std::unique_ptr<ISlab>, kLadder16Count> slabs16{};
+        std::array<std::unique_ptr<ISlab>, kLadder32Count> slabs32{};
+        std::array<std::unique_ptr<ISlab>, kLadder64Count> slabs64{};
         SlabProxy large_slab;
 
 #if SPALLOCATOR_POOL_COUNTERS
@@ -318,22 +316,22 @@ namespace spallocator
     // Pool
     // ---------------------------------------------------------------------------
 
-    inline AbstractSlab* Pool::resolveSlab(std::size_t alloc_size, std::size_t axis)
+    inline ISlab* Pool::resolveSlab(std::size_t alloc_size, std::size_t alignment_class)
     {
-        const std::size_t index = selectClassIndex(alloc_size, axis);
+        const std::size_t index = selectClassIndex(alloc_size, alignment_class);
         if (index == kSlabIndexNpos)
         {
             return &large_slab;
         }
 
-        // All axis registries are eager and immutable for the pool lifetime.
-        // trim/reclaim only drops empty data blocks inside each engine, never
-        // the unique_ptr slot — so resolve stays lock-free on every axis.
-        if (axis <= kSlabNativeAlignment)
+        // All alignment-class engines are eager and immutable for the pool lifetime.
+        // trim/reclaim only drops empty Blocks inside each engine, never
+        // the unique_ptr entry — so resolve stays lock-free on every class.
+        if (alignment_class <= kSlabNativeAlignment)
         {
             return slabs16[index].get();
         }
-        if (axis == 32)
+        if (alignment_class == 32)
         {
             return slabs32[index].get();
         }
@@ -355,7 +353,7 @@ namespace spallocator
         }
 
         // Range and power-of-two checks throw in all builds (including release).
-        // Non-power-of-two values in [4, 64] (e.g. 12) would break header/axis math.
+        // Non-power-of-two values in [4, 64] (e.g. 12) would break header/alignment-class math.
         if (alignment < kMinAlignment || alignment > kMaxAlignment ||
             (alignment & (alignment - 1)) != 0)
         {
@@ -365,20 +363,20 @@ namespace spallocator
 
         // Store footprint metadata in a header immediately before the user
         // pointer.
-        // header_size = max(8, alignment). For align 4/8 this stays 8 (axis 16);
-        // for 16/32/64 it equals the request align so free can recover the axis.
+        // header_size = max(8, alignment). For align 4/8 this stays 8 (alignment class 16);
+        // for 16/32/64 it equals the request align so free can recover the class.
         // Layout (from user pointer backward): uint32 alloc_size at −4,
         // uint8 header_size at −5, uint8 magic at −6. Deallocate validates
         // magic/size then recovers the slot base and re-selects the slab via
-        // (alloc_size, axis-from-header_size).
+        // (alloc_size, alignment-class-from-header_size).
         std::size_t header_size = 8 < alignment ? alignment : 8;
         std::size_t alloc_size = item_size + header_size;
         alloc.size = alloc_size;
 
-        const std::size_t axis = nativeAxis(alignment);
-        AbstractSlab* slab = resolveSlab(alloc_size, axis);
-        debug_println("Allocated {} bytes, axis={}, slab={}",
-                      alloc_size, axis,
+        const std::size_t alignment_class = nativeAlignmentClass(alignment);
+        ISlab* slab = resolveSlab(alloc_size, alignment_class);
+        debug_println("Allocated {} bytes, alignment_class={}, slab={}",
+                      alloc_size, alignment_class,
                       (slab == &large_slab) ? "large_slab" : "size_class");
 
         try
@@ -494,8 +492,8 @@ namespace spallocator
 
             std::byte* original_ptr = item - header_size;
 
-            // header_size 8 or 16 → axis 16; 32 → 32; 64 → 64.
-            const std::size_t axis = (header_size <= kSlabNativeAlignment)
+            // header_size 8 or 16 → alignment class 16; 32 → 32; 64 → 64.
+            const std::size_t alignment_class = (header_size <= kSlabNativeAlignment)
                 ? kSlabNativeAlignment
                 : static_cast<std::size_t>(header_size);
 
@@ -506,9 +504,9 @@ namespace spallocator
             ASAN_POISON_MEMORY_REGION(original_ptr, header_size);
 #endif
 
-            AbstractSlab* slab = resolveSlab(alloc_size, axis);
-            debug_println("Deallocating {} bytes at ptr={}, axis={}, slab={}",
-                          alloc_size, static_cast<void*>(original_ptr), axis,
+            ISlab* slab = resolveSlab(alloc_size, alignment_class);
+            debug_println("Deallocating {} bytes at ptr={}, alignment_class={}, slab={}",
+                          alloc_size, static_cast<void*>(original_ptr), alignment_class,
                           (slab == &large_slab) ? "large_slab" : "size_class");
             slab->deallocateItem(original_ptr);
             // May return `this` for heap-owned idle pools — delete only after
@@ -541,21 +539,21 @@ namespace spallocator
         {
             if (slab)
             {
-                reclaimed += slab->reclaimEmptySlabs(keep_min);
+                reclaimed += slab->reclaimEmptyBlocks(keep_min);
             }
         }
         for (auto& slab : slabs32)
         {
             if (slab)
             {
-                reclaimed += slab->reclaimEmptySlabs(keep_min);
+                reclaimed += slab->reclaimEmptyBlocks(keep_min);
             }
         }
         for (auto& slab : slabs64)
         {
             if (slab)
             {
-                reclaimed += slab->reclaimEmptySlabs(keep_min);
+                reclaimed += slab->reclaimEmptyBlocks(keep_min);
             }
         }
 
@@ -660,9 +658,9 @@ namespace spallocator
     {
         PoolStats s;
         s.live_allocations = live_allocation_count();
-        s.retained_slab_bytes = getAllocatedMemory();
+        s.retained_mapped_bytes = getAllocatedMemory();
         observe_live_hwm(s.live_allocations);
-        observe_retained_hwm(s.retained_slab_bytes);
+        observe_retained_hwm(s.retained_mapped_bytes);
 #if SPALLOCATOR_POOL_COUNTERS
         s.alloc_ok = alloc_ok_.load(std::memory_order_relaxed);
         s.alloc_fail = alloc_fail_.load(std::memory_order_relaxed);
@@ -681,18 +679,18 @@ namespace spallocator
     }
 
 
-    inline PoolBlockToken Pool::block_token()
+    inline PoolLifetimeToken Pool::lifetime_token()
     {
-        return PoolBlockToken(control_);
+        return PoolLifetimeToken(control_);
     }
 
 
     Pool::Pool()
         : control_(PoolControlBlock::create(this))
     {
-        // Every axis registry is filled here (immutable thereafter). First
+        // Every alignment-class engine is filled here (immutable thereafter). First
         // data-block mapping follows shouldPreallocateFirstBlock (defaults:
-        // axis ≤16 and ElemSize ≤256).
+        // alignment class ≤16 and ElemSize ≤256).
         slabs16[0]  = makePoolSlab<16, 16>();
         slabs16[1]  = makePoolSlab<32, 16>();
         slabs16[2]  = makePoolSlab<48, 16>();

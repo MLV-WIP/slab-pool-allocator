@@ -72,18 +72,19 @@ namespace spallocator
         SPALLOCATOR_SLAB_TARGET_MULTIPLIER;
 
     static_assert(kSlabTargetMultiplier >= 4,
-        "kSlabTargetMultiplier must be at least 4 (min slots per buffer)");
+        "kSlabTargetMultiplier must be at least 4 (min slots per Block)");
     static_assert(kSlabTargetBytes >= kSlabTargetMultiplier,
         "kSlabTargetBytes must be >= kSlabTargetMultiplier");
     static_assert((kSlabTargetBytes & (kSlabTargetBytes - 1)) == 0,
         "kSlabTargetBytes must be a power of two");
-    // Largest ladder ElemSize today is 4096 (axis 64).
+    // Largest ladder ElemSize today is 4096 (alignment class 64).
     static_assert(kSlabTargetMultiplier * 4096ull >= kSlabTargetBytes,
         "kSlabTargetMultiplier too small for largest ElemSize under target");
 
-    // Exact-pack buffer: slots = max(multiplier, target/ElemSize), zero tail.
+    // Exact-pack Block: slots = max(multiplier, target/ElemSize), zero tail.
+    // (SPALLOCATOR_SLAB_TARGET_* knobs size Blocks; names kept for config stability.)
     template<std::size_t ElemSize>
-    constexpr std::size_t selectBufferSize()
+    constexpr std::size_t selectBlockSize()
     {
         constexpr std::size_t from_target = kSlabTargetBytes / ElemSize;
         constexpr std::size_t slots =
@@ -92,33 +93,33 @@ namespace spallocator
     }
 
 
-    class AbstractSlab
+    class ISlab
     {
     public: // methods
         virtual std::byte* allocateItem(std::size_t size) = 0;
         virtual void deallocateItem(std::byte* item) = 0;
 
-        // Release fully empty slab buffers back to the OS. Default: no-op
-        // (SlabProxy). Returns the number of slab buffers deleted.
-        virtual std::size_t reclaimEmptySlabs(std::size_t keep_min = 1);
+        // Release fully empty Blocks back to the OS. Default: no-op
+        // (SlabProxy). Returns the number of Blocks deleted.
+        virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
         virtual std::size_t getAllocatedMemory() const { return 0; }
 
-        virtual ~AbstractSlab() = default;
+        virtual ~ISlab() = default;
 
     protected: // methods
-        AbstractSlab() = default;
+        ISlab() = default;
 
     private: // methods
-        AbstractSlab(const AbstractSlab&) = delete;
-        AbstractSlab& operator=(const AbstractSlab&) = delete;
-        AbstractSlab(AbstractSlab&&) = delete;
-        AbstractSlab& operator=(AbstractSlab&&) = delete;
+        ISlab(const ISlab&) = delete;
+        ISlab& operator=(const ISlab&) = delete;
+        ISlab(ISlab&&) = delete;
+        ISlab& operator=(ISlab&&) = delete;
     };
 
 
-    // Runtime-sized bit vector over uint64_t words. Used for per-slab
-    // availability so empty size classes do not embed bitset<max_slabs>
-    // (~128 KiB for 4 KiB slabs). Word ops are load/mask/store; storage
+    // Runtime-sized bit vector over uint64_t words. Used for per-Slab
+    // Block availability so empty size classes do not embed bitset<max_blocks>
+    // (~128 KiB for 4 KiB Blocks). Word ops are load/mask/store; storage
     // grows geometrically with live bit count.
     class DynBitset
     {
@@ -127,7 +128,7 @@ namespace spallocator
         void set(std::size_t bit);
         void reset(std::size_t bit);
 
-        // Append one bit valued 1 (new slab starts with free slots).
+        // Append one bit valued 1 (new Block starts with free slots).
         void push_set();
         void swap_bits(std::size_t a, std::size_t b);
 
@@ -150,10 +151,10 @@ namespace spallocator
     class SlotFreemap;
 
 
-    // Compound key: every slot is Alignment-aligned because the buffer uses
+    // Compound key: every slot is Alignment-aligned because the Block uses
     // align_val_t{Alignment} and ElemSize is a multiple of Alignment.
     template<std::size_t ElemSize, std::size_t Alignment = 16>
-    class Slab: public AbstractSlab
+    class Slab: public ISlab
     {
     public: // methods
         std::byte* allocateItem(std::size_t size) override;
@@ -161,16 +162,17 @@ namespace spallocator
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
         constexpr std::size_t getAlignment() const { return Alignment; }
-        constexpr std::size_t getAllocSize() const { return slab_alloc_size; }
-        std::size_t getAllocatedMemory() const override { return slab_data.size() * slab_alloc_size; }
-        std::size_t getAvailabilityMapBytes() const { return slab_available_map.bytes(); }
-        std::size_t getSlabCount() const { return slab_data.size(); }
+        constexpr std::size_t getAllocSize() const { return block_bytes; }
+        std::size_t getAllocatedMemory() const override { return block_bases.size() * block_bytes; }
+        std::size_t getAvailabilityMapBytes() const { return block_available_map.bytes(); }
+        std::size_t getBlockCount() const { return block_bases.size(); }
 
         // Delete fully empty data blocks; always retain at least keep_min
         // blocks (clamped to ≥ 1). Not called from the alloc/free hot path.
-        std::size_t reclaimEmptySlabs(std::size_t keep_min = 1) override;
+        std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1) override;
 
-        std::optional<std::size_t> findSlabForItem(std::byte* item) const;
+        // `slot_base` must be an exact Slot start (not a Pool user pointer).
+        std::optional<std::size_t> findBlockForSlot(std::byte* slot_base) const;
 
         // preallocate_first_block: map one data block at construction (warm
         // start). false leaves the engine empty until the first allocateItem
@@ -184,8 +186,8 @@ namespace spallocator
         Slab(Slab&&) = delete;
         Slab& operator=(Slab&&) = delete;
 
-        void allocateNewSlab();
-        void destroySlabAt(std::size_t index);
+        void allocateNewBlock();
+        void destroyBlockAt(std::size_t index);
     
     private: // data members
         static_assert(Alignment == 16 || Alignment == 32 || Alignment == 64,
@@ -195,27 +197,27 @@ namespace spallocator
         static_assert(ElemSize >= Alignment,
             "ElemSize must be at least Alignment");
 
-        static constexpr std::size_t slab_alloc_size{selectBufferSize<ElemSize>()};
-        static constexpr std::size_t slots_per_buffer{slab_alloc_size / ElemSize};
-        static_assert(slab_alloc_size == slots_per_buffer * ElemSize,
-            "slab buffer must be an exact multiple of ElemSize (zero tail)");
-        static_assert(slots_per_buffer >= kSlabTargetMultiplier,
-            "slab buffer must hold at least kSlabTargetMultiplier slots");
+        static constexpr std::size_t block_bytes{selectBlockSize<ElemSize>()};
+        static constexpr std::size_t slots_per_block{block_bytes / ElemSize};
+        static_assert(block_bytes == slots_per_block * ElemSize,
+            "Block must be an exact multiple of ElemSize (zero tail)");
+        static_assert(slots_per_block >= kSlabTargetMultiplier,
+            "Block must hold at least kSlabTargetMultiplier slots");
 
-        std::vector<std::byte*> slab_data;
-        // Per-buffer slot freemap (SlotFreemap): compile-time slot count,
+        std::vector<std::byte*> block_bases;
+        // Per-Block slot freemap (SlotFreemap): compile-time slot count,
         // word array storage. Convention: bit set ⇒ occupied; clear ⇒ free.
-        std::vector<SlotFreemap<slots_per_buffer>> slab_map;
-        static constexpr std::size_t max_slabs{kMaxClassBytes / slab_alloc_size};
-        static_assert(max_slabs >= 1,
-            "kMaxClassBytes must allow at least one buffer of this ElemSize");
-        DynBitset slab_available_map;
+        std::vector<SlotFreemap<slots_per_block>> block_freemaps;
+        static constexpr std::size_t max_blocks{kMaxClassBytes / block_bytes};
+        static_assert(max_blocks >= 1,
+            "kMaxClassBytes must allow at least one Block of this ElemSize");
+        DynBitset block_available_map;
 
         std::map<std::byte*, std::size_t> base_address_map;
 
-        // Next-fit cursors for allocateItem (indices into slab_data / freemap).
-        // Reset when reclaim/swap-with-last invalidates buffer indices.
-        std::size_t alloc_cursor_slab_{0};
+        // Next-fit cursors for allocateItem (indices into block_bases / freemap).
+        // Reset when reclaim/swap-with-last invalidates Block indices.
+        std::size_t alloc_cursor_block_{0};
         std::size_t alloc_cursor_slot_{0};
 
         SpinLock slab_lock;
@@ -228,7 +230,7 @@ namespace spallocator
     // allocations that aren't suitable for small-memory slab
     // optimizations
     //
-    class SlabProxy: public AbstractSlab
+    class SlabProxy: public ISlab
     {
     public: // methods
         std::byte* allocateItem(std::size_t size) override;
@@ -277,10 +279,10 @@ namespace spallocator
 
 
     // ---------------------------------------------------------------------------
-    // AbstractSlab
+    // ISlab
     // ---------------------------------------------------------------------------
 
-    inline std::size_t AbstractSlab::reclaimEmptySlabs(std::size_t /*keep_min*/)
+    inline std::size_t ISlab::reclaimEmptyBlocks(std::size_t /*keep_min*/)
     {
         return 0;
     }
@@ -548,138 +550,138 @@ namespace spallocator
 
         std::scoped_lock<SpinLock> guard(slab_lock);
 
-        // Next-fit: resume at (alloc_cursor_slab_, alloc_cursor_slot_). When every
-        // live buffer is full, grow then retry.
+        // Next-fit: resume at (alloc_cursor_block_, alloc_cursor_slot_). When every
+        // live Block is full, grow then retry.
         for (;;)
         {
-            const std::size_t nslabs = slab_data.size();
-            if (nslabs == 0)
+            const std::size_t nblocks = block_bases.size();
+            if (nblocks == 0)
             {
-                allocateNewSlab();
-                alloc_cursor_slab_ = 0;
+                allocateNewBlock();
+                alloc_cursor_block_ = 0;
                 alloc_cursor_slot_ = 0;
                 continue;
             }
 
-            if (alloc_cursor_slab_ >= nslabs)
+            if (alloc_cursor_block_ >= nblocks)
             {
-                alloc_cursor_slab_ = 0;
+                alloc_cursor_block_ = 0;
                 alloc_cursor_slot_ = 0;
             }
 
-            std::size_t slab_index = alloc_cursor_slab_;
+            std::size_t block_index = alloc_cursor_block_;
             std::size_t slot_start = alloc_cursor_slot_;
-            for (std::size_t visited = 0; visited < nslabs; ++visited)
+            for (std::size_t visited = 0; visited < nblocks; ++visited)
             {
-                if (slab_available_map.test(slab_index))
+                if (block_available_map.test(block_index))
                 {
-                    auto& slab_slots = slab_map[slab_index];
+                    auto& block_slots = block_freemaps[block_index];
                     // Next-fit fast path: if the cursor slot is free, take it
                     // without a freemap word scan (common for LIFO / local churn).
-                    std::size_t item_index = slab_slots.size();
-                    if (slot_start < slab_slots.size() && !slab_slots.test(slot_start))
+                    std::size_t item_index = block_slots.size();
+                    if (slot_start < block_slots.size() && !block_slots.test(slot_start))
                     {
                         item_index = slot_start;
                     }
                     else
                     {
                         // Forward from the cursor; if that misses and the cursor
-                        // was mid-buffer, wrap within this buffer before leaving.
-                        item_index = find_next_clear_bit(slab_slots, slot_start);
-                        if (item_index >= slab_slots.size() && slot_start > 0)
+                        // was mid-Block, wrap within this Block before leaving.
+                        item_index = find_next_clear_bit(block_slots, slot_start);
+                        if (item_index >= block_slots.size() && slot_start > 0)
                         {
-                            item_index = find_next_clear_bit(slab_slots, 0);
+                            item_index = find_next_clear_bit(block_slots, 0);
                             if (item_index >= slot_start)
                             {
-                                item_index = slab_slots.size(); // already scanned
+                                item_index = block_slots.size(); // already scanned
                             }
                         }
                     }
-                    if (item_index < slab_slots.size())
+                    if (item_index < block_slots.size())
                     {
-                        slab_slots.set(item_index);
-                        if (slab_slots.all())
+                        block_slots.set(item_index);
+                        if (block_slots.all())
                         {
-                            slab_available_map.reset(slab_index);
+                            block_available_map.reset(block_index);
                         }
 
                         // Advance cursor past this slot (next-fit).
-                        alloc_cursor_slab_ = slab_index;
+                        alloc_cursor_block_ = block_index;
                         alloc_cursor_slot_ = item_index + 1;
-                        if (alloc_cursor_slot_ >= slab_slots.size())
+                        if (alloc_cursor_slot_ >= block_slots.size())
                         {
                             alloc_cursor_slot_ = 0;
-                            alloc_cursor_slab_ = slab_index + 1;
-                            if (alloc_cursor_slab_ >= nslabs)
+                            alloc_cursor_block_ = block_index + 1;
+                            if (alloc_cursor_block_ >= nblocks)
                             {
-                                alloc_cursor_slab_ = 0;
+                                alloc_cursor_block_ = 0;
                             }
                         }
 
-                        debug_println("Item allocated ({}/{}), slab_map<{},{}>: {}",
-                                      slab_index, item_index, ElemSize, Alignment,
-                                      printHex(slab_slots));
-                        return slab_data[slab_index] + item_index * ElemSize;
+                        debug_println("Item allocated ({}/{}), block_freemaps<{},{}>: {}",
+                                      block_index, item_index, ElemSize, Alignment,
+                                      printHex(block_slots));
+                        return block_bases[block_index] + item_index * ElemSize;
                     }
                 }
 
-                slab_index = slab_index + 1;
-                if (slab_index >= nslabs)
+                block_index = block_index + 1;
+                if (block_index >= nblocks)
                 {
-                    slab_index = 0;
+                    block_index = 0;
                 }
-                slot_start = 0; // only the first buffer uses the saved slot cursor
+                slot_start = 0; // only the first Block uses the saved slot cursor
             }
 
-            // allocateNewSlab throws when max_slabs is reached.
-            allocateNewSlab();
-            alloc_cursor_slab_ = slab_data.size() - 1;
+            // allocateNewBlock throws when max_blocks is reached.
+            allocateNewBlock();
+            alloc_cursor_block_ = block_bases.size() - 1;
             alloc_cursor_slot_ = 0;
-            debug_println("New slab<{},{}> allocated, total slabs: {}",
-                          ElemSize, Alignment, slab_data.size());
+            debug_println("New block<{},{}> allocated, total blocks: {}",
+                          ElemSize, Alignment, block_bases.size());
         }
     }
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    std::optional<std::size_t> Slab<ElemSize, Alignment>::findSlabForItem(std::byte* item) const
+    std::optional<std::size_t> Slab<ElemSize, Alignment>::findBlockForSlot(std::byte* slot_base) const
     {
-        // Single-buffer fast path: skip the address map (common steady state).
-        if (slab_data.size() == 1)
+        // Single-Block fast path: skip the address map (common steady state).
+        if (block_bases.size() == 1)
         {
-            std::byte* const slab_start = slab_data[0];
-            std::byte* const slab_end = slab_start + slab_alloc_size;
-            if (item >= slab_start && item < slab_end)
+            std::byte* const block_start = block_bases[0];
+            std::byte* const block_end = block_start + block_bytes;
+            if (slot_base >= block_start && slot_base < block_end)
             {
                 return 0;
             }
             debug_println(
-                "Item {} is not within sole slab range {} - {}; treating as unknown pointer",
-                static_cast<void*>(item),
-                static_cast<void*>(slab_start),
-                static_cast<void*>(slab_end));
+                "Slot base {} is not within sole block range {} - {}; treating as unknown pointer",
+                static_cast<void*>(slot_base),
+                static_cast<void*>(block_start),
+                static_cast<void*>(block_end));
             return std::nullopt;
         }
 
-        auto it = base_address_map.upper_bound(item);
+        auto it = base_address_map.upper_bound(slot_base);
         if (it != base_address_map.begin())
         {
             --it;
-            auto slab_start = it->first;
-            auto slab_end = slab_start + slab_alloc_size;
+            auto block_start = it->first;
+            auto block_end = block_start + block_bytes;
             // Predecessor start is only a candidate. Invalid pointers (or
-            // addresses in gaps between slabs) can upper_bound into this path
-            // without falling inside [slab_start, slab_end).
-            if (item >= slab_start && item < slab_end)
+            // addresses in gaps between Blocks) can upper_bound into this path
+            // without falling inside [block_start, block_end).
+            if (slot_base >= block_start && slot_base < block_end)
             {
                 return it->second;
             }
 
             debug_println(
-                "Item {} is not within candidate slab range {} - {}; treating as unknown pointer",
-                static_cast<void*>(item),
-                static_cast<void*>(slab_start),
-                static_cast<void*>(slab_end));
+                "Slot base {} is not within candidate block range {} - {}; treating as unknown pointer",
+                static_cast<void*>(slot_base),
+                static_cast<void*>(block_start),
+                static_cast<void*>(block_end));
         }
         return std::nullopt;
     }
@@ -695,44 +697,44 @@ namespace spallocator
 
         std::scoped_lock<SpinLock> guard(slab_lock);
 
-        // Find which slab this item belongs to
-        if (auto slab_index_opt = findSlabForItem(item); !slab_index_opt.has_value())
+        // Find which Block this item belongs to
+        if (auto block_index_opt = findBlockForSlot(item); !block_index_opt.has_value())
         {
-            throw std::invalid_argument("Invalid item pointer; no corresponding slab found");
+            throw std::invalid_argument("Invalid item pointer; no corresponding block found");
         }
         else
         {
-            auto slab_index = *slab_index_opt;
+            auto block_index = *block_index_opt;
 
-            auto slab_start = slab_data[slab_index];
-            auto& slab_slots = slab_map[slab_index];
+            auto block_start = block_bases[block_index];
+            auto& block_slots = block_freemaps[block_index];
 
             // Require an exact slot base. Integer division alone would map an
             // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
             // the freemap — or free a live neighbor.
-            const auto offset = item - slab_start;
+            const auto offset = item - block_start;
             if (offset < 0)
             {
                 throw std::invalid_argument(
-                    "Invalid item pointer; address is before slab start");
+                    "Invalid item pointer; address is before block start");
             }
             const std::size_t byte_offset = static_cast<std::size_t>(offset);
             const std::size_t item_index = byte_offset / ElemSize;
-            if (item_index >= slab_slots.size() ||
-                item != slab_start + item_index * ElemSize)
+            if (item_index >= block_slots.size() ||
+                item != block_start + item_index * ElemSize)
             {
                 throw std::invalid_argument(
                     "Invalid item pointer; not aligned to a slot boundary");
             }
 
-            if (slab_slots.test(item_index))
+            if (block_slots.test(item_index))
             {
                 // Free the item
-                slab_slots.reset(item_index);
-                // This slab now has free space
-                slab_available_map.set(slab_index);
-                debug_println("Item freed ({}/{}), slab_map: {}",
-                              slab_index, item_index, printHex(slab_slots));
+                block_slots.reset(item_index);
+                // This Block now has free space
+                block_available_map.set(block_index);
+                debug_println("Item freed ({}/{}), block_freemaps: {}",
+                              block_index, item_index, printHex(block_slots));
                 return;
             }
             else
@@ -741,7 +743,7 @@ namespace spallocator
             }
         }
 
-        throw std::invalid_argument("Invalid item pointer; item not found in slab");
+        throw std::invalid_argument("Invalid item pointer; item not found in block");
     }
 
 
@@ -755,7 +757,7 @@ namespace spallocator
 
         if (preallocate_first_block)
         {
-            allocateNewSlab();
+            allocateNewBlock();
         }
     }
 
@@ -763,7 +765,7 @@ namespace spallocator
     Slab<ElemSize, Alignment>::~Slab()
     {
         debug_println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
-        for (auto ptr : slab_data)
+        for (auto ptr : block_bases)
         {
             // C++23 is improved to handle aligned deallocation automatically.
             // For earlier standards, we need to explicitly pass the alignment
@@ -779,9 +781,9 @@ namespace spallocator
     }
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    std::size_t Slab<ElemSize, Alignment>::reclaimEmptySlabs(std::size_t keep_min)
+    std::size_t Slab<ElemSize, Alignment>::reclaimEmptyBlocks(std::size_t keep_min)
     {
-        // Retain at least one slab so the class stays warm for the next alloc.
+        // Retain at least one Block so the class stays warm for the next alloc.
         if (keep_min < 1)
         {
             keep_min = 1;
@@ -791,52 +793,52 @@ namespace spallocator
 
         std::size_t reclaimed = 0;
         std::size_t index = 0;
-        while (index < slab_data.size())
+        while (index < block_bases.size())
         {
-            if (slab_data.size() <= keep_min)
+            if (block_bases.size() <= keep_min)
             {
                 break;
             }
 
-            if (!slab_map[index].none())
+            if (!block_freemaps[index].none())
             {
                 ++index;
                 continue;
             }
 
-            destroySlabAt(index);
+            destroyBlockAt(index);
             ++reclaimed;
             // New occupant at index (swap-with-last) must be examined next.
         }
 
         debug_println(
-            "reclaimEmptySlabs<{},{}>: removed {}, remaining slabs={}",
-            ElemSize, Alignment, reclaimed, slab_data.size());
+            "reclaimEmptyBlocks<{},{}>: removed {}, remaining blocks={}",
+            ElemSize, Alignment, reclaimed, block_bases.size());
         return reclaimed;
     }
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    void Slab<ElemSize, Alignment>::destroySlabAt(std::size_t index)
+    void Slab<ElemSize, Alignment>::destroyBlockAt(std::size_t index)
     {
-        std::byte* doomed = slab_data[index];
+        std::byte* doomed = block_bases[index];
         base_address_map.erase(doomed);
 
-        const std::size_t last = slab_data.size() - 1;
+        const std::size_t last = block_bases.size() - 1;
         if (index != last)
         {
-            slab_data[index] = slab_data[last];
-            slab_map[index] = slab_map[last];
-            slab_available_map.swap_bits(index, last);
-            base_address_map[slab_data[index]] = index;
+            block_bases[index] = block_bases[last];
+            block_freemaps[index] = block_freemaps[last];
+            block_available_map.swap_bits(index, last);
+            base_address_map[block_bases[index]] = index;
         }
 
-        slab_data.pop_back();
-        slab_map.pop_back();
-        slab_available_map.pop_back();
+        block_bases.pop_back();
+        block_freemaps.pop_back();
+        block_available_map.pop_back();
 
-        // Buffer indices may have been swapped; drop the next-fit hint.
-        alloc_cursor_slab_ = 0;
+        // Block indices may have been swapped; drop the next-fit hint.
+        alloc_cursor_block_ = 0;
         alloc_cursor_slot_ = 0;
 
         ::operator delete[](doomed, std::align_val_t{Alignment});
@@ -844,21 +846,21 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    void Slab<ElemSize, Alignment>::allocateNewSlab()
+    void Slab<ElemSize, Alignment>::allocateNewBlock()
     {
-        if (slab_data.size() >= max_slabs)
+        if (block_bases.size() >= max_blocks)
         {
             throw std::out_of_range(
-                std::format("Cannot allocate more than {} slabs of size {} bytes",
-                            max_slabs, slab_alloc_size));
+                std::format("Cannot allocate more than {} blocks of size {} bytes",
+                            max_blocks, block_bytes));
         }
 
-        std::byte* new_slab = new(std::align_val_t{Alignment}) std::byte[slab_alloc_size];
-        slab_data.push_back(new_slab);
-        base_address_map[new_slab] = slab_data.size() - 1;
-        slab_map.emplace_back();
-        // New slab has free slots; grow availability words only as needed.
-        slab_available_map.push_set();
+        std::byte* new_block = new(std::align_val_t{Alignment}) std::byte[block_bytes];
+        block_bases.push_back(new_block);
+        base_address_map[new_block] = block_bases.size() - 1;
+        block_freemaps.emplace_back();
+        // New Block has free slots; grow availability words only as needed.
+        block_available_map.push_set();
     }
 
 
@@ -866,7 +868,7 @@ namespace spallocator
     // SlabProxy
     // ---------------------------------------------------------------------------
 
-    // Oversize / beyond-axis-max path. Always uses 64-byte aligned new/delete
+    // Oversize / beyond-alignment-class-max path. Always uses 64-byte aligned new/delete
     // so any Pool request alignment ≤ 64 is satisfied.
     inline constexpr std::size_t kProxyAlignment = 64;
 
@@ -874,7 +876,7 @@ namespace spallocator
     {
         // Active in all build types (not runtime_assert): mis-sized large
         // allocations must fail loudly rather than allocate or be rejected
-        // only under DEBUG_BUILD. Lower bound is the smallest axis max (1KB).
+        // only under DEBUG_BUILD. Lower bound is the smallest alignment-class max (1KB).
         if (elem_size <= 1_KB)
         {
             throw std::invalid_argument(

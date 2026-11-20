@@ -36,7 +36,7 @@
 #include <atomic>
 #include <cstdint>
 
-// Pool lifetime meta-management: control block, block tokens, and handles.
+// Pool lifetime meta-management: control block, lifetime tokens, and handles.
 // Separated from pool.hpp so the allocator facade stays focused on routing.
 //
 // Methods that require a complete Pool (PoolHandle::create, and deleting a
@@ -102,18 +102,18 @@ namespace spallocator
     };
 
 
-    // Deleter/allocator pin: block_refs only (does not keep empty heap pools
+    // Deleter/allocator pin (PoolLifetimeToken): block_refs only (does not keep empty heap pools
     // alive). Outlives Pool on the arena path so !alive can be observed.
-    class PoolBlockToken
+    class PoolLifetimeToken
     {
     public: // methods
-        PoolBlockToken() noexcept = default;
-        PoolBlockToken(const PoolBlockToken& other) noexcept;
-        PoolBlockToken(PoolBlockToken&& other) noexcept;
-        ~PoolBlockToken();
+        PoolLifetimeToken() noexcept = default;
+        PoolLifetimeToken(const PoolLifetimeToken& other) noexcept;
+        PoolLifetimeToken(PoolLifetimeToken&& other) noexcept;
+        ~PoolLifetimeToken();
 
-        PoolBlockToken& operator=(const PoolBlockToken& other) noexcept;
-        PoolBlockToken& operator=(PoolBlockToken&& other) noexcept;
+        PoolLifetimeToken& operator=(const PoolLifetimeToken& other) noexcept;
+        PoolLifetimeToken& operator=(PoolLifetimeToken&& other) noexcept;
 
         // nullptr if empty token or pool already marked dead.
         Pool* get() const noexcept;
@@ -125,7 +125,7 @@ namespace spallocator
     private: // methods
         friend class Pool;
         friend class PoolHandle;
-        explicit PoolBlockToken(PoolControlBlock* block) noexcept;
+        explicit PoolLifetimeToken(PoolControlBlock* block) noexcept;
 
         void retain() noexcept;
         void release() noexcept;
@@ -159,7 +159,7 @@ namespace spallocator
         PoolControlBlock* control() const noexcept { return block_; }
 
         // Deleter/allocator pin (block_refs only; does not bump handle_refs).
-        PoolBlockToken block_token() const noexcept;
+        PoolLifetimeToken lifetime_token() const noexcept;
 
     private: // methods
         friend class Pool;
@@ -312,37 +312,37 @@ namespace spallocator
 
 
     // ---------------------------------------------------------------------------
-    // PoolBlockToken
+    // PoolLifetimeToken
     // ---------------------------------------------------------------------------
 
-    inline PoolBlockToken::PoolBlockToken(PoolControlBlock* block) noexcept
+    inline PoolLifetimeToken::PoolLifetimeToken(PoolControlBlock* block) noexcept
         : block_(block)
     {
         retain();
     }
 
 
-    inline PoolBlockToken::PoolBlockToken(const PoolBlockToken& other) noexcept
+    inline PoolLifetimeToken::PoolLifetimeToken(const PoolLifetimeToken& other) noexcept
         : block_(other.block_)
     {
         retain();
     }
 
 
-    inline PoolBlockToken::PoolBlockToken(PoolBlockToken&& other) noexcept
+    inline PoolLifetimeToken::PoolLifetimeToken(PoolLifetimeToken&& other) noexcept
         : block_(other.block_)
     {
         other.block_ = nullptr;
     }
 
 
-    inline PoolBlockToken::~PoolBlockToken()
+    inline PoolLifetimeToken::~PoolLifetimeToken()
     {
         release();
     }
 
 
-    inline PoolBlockToken& PoolBlockToken::operator=(const PoolBlockToken& other) noexcept
+    inline PoolLifetimeToken& PoolLifetimeToken::operator=(const PoolLifetimeToken& other) noexcept
     {
         if (this != &other)
         {
@@ -354,7 +354,7 @@ namespace spallocator
     }
 
 
-    inline PoolBlockToken& PoolBlockToken::operator=(PoolBlockToken&& other) noexcept
+    inline PoolLifetimeToken& PoolLifetimeToken::operator=(PoolLifetimeToken&& other) noexcept
     {
         if (this != &other)
         {
@@ -366,7 +366,7 @@ namespace spallocator
     }
 
 
-    inline Pool* PoolBlockToken::get() const noexcept
+    inline Pool* PoolLifetimeToken::get() const noexcept
     {
         if (!block_ || !block_->is_alive())
         {
@@ -376,19 +376,19 @@ namespace spallocator
     }
 
 
-    inline bool PoolBlockToken::alive() const noexcept
+    inline bool PoolLifetimeToken::alive() const noexcept
     {
         return block_ && block_->is_alive();
     }
 
 
-    inline PoolBlockToken::operator bool() const noexcept
+    inline PoolLifetimeToken::operator bool() const noexcept
     {
         return alive();
     }
 
 
-    inline void PoolBlockToken::retain() noexcept
+    inline void PoolLifetimeToken::retain() noexcept
     {
         if (block_)
         {
@@ -397,7 +397,7 @@ namespace spallocator
     }
 
 
-    inline void PoolBlockToken::release() noexcept
+    inline void PoolLifetimeToken::release() noexcept
     {
         if (block_)
         {
@@ -411,9 +411,9 @@ namespace spallocator
     // PoolHandle
     // ---------------------------------------------------------------------------
 
-    inline PoolBlockToken PoolHandle::block_token() const noexcept
+    inline PoolLifetimeToken PoolHandle::lifetime_token() const noexcept
     {
-        return PoolBlockToken(block_);
+        return PoolLifetimeToken(block_);
     }
 
 
