@@ -77,8 +77,8 @@ namespace spallocator
         "kSlabTargetBytes must be >= kSlabTargetMultiplier");
     static_assert((kSlabTargetBytes & (kSlabTargetBytes - 1)) == 0,
         "kSlabTargetBytes must be a power of two");
-    // Largest ladder ElemSize today is 4096 (alignment class 64).
-    static_assert(kSlabTargetMultiplier * 4096ull >= kSlabTargetBytes,
+    // Largest ladder ElemSize today is 16384 (alignment class 64).
+    static_assert(kSlabTargetMultiplier * 16384ull >= kSlabTargetBytes,
         "kSlabTargetMultiplier too small for largest ElemSize under target");
 
     // Exact-pack Block: slots = max(multiplier, target/ElemSize), zero tail.
@@ -876,7 +876,8 @@ namespace spallocator
     {
         // Active in all build types (not runtime_assert): mis-sized large
         // allocations must fail loudly rather than allocate or be rejected
-        // only under DEBUG_BUILD. Lower bound is the smallest alignment-class max (1KB).
+        // only under DEBUG_BUILD. Lower bound guards misuse; real overflow
+        // footprints exceed the alignment-class ladder max (see kLadder*).
         if (elem_size <= 1_KB)
         {
             throw std::invalid_argument(

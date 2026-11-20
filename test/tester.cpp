@@ -1129,10 +1129,12 @@ TEST(PoolTest, Selector)
     EXPECT_EQ(selectClassIndex(512, kSlabNativeAlignment), 9u);
     EXPECT_EQ(selectClassIndex(768, kSlabNativeAlignment), 10u);
     EXPECT_EQ(selectClassIndex(1024, kSlabNativeAlignment), 11u);
-    EXPECT_EQ(selectClassIndex(1500, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(selectClassIndex(2000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(selectClassIndex(3000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(selectClassIndex(4000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(1500, kSlabNativeAlignment), 12u);
+    EXPECT_EQ(selectClassIndex(2000, kSlabNativeAlignment), 13u);
+    EXPECT_EQ(selectClassIndex(3000, kSlabNativeAlignment), 14u);
+    EXPECT_EQ(selectClassIndex(4000, kSlabNativeAlignment), 15u);
+    EXPECT_EQ(selectClassIndex(4096, kSlabNativeAlignment), 15u);
+    EXPECT_EQ(selectClassIndex(4097, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
     EXPECT_EQ(selectClassIndex(5000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
 
     EXPECT_EQ(selectClassIndex(1, kSlabNativeAlignment), 0u);
@@ -1159,7 +1161,10 @@ TEST(PoolTest, Selector)
     EXPECT_EQ(selectClassIndex(767, kSlabNativeAlignment), 10u);
     EXPECT_EQ(selectClassIndex(769, kSlabNativeAlignment), 11u);
     EXPECT_EQ(selectClassIndex(1023, kSlabNativeAlignment), 11u);
-    EXPECT_EQ(selectClassIndex(1025, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(1025, kSlabNativeAlignment), 12u);
+    EXPECT_EQ(selectClassIndex(1536, kSlabNativeAlignment), 12u);
+    EXPECT_EQ(selectClassIndex(2048, kSlabNativeAlignment), 13u);
+    EXPECT_EQ(selectClassIndex(3072, kSlabNativeAlignment), 14u);
 
     // Align 4/8 map to alignment class 16
     EXPECT_EQ(nativeAlignmentClass(4), 16u);
@@ -1170,13 +1175,19 @@ TEST(PoolTest, Selector)
     EXPECT_EQ(selectClassIndex(64, nativeAlignmentClass(8)), selectClassIndex(64, kSlabNativeAlignment));
     EXPECT_EQ(selectClassIndex(64, nativeAlignmentClass(4)), selectClassIndex(64, kSlabNativeAlignment));
 
+    EXPECT_EQ(alignmentClassMaxElem(16), 4096u);
+    EXPECT_EQ(alignmentClassMaxElem(32), 8192u);
+    EXPECT_EQ(alignmentClassMaxElem(64), 16384u);
+
     // Explicit alignment-class-32 ladder (incl. denser top)
     EXPECT_EQ(selectClassIndex(32, 32), 0u);
     EXPECT_EQ(selectClassIndex(96, 32), 2u);
     EXPECT_EQ(selectClassIndex(1024, 32), 9u);
     EXPECT_EQ(selectClassIndex(1536, 32), 10u);
     EXPECT_EQ(selectClassIndex(2048, 32), 11u);
-    EXPECT_EQ(selectClassIndex(2049, 32), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(2049, 32), 12u);
+    EXPECT_EQ(selectClassIndex(8192, 32), 15u);
+    EXPECT_EQ(selectClassIndex(8193, 32), std::numeric_limits<std::size_t>::max());
 
     // Explicit alignment-class-64 ladder
     EXPECT_EQ(selectClassIndex(64, 64), 0u);
@@ -1185,7 +1196,9 @@ TEST(PoolTest, Selector)
     EXPECT_EQ(selectClassIndex(2048, 64), 9u);
     EXPECT_EQ(selectClassIndex(3072, 64), 10u);
     EXPECT_EQ(selectClassIndex(4096, 64), 11u);
-    EXPECT_EQ(selectClassIndex(4097, 64), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(4097, 64), 12u);
+    EXPECT_EQ(selectClassIndex(16384, 64), 15u);
+    EXPECT_EQ(selectClassIndex(16385, 64), std::numeric_limits<std::size_t>::max());
 }
 
 
@@ -1744,8 +1757,8 @@ TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
         pool.deallocate(p);
     }
 
-    // Footprint > 4096 on alignment class 64 → Proxy (still 64-byte aligned storage).
-    auto* big = pool.allocate(4100, 64);
+    // Footprint > 16384 on alignment class 64 → Proxy (still 64-byte aligned storage).
+    auto* big = pool.allocate(16400, 64);
     EXPECT_NE(big, nullptr);
     EXPECT_EQ(reinterpret_cast<std::uintptr_t>(big) % 64, 0u);
     pool.deallocate(big);

@@ -24,7 +24,7 @@ README.md             # this overview + build/run
 ## Key Features
 
 - **Pool as allocation domain** — construct, share `Pool&` / `PoolHandle`, destroy to dispose; shard pools to isolate or reduce contention
-- **Slab size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB; large fallback via `SlabProxy`
+- **Slab size classes** — alignment-class ladders 16 (16B–4KB), 32 (32B–8KB), 64 (64B–16KB); large fallback via `SlabProxy`
 - **Thread-safe routing** — pool + per-slab locking
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolLifetimeToken`)
 - **Optional PMR bridge** — `PoolMemoryResource` in `pool_pmr.hpp` for `std::pmr` containers (prefer `PoolAllocator` when types can bake it in)
@@ -178,9 +178,9 @@ int main() {
 Per-alignment ladders (`Slab<ElemSize, Alignment>`). Align 4/8 use the 16-byte alignment class.
 
 ```
-Alignment class 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Alignment class 32 (lazy):  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Alignment class 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Alignment class 16: 16 … 4096 (16 rungs; engines eager, Blocks may map on demand)
+Alignment class 32: 32 … 8192
+Alignment class 64: 64 … 16384
 ```
 
 Beyond an alignment-class max → `SlabProxy` (always 64-byte aligned `new[]`).

@@ -73,11 +73,11 @@ namespace spallocator
     inline constexpr std::uint8_t kAllocMagic = 0xA7;
 
     inline constexpr std::size_t kLadder16[] = {
-        16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024};
+        16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
     inline constexpr std::size_t kLadder32[] = {
-        32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048};
+        32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192};
     inline constexpr std::size_t kLadder64[] = {
-        64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
+        64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384};
 
     inline constexpr std::size_t kLadder16Count =
         sizeof(kLadder16) / sizeof(kLadder16[0]);
@@ -136,15 +136,16 @@ namespace spallocator
 
     constexpr std::size_t alignmentClassMaxElem(std::size_t alignment_class)
     {
+        // Keep in sync with kLadder* tails (last rung = max size-class ElemSize).
         if (alignment_class <= kSlabNativeAlignment)
         {
-            return 1024;
+            return kLadder16[kLadder16Count - 1];
         }
         if (alignment_class == 32)
         {
-            return 2048;
+            return kLadder32[kLadder32Count - 1];
         }
-        return 4096; // alignment class 64
+        return kLadder64[kLadder64Count - 1];
     }
 
     constexpr std::size_t selectClassIndex(std::size_t alloc_size, std::size_t alignment_class)
@@ -691,6 +692,9 @@ namespace spallocator
         // Every alignment-class engine is filled here (immutable thereafter). First
         // data-block mapping follows shouldPreallocateFirstBlock (defaults:
         // alignment class ≤16 and ElemSize ≤256).
+        static_assert(kLadder16Count == 16 && kLadder32Count == 16 && kLadder64Count == 16,
+            "Pool ctor installs one engine per ladder rung; update makePoolSlab list when counts change");
+
         slabs16[0]  = makePoolSlab<16, 16>();
         slabs16[1]  = makePoolSlab<32, 16>();
         slabs16[2]  = makePoolSlab<48, 16>();
@@ -703,6 +707,10 @@ namespace spallocator
         slabs16[9]  = makePoolSlab<512, 16>();
         slabs16[10] = makePoolSlab<768, 16>();
         slabs16[11] = makePoolSlab<1024, 16>();
+        slabs16[12] = makePoolSlab<1536, 16>();
+        slabs16[13] = makePoolSlab<2048, 16>();
+        slabs16[14] = makePoolSlab<3072, 16>();
+        slabs16[15] = makePoolSlab<4096, 16>();
 
         slabs32[0]  = makePoolSlab<32, 32>();
         slabs32[1]  = makePoolSlab<64, 32>();
@@ -716,6 +724,10 @@ namespace spallocator
         slabs32[9]  = makePoolSlab<1024, 32>();
         slabs32[10] = makePoolSlab<1536, 32>();
         slabs32[11] = makePoolSlab<2048, 32>();
+        slabs32[12] = makePoolSlab<3072, 32>();
+        slabs32[13] = makePoolSlab<4096, 32>();
+        slabs32[14] = makePoolSlab<6144, 32>();
+        slabs32[15] = makePoolSlab<8192, 32>();
 
         slabs64[0]  = makePoolSlab<64, 64>();
         slabs64[1]  = makePoolSlab<128, 64>();
@@ -729,6 +741,10 @@ namespace spallocator
         slabs64[9]  = makePoolSlab<2048, 64>();
         slabs64[10] = makePoolSlab<3072, 64>();
         slabs64[11] = makePoolSlab<4096, 64>();
+        slabs64[12] = makePoolSlab<6144, 64>();
+        slabs64[13] = makePoolSlab<8192, 64>();
+        slabs64[14] = makePoolSlab<12288, 64>();
+        slabs64[15] = makePoolSlab<16384, 64>();
     }
 
 

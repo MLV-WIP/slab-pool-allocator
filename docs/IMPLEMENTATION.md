@@ -224,9 +224,9 @@ slot bases would not guarantee the user’s alignment. Separate
 ### Alignment ladders
 
 ```
-Alignment class 16 (eager): 16 … 1024
-Alignment class 32:  32 … 2048
-Alignment class 64:  64 … 4096
+Alignment class 16 (eager): 16 … 4096
+Alignment class 32:  32 … 8192
+Alignment class 64:  64 … 16384
 ```
 
 Request align 4/8 **over-aligns** into alignment class 16 (slots are at least 16-aligned).
@@ -265,7 +265,7 @@ then `SlabProxy` for overflow, is intentional - not a goal to match TCMalloc's
 
 | Choice | Rationale |
 |--------|-----------|
-| Alignment-class-16 rungs through **1024** | Covers the count-dominated <1 KiB band for default align 8/16 |
+| Alignment-class-16 rungs through **4096** | Covers small/medium count-dominated traffic for default align 8/16 |
 | Proxy beyond alignment-class max | Large *volume* should not force every multi-KiB size through slot freemaps |
 | Default prealloc: alignment class <=16 and `ElemSize` <= **256** | Warm cold RSS where call rate concentrates; leave 384-1024 first-touch unless raised |
 | High-align alignment classes not pre-warmed by default | High-align traffic is rare vs the mass of the size distribution |

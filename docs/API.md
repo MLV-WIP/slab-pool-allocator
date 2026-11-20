@@ -140,9 +140,9 @@ Why pools exist as a concept: [CONCEPTS.md — Pool](CONCEPTS.md#what-is-a-pool-
 | `kSlabIndexNpos` | Sentinel from class selection meaning “use large path” |
 
 ```
-Alignment class 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Alignment class 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Alignment class 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Alignment class 16 (eager): 16 … 4096 (16 rungs)
+Alignment class 32:  32 … 8192 (16 rungs)
+Alignment class 64:  64 … 16384 (16 rungs)
 ```
 
 If the footprint exceeds the maximum class on that alignment class, the pool uses
