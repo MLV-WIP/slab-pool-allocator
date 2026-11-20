@@ -186,9 +186,8 @@ TESTER_SRC := $(TESTDIR)/tester.cpp
 TESTER_TARGET := tester
 TESTER_DEPFILE := $(OBJDIR)/$(TESTER_TARGET).d
 
-DEMO_SRC := $(DEMODIR)/demo_spalloc_shared_ptr.cpp
-DEMO_TARGET := demo_spalloc_shared_ptr
-DEMO_DEPFILE := $(OBJDIR)/$(DEMO_TARGET).d
+DEMO_NAMES := demo_spalloc_shared_ptr demo_pool_pmr
+DEMO_TARGETS := $(addprefix $(OBJDIR)/,$(DEMO_NAMES))
 
 BENCH_SRC := $(BENCHDIR)/bench_allocators.cpp
 BENCH_TARGET := bench_allocators
@@ -204,7 +203,7 @@ ifeq ($(ENABLE_TESTS),yes)
     TARGETS += $(OBJDIR)/$(TESTER_TARGET)
 endif
 ifeq ($(ENABLE_DEMO),yes)
-    TARGETS += $(OBJDIR)/$(DEMO_TARGET)
+    TARGETS += $(DEMO_TARGETS)
 endif
 
 # Default target
@@ -247,12 +246,12 @@ ifeq ($(ENABLE_COVERAGE),yes)
 	$(Q)rm -f $(OBJDIR)/*.gcda $(OBJDIR)/*.gcov
 endif
 
-# Build demo
-$(OBJDIR)/$(DEMO_TARGET): $(DEMO_SRC) $(HEADERS) | $(OBJDIR)
+# Build demos (one binary per demos/demo_*.cpp listed in DEMO_NAMES)
+$(OBJDIR)/demo_%: $(DEMODIR)/demo_%.cpp $(HEADERS) | $(OBJDIR)
 	$(ECHO) "  CXX     $@"
 	$(Q)$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
-	$(Q)rm -f $(BASEOBJDIR)/$(DEMO_TARGET)
-	$(Q)ln -s $(OBJDIRNAME)/$(DEMO_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET)
+	$(Q)rm -f $(BASEOBJDIR)/$(@F)
+	$(Q)ln -s $(OBJDIRNAME)/$(@F) $(BASEOBJDIR)/$(@F)
 
 # Run tests
 test: $(OBJDIR)/$(TESTER_TARGET)
@@ -293,10 +292,12 @@ else
 	@echo "Coverage disabled (ENABLE_COVERAGE=$(ENABLE_COVERAGE); use --enable-coverage or BUILD_TYPE=release)"
 endif
 
-# Run demo
-demo: $(OBJDIR)/$(DEMO_TARGET)
-	$(ECHO) "  RUN     $(DEMO_TARGET)"
-	$(Q)$(OBJDIR)/$(DEMO_TARGET)
+# Run demos
+demo: $(DEMO_TARGETS)
+	$(Q)for t in $(DEMO_NAMES); do \
+		echo "  RUN     $$t"; \
+		$(OBJDIR)/$$t; \
+	done
 
 # Build on-demand allocator comparison bench (not part of `all` / `test`).
 $(OBJDIR)/$(BENCH_TARGET): $(BENCH_SRC) $(HEADERS) | $(OBJDIR)
@@ -371,10 +372,11 @@ uninstall:
 # Clean build artifacts
 clean:
 	$(ECHO) "  CLEAN   $(OBJDIR)"
-	$(Q)rm -f $(OBJDIR)/$(TESTER_TARGET) $(OBJDIR)/$(DEMO_TARGET) $(OBJDIR)/$(BENCH_TARGET)
+	$(Q)rm -f $(OBJDIR)/$(TESTER_TARGET) $(DEMO_TARGETS) $(OBJDIR)/$(BENCH_TARGET)
 	$(Q)rm -f $(OBJDIR)/*.o $(OBJDIR)/*.d $(OBJDIR)/*.gcda $(OBJDIR)/*.gcno $(OBJDIR)/*.gcov
 	$(Q)rm -f $(OBJDIR)/perf.data $(OBJDIR)/perf.data.old
-	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET) $(BASEOBJDIR)/$(DEMO_TARGET) $(BASEOBJDIR)/$(BENCH_TARGET)
+	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET) $(addprefix $(BASEOBJDIR)/,$(DEMO_NAMES)) \
+		$(BASEOBJDIR)/$(BENCH_TARGET)
 	$(Q)rm -f *.gcov *.gcda *.gcno
 	$(ECHO) "Clean complete!"
 
@@ -397,7 +399,7 @@ help:
 	@echo "  make all               - Same as 'make'"
 	@echo "  make test              - Run test suite"
 	@echo "  make coverage          - Run tests and print gcov summary (release default)"
-	@echo "  make demo              - Run demo program"
+	@echo "  make demo              - Run demo programs"
 	@echo "  make bench             - Build/run allocator comparison bench (on-demand)"
 	@echo "  make profile           - Build profile binary + perf record/report (on-demand)"
 	@echo "  make clean             - Remove build artifacts"
@@ -435,5 +437,4 @@ help:
 
 # Include generated dependency files
 -include $(TESTER_DEPFILE)
--include $(DEMO_DEPFILE)
 -include $(BENCH_DEPFILE)
