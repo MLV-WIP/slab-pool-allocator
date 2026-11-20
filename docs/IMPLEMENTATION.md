@@ -50,7 +50,7 @@ distinct while reading below. See [terminology-glossary.md](terminology-glossary
 ## How to read
 
 1. **Component map** — who owns what (pool vs slab)  
-2. **Memory layout** + **Alignment design** — header protocol and axes  
+2. **Memory layout** + **Alignment design** — header protocol and alignment classes  
 3. **Request lifecycle** — one numeric alloc/free walkthrough  
 4. **Pool routing** / **Slab strategy** / **bitsets** / **address lookup** — internals  
 5. **Trim**, **smart pointers**, **LifetimeObserver**, **locks** as needed  
@@ -66,15 +66,15 @@ you need the “why pools / why slabs” story without code structure.
 ```
                     ┌─────────────────────────────────────┐
                     │  Pool — lifetime / routing domain   │
-                    │  (registry, header protocol, locks) │
+                    │  (header protocol, locks)           │
                     └──────────────┬──────────────────────┘
                                    │
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                    ▼
-     AbstractSlab           AbstractSlab          SlabProxy
-     Slab<16> …          (fixed-size slots)    (>axis max → ::new[])
+     ISlab                  ISlab                 SlabProxy
+     Slab<…> …         (size-class engine)   (>class max → ::new[])
               │
-              └── per-slab SpinLock, bitsets, base_address_map
+              └── Block → Slot; per-slab SpinLock, bitsets, base_address_map
 
   Smart pointers / PoolAllocator / PoolMemoryResource ──► clients via PoolLifetimeToken / PoolHandle
   LifetimeObserver                 (stand-alone; not part of Pool)
@@ -92,7 +92,7 @@ Destroying a `Pool` destroys its slab backends. Speeding up 64-byte churn is
 primarily a slab concern; naming “memory for this shard” is a pool concern.
 Background: [CONCEPTS.md](CONCEPTS.md#what-is-a-pool-and-why-use-one).
 
-`AbstractSlab` is the narrow virtual interface (`allocateItem` /
+`ISlab` is the narrow virtual interface (`allocateItem` /
 `deallocateItem` / reclaim / accounting) that lets `Pool` treat size-class
 `Slab`s and `SlabProxy` uniformly after routing.
 
@@ -172,7 +172,7 @@ first, then re-poisons if the peek path fails.
 | 128 | 8 | 8 | 136 | 192B | ~6% |
 | 100 | 8 | 8 | 108 | 128B | 8% |
 | 16 | 8 | 8 | 24 | 32B | 50% |
-| 64 | 64 | 64 | 128 | 128B (axis 64) | 100% |
+| 64 | 64 | 64 | 128 | 128B (alignment class 64) | 100% |
 
 Tiny objects pay a higher relative header tax; that is expected. Bitset and
 class waste are additional — always reason in footprints when estimating.
@@ -193,43 +193,43 @@ size-mismatch bugs, and supports variable alignment without pointer tagging.
 ## Alignment design
 
 Alignment is both a **user contract** (`allocate`’s second argument /
-`alignof(T)` from factories) and a **routing key** into a size-class axis.
+`alignof(T)` from factories) and a **routing key** into an alignment-class size ladder.
 
 | Rule | Detail |
 |------|--------|
 | Default | `alignment = 8` |
 | Allowed | Power of two in `[4, 64]`; else `invalid_argument` in **all** builds (including release) |
 | Header width | `header_size = max(8, alignment)` |
-| Native axis | `nativeAxis`: 4/8/16 → **16**; 32 → 32; 64 → 64 |
-| Storage | `Slab<ElemSize, Alignment>` per axis ladder |
-| Lazy axes | 32/64 slab objects created on first use |
-| Over axis max | `SlabProxy` with `align_val_t{64}` |
+| Native alignment class | `nativeAlignmentClass`: 4/8/16 → **16**; 32 → 32; 64 → 64 |
+| Storage | `Slab<ElemSize, Alignment>` per alignment ladder |
+| High-align ladders | 32/64 engines installed eagerly; Blocks may map on first use |
+| Over alignment-class max | `SlabProxy` with `align_val_t{64}` |
 | Factories | `static_assert(alignof(T) ≤ 64)` |
 
 Non-power-of-two values in range (for example 12) are rejected even in release:
-header/axis math assumes power-of-two alignment.
+header/alignment-class math assumes power-of-two alignment.
 
 ### Why compound keys?
 
 High-align requests must not share a native-16 slot layout with a narrower
-header story. If a 64-align object lived in an axis-16 128B slot with only an
-8-byte header, free could not recover a consistent axis from `header_size`, and
+header story. If a 64-align object lived in an alignment-class-16 128B slot with only an
+8-byte header, free could not recover a consistent alignment class from `header_size`, and
 slot bases would not guarantee the user’s alignment. Separate
 `Slab<ElemSize, Alignment>` specializations keep:
 
 - slot stride = `ElemSize` (multiple of `Alignment`)  
 - freemap bit ↔ exact slot base  
-- `header_size` recoverable as 8/16/32/64 and mapped back to an axis  
+- `header_size` recoverable as 8/16/32/64 and mapped back to an alignment class  
 
-### Axis ladders
+### Alignment ladders
 
 ```
-Axis 16 (eager): 16 … 1024
-Axis 32:  32 … 2048
-Axis 64:  64 … 4096
+Alignment class 16 (eager): 16 … 1024
+Alignment class 32:  32 … 2048
+Alignment class 64:  64 … 4096
 ```
 
-Request align 4/8 **over-aligns** into axis 16 (slots are at least 16-aligned).
+Request align 4/8 **over-aligns** into alignment class 16 (slots are at least 16-aligned).
 That is intentional: one hot ladder for the common case; pay for 32/64 only on
 first use.
 
@@ -237,9 +237,9 @@ first use.
 
 | Call | Header | Footprint | Path |
 |------|--------|-----------|------|
-| `allocate(64)` | 8 | 72 | 96B class, axis 16 |
-| `allocate(64, 16)` | 16 | 80 | 96B class, axis 16 |
-| `allocate(64, 64)` | 64 | 128 | 128B class, axis 64 |
+| `allocate(64)` | 8 | 72 | 96B class, alignment class 16 |
+| `allocate(64, 16)` | 16 | 80 | 96B class, alignment class 16 |
+| `allocate(64, 64)` | 64 | 128 | 128B class, alignment class 64 |
 
 ### Ladder and prealloc sizing (empirical context)
 
@@ -257,7 +257,7 @@ Zhou et al. ASPLOS 2024 on TCMalloc fleets) repeat a few stable patterns:
 General-purpose mallocs (jemalloc, TCMalloc, ...) respond with many fine size
 classes in the small regime and a separate large/page path. That density is
 tuned for a *process-global* heap with fleet-wide histograms. This library is a
-**named domain** allocator: a jemalloc-shaped geometric ladder on the hot axis,
+**named domain** allocator: a jemalloc-shaped geometric ladder on the hot alignment class,
 then `SlabProxy` for overflow, is intentional - not a goal to match TCMalloc's
 ~60-90 classes.
 
@@ -265,10 +265,10 @@ then `SlabProxy` for overflow, is intentional - not a goal to match TCMalloc's
 
 | Choice | Rationale |
 |--------|-----------|
-| Axis-16 rungs through **1024** | Covers the count-dominated <1 KiB band for default align 8/16 |
-| Proxy beyond axis max | Large *volume* should not force every multi-KiB size through slot freemaps |
-| Default prealloc: axis <=16 and `ElemSize` <= **256** | Warm cold RSS where call rate concentrates; leave 384-1024 first-touch unless raised |
-| High-align axes not pre-warmed by default | High-align traffic is rare vs the mass of the size distribution |
+| Alignment-class-16 rungs through **1024** | Covers the count-dominated <1 KiB band for default align 8/16 |
+| Proxy beyond alignment-class max | Large *volume* should not force every multi-KiB size through slot freemaps |
+| Default prealloc: alignment class <=16 and `ElemSize` <= **256** | Warm cold RSS where call rate concentrates; leave 384-1024 first-touch unless raised |
+| High-align alignment classes not pre-warmed by default | High-align traffic is rare vs the mass of the size distribution |
 
 Always reason in **footprint** (user + header), not bare user size. Align-8
 `allocate(16)` lands in the **32** class (footprint 24), so the **16** rung is
@@ -280,9 +280,9 @@ size.
 - Do **not** densify toward TCMalloc's class count without a histogram of *this*
   pool's clients: more rungs cut internal waste but raise empty-class RSS and
   engine count.
-- If adjusting spacing, bias the **bottom** of axis 16 (systematic round-up
+- If adjusting spacing, bias the **bottom** of alignment class 16 (systematic round-up
   cliffs in the <=128 B user / <=~136 B footprint band), not the rare large end.
-- Raising `kPreallocateMaxElemSize` toward 512 or 1024 (still axis 16) trades
+- Raising `kPreallocateMaxElemSize` toward 512 or 1024 (still alignment class 16) trades
   construct RSS for fewer first-mmap stalls on cold <1 KiB classes; lowering
   toward 128 only if those mid rungs stay unused.
 - Raising `kPreallocateMaxAlignment` to 32/64 is usually unjustified by size-
@@ -306,8 +306,8 @@ of the current code; see [Thread safety](#thread-safety--lock-ordering).
 1. **Validate (pool, unlocked):** reject `N > kMaxAllocationBytes`; require
    power-of-two align in `[4, 64]`  
 2. **Compute (pool):** `header_size = 8`, `alloc_size = 108`  
-3. **Classify (pool):** `nativeAxis(8) → 16`; class **128B** (108 > 96)  
-4. **Resolve backend (lock-free):** pick eager registry index for the axis
+3. **Classify (pool):** `nativeAlignmentClass(8) → 16`; class **128B** (108 > 96)  
+4. **Resolve backend (lock-free):** pick eager registry index for the alignment class
    (`slabs16` / `slabs32` / `slabs64`); Slabs are installed at `Pool()` and
    never replaced  
 5. **Take Slot (slab lock):** find free bit, mark freemap / availability; return
@@ -322,7 +322,7 @@ Exclusive ownership of the user pointer begins at step 6.
 1. **Peek (pool):** read header behind user pointer (ASan unpoison peek if needed)  
 2. **Validate (pool):** magic / `header_size` / footprint; else fail per API  
 3. **Recover base (pool):** `base = item - header_size`; clear magic  
-4. **Re-route (pool):** backend from `(alloc_size, axis-from-header_size)`  
+4. **Re-route (pool):** backend from `(alloc_size, alignment-class-from-header_size)`  
 5. **Free Slot (slab lock):** `deallocateItem(base)` — exact slot base only  
 6. **Retention:** empty Blocks stay mapped until [`trim`](#trim-and-rss)  
 
@@ -350,7 +350,7 @@ tests or docs almost always means forgetting the header.
 | Registry | When built | Contents |
 |----------|------------|----------|
 | `slabs16[12]` | With the pool (eager) | One size-class **Slab** per ladder rung; **never replaced/nulled** |
-| `slabs32` / `slabs64` | With the pool (eager) | Same shape for high-align axes |
+| `slabs32` / `slabs64` | With the pool (eager) | Same shape for high-align alignment classes |
 | `large_slab` | With the pool | Single `SlabProxy` instance |
 
 **Terminology (Slab vs Block vs Slot):** a **Slab** is the size-class engine for
@@ -367,9 +367,9 @@ Slots); each **Slot** is one `ElemSize` unit. Full glossary:
 knobs `kSlabTargetBytes` / `SPALLOCATOR_SLAB_TARGET_*` still size Blocks
 (names kept). Prefer **Block** in prose.
 
-**Routing:** `resolveSlab(alloc_size, axis)` runs `selectClassIndex`. A normal
+**Routing:** `resolveSlab(alloc_size, alignment_class)` runs `selectClassIndex`. A normal
 index picks a size-class Slab; `kSlabIndexNpos` means footprint exceeds that
-axis’s max → `large_slab`. All registry lookups are **lock-free**.
+alignment class’s max → `large_slab`. Lookups are **lock-free**.
 
 **Cold-start Blocks:** every Slab exists after `Pool()`, but only some map a
 first Block at construction. Policy (override via `-D` / `./configure`):
@@ -377,7 +377,7 @@ first Block at construction. Policy (override via `-D` / `./configure`):
 | Knob | Default | Meaning |
 |------|---------|---------|
 | `kPreallocateMaxElemSize` | 256 | Preallocate when `ElemSize <=` this |
-| `kPreallocateMaxAlignment` | 16 | …and `Alignment <=` this (raise to 32/64 to warm high-align axes) |
+| `kPreallocateMaxAlignment` | 16 | …and `Alignment <=` this (raise to 32/64 to warm high-align alignment classes) |
 
 Defaults bias warm Blocks toward the small-object call-rate band; see
 [Ladder and prealloc sizing](#ladder-and-prealloc-sizing-empirical-context).
@@ -386,7 +386,7 @@ Other Slabs stay at zero Blocks until the first `allocateItem` (under the
 per-slab lock). `trim` only reclaims empty **Blocks** inside Slabs — never
 registry indices.
 
-`selectSlab` / `selectClassIndex` are pure classification helpers: usable from
+`selectClassIndex` is a pure classification helper: usable from
 tests and constexpr-friendly call sites, and shared by allocate and free so both
 paths agree on the ladder.
 
@@ -395,7 +395,7 @@ paths agree on the ladder.
 ## Slab strategy
 
 Each `Slab<ElemSize, Alignment>` is a **fixed-size recycler** for one rung of
-one axis.
+one alignment class.
 
 **Owns**
 
@@ -426,7 +426,7 @@ returned to the OS on the last free — see [Trim and RSS](#trim-and-rss).
 
 ### `SlabProxy`
 
-Large / overflow path behind the same `AbstractSlab` interface:
+Large / overflow path behind the same `ISlab` interface:
 
 - `allocateItem` → aligned `new[]`  
 - `deallocateItem` → `delete[]` (no freemap, no retention)  
@@ -434,7 +434,7 @@ Large / overflow path behind the same `AbstractSlab` interface:
 
 The pool still attaches the usual header on the returned user pointer so free
 looks the same. Choosing proxy vs size-class is purely a routing decision from
-footprint + axis max.
+footprint + alignment-class max.
 
 ---
 
@@ -810,12 +810,12 @@ instances share no locks — isolation is free at the domain boundary.
 |------|----------|------------------|
 | Per-`Slab` `SpinLock` | Freemap, availability, address map, Block growth | Brief — bit ops, map update, optional first-Block map |
 
-Pool no longer holds registry locks: all axis Slabs are installed in `Pool()`
+Pool no longer holds registry locks: all alignment-class Slabs are installed in `Pool()`
 and the directory is immutable for the pool lifetime.
 
 ### Ordering intent
 
-- Common allocate / free (any axis): lock-free resolve → `Slab::lock` (slot /
+- Common allocate / free (any alignment class): lock-free resolve → `Slab::lock` (slot /
   block growth)  
 - Avoid nesting unrelated slab locks across classes unless a future API requires
   it (today’s hot path never does)  
@@ -939,7 +939,7 @@ checks — do not mix debug and release TUs against the same `SpinLock` layout.
 |-----------|-----------|-------|
 | Alloc (size class) | O(1) | Next-fit cursor; cold scan O(slots / 64) via CTZ |
 | Free (size class) | O(log m) | Address map; m = Blocks in that Slab |
-| `selectSlab` | O(1) | Ladder of compares |
+| `selectClassIndex` | O(1) | Ladder of compares |
 | `SpinLock` uncontended | O(1) | Single atomic |
 | `SpinLock` contended | depends | Spin → sleep backoff → `wait` |
 | `SlabProxy` alloc/free | OS dependent | No slot freemap |
@@ -966,7 +966,7 @@ Waste has three buckets:
 |-------|--------|
 | Per-slab locks | Different size classes proceed in parallel after routing |
 | Multiple pools | Isolate shards / tenants; reduce cross-talk and lock sharing |
-| Eager Slabs + selective first-Block | Lock-free resolve on all axes; cold RSS only for configured warm classes |
+| Eager Slabs + selective first-Block | Lock-free resolve on all alignment classes; cold RSS only for configured warm classes |
 | `trim` | Reclaim RSS after spikes without changing the hot path |
 | `SlabProxy` | Avoids forcing huge objects through size-class bookkeeping |
 
@@ -997,7 +997,7 @@ samples *inside* the slab methods — lock cost without contention.
 
 | Candidate | Decision |
 |-----------|----------|
-| `AbstractSlab` de-virtualization | **Deferred** — no measurable vtable/thunk hotspot |
+| `ISlab` de-virtualization | **Deferred** — no measurable vtable/thunk hotspot |
 | Intrusive freelist | **Deferred** — scan/freemap not dominating post-`SlotFreemap` |
 | Denser free address map | **Deferred** — not a clear top-level hotspot; single-buffer free fast path remains |
 | Pluggable `SpinLock` vs `std::mutex` | **Deferred** — cost is uncontended TAS, not contention; mutex unlikely to help |
@@ -1016,8 +1016,8 @@ ns/op.
 ```bash
 make bench BUILD_TYPE=release
 make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
-make bench BUILD_TYPE=release BENCH_ARGS='--align=32'   # Pool vs ::new axis-32 spot
-make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new axis-64 spot
+make bench BUILD_TYPE=release BENCH_ARGS='--align=32'   # Pool vs ::new alignment-class-32 spot
+make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new alignment-class-64 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
 ```
 
@@ -1041,10 +1041,10 @@ Filters (for focused timing or profiling):
 | `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `pool_pmr`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk`. `pool_pmr` shows PMR virtual tax vs raw `pool` |
 | `--pool-stats` | (flag) | Opt-in `[PoolStats]` / slab retained dumps after scenarios |
 | `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
-| `--size-mix=` | `uniform` or `class` (default **class**) | `class` = equal weight per reachable axis-16 size class (exact-fit user size); better multi-slab coverage than uniform bytes |
+| `--size-mix=` | `uniform` or `class` (default **class**) | `class` = equal weight per reachable alignment-class-16 size class (exact-fit user size); better multi-slab coverage than uniform bytes |
 
 Default alignment is 8 (full comparative suite). `--align=32` and `--align=64`
-are Pool vs `::new` LIFO spot-checks for high-align axis/header tax (not a full
+are Pool vs `::new` LIFO spot-checks for high-align alignment-class/header tax (not a full
 alignment matrix).
 
 `SlabTest.AllocFreeChurnMicrobench` remains a light GTest smoke/`RecordProperty`
@@ -1114,7 +1114,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 | Address map | O(log m); denser structures deferred (P4 re-baseline) |
 | Fixed size-class ladders | Deliberate; exact-pack buffers within classes; non-ladder shaping is backlog R2 |
 | Lock type | Hard-wired `SpinLock`; pluggable mutex deferred (P4: uncontended TAS dominates, not contention) |
-| `AbstractSlab` virtuals | Deferred de-virt (P4: no measurable thunk hotspot) |
+| `ISlab` virtuals | Deferred de-virt (P4: no measurable thunk hotspot) |
 | MSan in CI | Deferred pending host instrumented runtime |
 | Metrics API | `PoolStats` / `Pool::stats()` (HWMs always; alloc/free tallies opt-in via `SPALLOCATOR_POOL_COUNTERS`); richer per-class breakdown later |
 | C API | C++ only today; C99 wrapper is backlog R4 |
@@ -1145,7 +1145,7 @@ Roy / C++ Memory Management alignment pass on `PR-CMM-alignment`:
 - Per-class breakdown on top of `PoolStats` (counters/HWMs already shipped)  
 - Intrusive freelist — **deferred** (P4 re-baseline; revive if scan dominates)  
 - Denser free address lookup — **deferred** (P4 re-baseline; revive if map hot at large `m`)  
-- `AbstractSlab` de-virt — **deferred** (P4 re-baseline)  
+- `ISlab` de-virt — **deferred** (P4 re-baseline)  
 - Thread-local caches; NUMA-aware buffers  
 - Lock-free fast paths / fewer per-op lock acquisitions if TAS tax remains primary  
 - Configurable SpinLock backoff parameters  

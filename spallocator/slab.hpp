@@ -77,7 +77,7 @@ namespace spallocator
         "kSlabTargetBytes must be >= kSlabTargetMultiplier");
     static_assert((kSlabTargetBytes & (kSlabTargetBytes - 1)) == 0,
         "kSlabTargetBytes must be a power of two");
-    // Largest ladder ElemSize today is 4096 (axis 64).
+    // Largest ladder ElemSize today is 4096 (alignment class 64).
     static_assert(kSlabTargetMultiplier * 4096ull >= kSlabTargetBytes,
         "kSlabTargetMultiplier too small for largest ElemSize under target");
 
@@ -93,7 +93,7 @@ namespace spallocator
     }
 
 
-    class AbstractSlab
+    class ISlab
     {
     public: // methods
         virtual std::byte* allocateItem(std::size_t size) = 0;
@@ -104,16 +104,16 @@ namespace spallocator
         virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
         virtual std::size_t getAllocatedMemory() const { return 0; }
 
-        virtual ~AbstractSlab() = default;
+        virtual ~ISlab() = default;
 
     protected: // methods
-        AbstractSlab() = default;
+        ISlab() = default;
 
     private: // methods
-        AbstractSlab(const AbstractSlab&) = delete;
-        AbstractSlab& operator=(const AbstractSlab&) = delete;
-        AbstractSlab(AbstractSlab&&) = delete;
-        AbstractSlab& operator=(AbstractSlab&&) = delete;
+        ISlab(const ISlab&) = delete;
+        ISlab& operator=(const ISlab&) = delete;
+        ISlab(ISlab&&) = delete;
+        ISlab& operator=(ISlab&&) = delete;
     };
 
 
@@ -154,7 +154,7 @@ namespace spallocator
     // Compound key: every slot is Alignment-aligned because the Block uses
     // align_val_t{Alignment} and ElemSize is a multiple of Alignment.
     template<std::size_t ElemSize, std::size_t Alignment = 16>
-    class Slab: public AbstractSlab
+    class Slab: public ISlab
     {
     public: // methods
         std::byte* allocateItem(std::size_t size) override;
@@ -230,7 +230,7 @@ namespace spallocator
     // allocations that aren't suitable for small-memory slab
     // optimizations
     //
-    class SlabProxy: public AbstractSlab
+    class SlabProxy: public ISlab
     {
     public: // methods
         std::byte* allocateItem(std::size_t size) override;
@@ -279,10 +279,10 @@ namespace spallocator
 
 
     // ---------------------------------------------------------------------------
-    // AbstractSlab
+    // ISlab
     // ---------------------------------------------------------------------------
 
-    inline std::size_t AbstractSlab::reclaimEmptyBlocks(std::size_t /*keep_min*/)
+    inline std::size_t ISlab::reclaimEmptyBlocks(std::size_t /*keep_min*/)
     {
         return 0;
     }
@@ -868,7 +868,7 @@ namespace spallocator
     // SlabProxy
     // ---------------------------------------------------------------------------
 
-    // Oversize / beyond-axis-max path. Always uses 64-byte aligned new/delete
+    // Oversize / beyond-alignment-class-max path. Always uses 64-byte aligned new/delete
     // so any Pool request alignment ≤ 64 is satisfied.
     inline constexpr std::size_t kProxyAlignment = 64;
 
@@ -876,7 +876,7 @@ namespace spallocator
     {
         // Active in all build types (not runtime_assert): mis-sized large
         // allocations must fail loudly rather than allocate or be rejected
-        // only under DEBUG_BUILD. Lower bound is the smallest axis max (1KB).
+        // only under DEBUG_BUILD. Lower bound is the smallest alignment-class max (1KB).
         if (elem_size <= 1_KB)
         {
             throw std::invalid_argument(

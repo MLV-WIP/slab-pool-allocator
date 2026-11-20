@@ -670,8 +670,8 @@ TEST(PoolTest, StatsTracksAllocFreeAndLiveHwm)
     EXPECT_EQ(empty.free_ok, 0u);
     EXPECT_EQ(empty.free_fail, 0u);
     EXPECT_EQ(empty.live_hwm, 0u);
-    EXPECT_GE(empty.retained_slab_bytes, 0u);
-    EXPECT_GE(empty.retained_hwm, empty.retained_slab_bytes);
+    EXPECT_GE(empty.retained_mapped_bytes, 0u);
+    EXPECT_GE(empty.retained_hwm, empty.retained_mapped_bytes);
 
     auto* a = pool.allocate(16);
     auto* b = pool.allocate(16);
@@ -679,7 +679,7 @@ TEST(PoolTest, StatsTracksAllocFreeAndLiveHwm)
     EXPECT_EQ(mid.live_allocations, 2u);
     EXPECT_EQ(mid.alloc_ok, 2u);
     EXPECT_EQ(mid.live_hwm, 2u);
-    EXPECT_GE(mid.retained_hwm, mid.retained_slab_bytes);
+    EXPECT_GE(mid.retained_hwm, mid.retained_mapped_bytes);
 
     pool.deallocate(a);
     PoolStats after_one = pool.stats();
@@ -795,7 +795,7 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
     Pool pool;
     const std::size_t before = pool.getAllocatedMemory();
 
-    // allocate(16) → footprint 24 → 32 B class on axis 16.
+    // allocate(16) → footprint 24 → 32 B class on alignment class 16.
     constexpr std::size_t kSlotsPerSlab = selectBlockSize<32>() / 32;
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
@@ -964,8 +964,8 @@ TEST(SlabTest, ZeroBlockEngineGrowsOnFirstAlloc)
 
 TEST(PoolTest, ColdRetainedMatchesPreallocatePolicy)
 {
-    // Why: default policy warms axis-16 classes with ElemSize <= 256 only;
-    // larger axis-16 rungs and all 32/64 engines start with zero data blocks.
+    // Why: default policy warms alignment-class-16 classes with ElemSize <= 256 only;
+    // larger alignment-class-16 rungs and all 32/64 engines start with zero data blocks.
     // Guarding the knobs documents the contract for -D overrides.
     EXPECT_TRUE(shouldPreallocateFirstBlock(256, 16));
     EXPECT_FALSE(shouldPreallocateFirstBlock(384, 16));
@@ -982,8 +982,8 @@ TEST(PoolTest, ColdRetainedMatchesPreallocatePolicy)
     Pool pool;
     EXPECT_EQ(pool.getAllocatedMemory(), expected);
 
-    // Touch a cold large axis-16 class and a high-align class; both grow on demand.
-    auto* large = pool.allocate(400); // footprint 408 → 512B axis 16
+    // Touch a cold large alignment-class-16 class and a high-align class; both grow on demand.
+    auto* large = pool.allocate(400); // footprint 408 → 512B alignment class 16
     ASSERT_NE(large, nullptr);
     EXPECT_GT(pool.getAllocatedMemory(), expected);
     pool.deallocate(large);
@@ -1116,76 +1116,76 @@ TEST(PoolTest, Selector)
 {
     Pool pool;
 
-    // Default selectSlab(size) ⇒ axis 16
-    EXPECT_EQ(pool.selectSlab(16), 0u);
-    EXPECT_EQ(pool.selectSlab(32), 1u);
-    EXPECT_EQ(pool.selectSlab(48), 2u);
-    EXPECT_EQ(pool.selectSlab(64), 3u);
-    EXPECT_EQ(pool.selectSlab(96), 4u);
-    EXPECT_EQ(pool.selectSlab(128), 5u);
-    EXPECT_EQ(pool.selectSlab(192), 6u);
-    EXPECT_EQ(pool.selectSlab(256), 7u);
-    EXPECT_EQ(pool.selectSlab(384), 8u);
-    EXPECT_EQ(pool.selectSlab(512), 9u);
-    EXPECT_EQ(pool.selectSlab(768), 10u);
-    EXPECT_EQ(pool.selectSlab(1024), 11u);
-    EXPECT_EQ(pool.selectSlab(1500), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(pool.selectSlab(2000), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(pool.selectSlab(3000), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(pool.selectSlab(4000), std::numeric_limits<std::size_t>::max());
-    EXPECT_EQ(pool.selectSlab(5000), std::numeric_limits<std::size_t>::max());
+    // Default selectClassIndex(size, kSlabNativeAlignment) ⇒ class 16
+    EXPECT_EQ(selectClassIndex(16, kSlabNativeAlignment), 0u);
+    EXPECT_EQ(selectClassIndex(32, kSlabNativeAlignment), 1u);
+    EXPECT_EQ(selectClassIndex(48, kSlabNativeAlignment), 2u);
+    EXPECT_EQ(selectClassIndex(64, kSlabNativeAlignment), 3u);
+    EXPECT_EQ(selectClassIndex(96, kSlabNativeAlignment), 4u);
+    EXPECT_EQ(selectClassIndex(128, kSlabNativeAlignment), 5u);
+    EXPECT_EQ(selectClassIndex(192, kSlabNativeAlignment), 6u);
+    EXPECT_EQ(selectClassIndex(256, kSlabNativeAlignment), 7u);
+    EXPECT_EQ(selectClassIndex(384, kSlabNativeAlignment), 8u);
+    EXPECT_EQ(selectClassIndex(512, kSlabNativeAlignment), 9u);
+    EXPECT_EQ(selectClassIndex(768, kSlabNativeAlignment), 10u);
+    EXPECT_EQ(selectClassIndex(1024, kSlabNativeAlignment), 11u);
+    EXPECT_EQ(selectClassIndex(1500, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(2000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(3000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(4000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(5000, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
 
-    EXPECT_EQ(pool.selectSlab(1), 0u);
-    EXPECT_EQ(pool.selectSlab(15), 0u);
-    EXPECT_EQ(pool.selectSlab(17), 1u);
-    EXPECT_EQ(pool.selectSlab(31), 1u);
-    EXPECT_EQ(pool.selectSlab(33), 2u);
-    EXPECT_EQ(pool.selectSlab(47), 2u);
-    EXPECT_EQ(pool.selectSlab(49), 3u);
-    EXPECT_EQ(pool.selectSlab(63), 3u);
-    EXPECT_EQ(pool.selectSlab(65), 4u);
-    EXPECT_EQ(pool.selectSlab(95), 4u);
-    EXPECT_EQ(pool.selectSlab(97), 5u);
-    EXPECT_EQ(pool.selectSlab(127), 5u);
-    EXPECT_EQ(pool.selectSlab(129), 6u);
-    EXPECT_EQ(pool.selectSlab(191), 6u);
-    EXPECT_EQ(pool.selectSlab(193), 7u);
-    EXPECT_EQ(pool.selectSlab(255), 7u);
-    EXPECT_EQ(pool.selectSlab(257), 8u);
-    EXPECT_EQ(pool.selectSlab(383), 8u);
-    EXPECT_EQ(pool.selectSlab(385), 9u);
-    EXPECT_EQ(pool.selectSlab(511), 9u);
-    EXPECT_EQ(pool.selectSlab(513), 10u);
-    EXPECT_EQ(pool.selectSlab(767), 10u);
-    EXPECT_EQ(pool.selectSlab(769), 11u);
-    EXPECT_EQ(pool.selectSlab(1023), 11u);
-    EXPECT_EQ(pool.selectSlab(1025), std::numeric_limits<std::size_t>::max());
+    EXPECT_EQ(selectClassIndex(1, kSlabNativeAlignment), 0u);
+    EXPECT_EQ(selectClassIndex(15, kSlabNativeAlignment), 0u);
+    EXPECT_EQ(selectClassIndex(17, kSlabNativeAlignment), 1u);
+    EXPECT_EQ(selectClassIndex(31, kSlabNativeAlignment), 1u);
+    EXPECT_EQ(selectClassIndex(33, kSlabNativeAlignment), 2u);
+    EXPECT_EQ(selectClassIndex(47, kSlabNativeAlignment), 2u);
+    EXPECT_EQ(selectClassIndex(49, kSlabNativeAlignment), 3u);
+    EXPECT_EQ(selectClassIndex(63, kSlabNativeAlignment), 3u);
+    EXPECT_EQ(selectClassIndex(65, kSlabNativeAlignment), 4u);
+    EXPECT_EQ(selectClassIndex(95, kSlabNativeAlignment), 4u);
+    EXPECT_EQ(selectClassIndex(97, kSlabNativeAlignment), 5u);
+    EXPECT_EQ(selectClassIndex(127, kSlabNativeAlignment), 5u);
+    EXPECT_EQ(selectClassIndex(129, kSlabNativeAlignment), 6u);
+    EXPECT_EQ(selectClassIndex(191, kSlabNativeAlignment), 6u);
+    EXPECT_EQ(selectClassIndex(193, kSlabNativeAlignment), 7u);
+    EXPECT_EQ(selectClassIndex(255, kSlabNativeAlignment), 7u);
+    EXPECT_EQ(selectClassIndex(257, kSlabNativeAlignment), 8u);
+    EXPECT_EQ(selectClassIndex(383, kSlabNativeAlignment), 8u);
+    EXPECT_EQ(selectClassIndex(385, kSlabNativeAlignment), 9u);
+    EXPECT_EQ(selectClassIndex(511, kSlabNativeAlignment), 9u);
+    EXPECT_EQ(selectClassIndex(513, kSlabNativeAlignment), 10u);
+    EXPECT_EQ(selectClassIndex(767, kSlabNativeAlignment), 10u);
+    EXPECT_EQ(selectClassIndex(769, kSlabNativeAlignment), 11u);
+    EXPECT_EQ(selectClassIndex(1023, kSlabNativeAlignment), 11u);
+    EXPECT_EQ(selectClassIndex(1025, kSlabNativeAlignment), std::numeric_limits<std::size_t>::max());
 
-    // Align 4/8 map to axis 16
-    EXPECT_EQ(nativeAxis(4), 16u);
-    EXPECT_EQ(nativeAxis(8), 16u);
-    EXPECT_EQ(nativeAxis(16), 16u);
-    EXPECT_EQ(nativeAxis(32), 32u);
-    EXPECT_EQ(nativeAxis(64), 64u);
-    EXPECT_EQ(pool.selectSlab(64, 8), pool.selectSlab(64));
-    EXPECT_EQ(pool.selectSlab(64, 4), pool.selectSlab(64));
+    // Align 4/8 map to alignment class 16
+    EXPECT_EQ(nativeAlignmentClass(4), 16u);
+    EXPECT_EQ(nativeAlignmentClass(8), 16u);
+    EXPECT_EQ(nativeAlignmentClass(16), 16u);
+    EXPECT_EQ(nativeAlignmentClass(32), 32u);
+    EXPECT_EQ(nativeAlignmentClass(64), 64u);
+    EXPECT_EQ(selectClassIndex(64, nativeAlignmentClass(8)), selectClassIndex(64, kSlabNativeAlignment));
+    EXPECT_EQ(selectClassIndex(64, nativeAlignmentClass(4)), selectClassIndex(64, kSlabNativeAlignment));
 
-    // Explicit axis 32 ladder (incl. denser top)
-    EXPECT_EQ(pool.selectSlab(32, 32), 0u);
-    EXPECT_EQ(pool.selectSlab(96, 32), 2u);
-    EXPECT_EQ(pool.selectSlab(1024, 32), 9u);
-    EXPECT_EQ(pool.selectSlab(1536, 32), 10u);
-    EXPECT_EQ(pool.selectSlab(2048, 32), 11u);
-    EXPECT_EQ(pool.selectSlab(2049, 32), std::numeric_limits<std::size_t>::max());
+    // Explicit alignment-class-32 ladder (incl. denser top)
+    EXPECT_EQ(selectClassIndex(32, 32), 0u);
+    EXPECT_EQ(selectClassIndex(96, 32), 2u);
+    EXPECT_EQ(selectClassIndex(1024, 32), 9u);
+    EXPECT_EQ(selectClassIndex(1536, 32), 10u);
+    EXPECT_EQ(selectClassIndex(2048, 32), 11u);
+    EXPECT_EQ(selectClassIndex(2049, 32), std::numeric_limits<std::size_t>::max());
 
-    // Explicit axis 64 ladder
-    EXPECT_EQ(pool.selectSlab(64, 64), 0u);
-    EXPECT_EQ(pool.selectSlab(1024, 64), 7u);
-    EXPECT_EQ(pool.selectSlab(1536, 64), 8u);
-    EXPECT_EQ(pool.selectSlab(2048, 64), 9u);
-    EXPECT_EQ(pool.selectSlab(3072, 64), 10u);
-    EXPECT_EQ(pool.selectSlab(4096, 64), 11u);
-    EXPECT_EQ(pool.selectSlab(4097, 64), std::numeric_limits<std::size_t>::max());
+    // Explicit alignment-class-64 ladder
+    EXPECT_EQ(selectClassIndex(64, 64), 0u);
+    EXPECT_EQ(selectClassIndex(1024, 64), 7u);
+    EXPECT_EQ(selectClassIndex(1536, 64), 8u);
+    EXPECT_EQ(selectClassIndex(2048, 64), 9u);
+    EXPECT_EQ(selectClassIndex(3072, 64), 10u);
+    EXPECT_EQ(selectClassIndex(4096, 64), 11u);
+    EXPECT_EQ(selectClassIndex(4097, 64), std::numeric_limits<std::size_t>::max());
 }
 
 
@@ -1718,7 +1718,7 @@ TEST(PoolTest, HighAlignmentFactories)
 }
 
 
-// High-align size classes reuse slots; over-axis-max uses SlabProxy.
+// High-align size classes reuse slots; over-alignment-class-max uses SlabProxy.
 TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
 {
     Pool pool;
@@ -1735,7 +1735,7 @@ TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
         pool.deallocate(p);
     }
 
-    // Re-allocate into the same axis-64 size class (engine was eager; block may
+    // Re-allocate into the same alignment-class-64 size class (engine was eager; block may
     // have been created on the first round).
     for (int i = 0; i < 32; ++i)
     {
@@ -1744,7 +1744,7 @@ TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
         pool.deallocate(p);
     }
 
-    // Footprint > 4096 on axis 64 → Proxy (still 64-byte aligned storage).
+    // Footprint > 4096 on alignment class 64 → Proxy (still 64-byte aligned storage).
     auto* big = pool.allocate(4100, 64);
     EXPECT_NE(big, nullptr);
     EXPECT_EQ(reinterpret_cast<std::uintptr_t>(big) % 64, 0u);

@@ -184,15 +184,19 @@ API: [API.md — Slab & SlabProxy](API.md#slab--slabproxy).
 ## How this library composes them
 
 ```text
-  Pool                          ← lifetime / routing / isolation boundary
-    ├── Slab<16>, Slab<32>, …   ← fixed-size slot recycling per size class
-    ├── Slab<…, 32>, Slab<…, 64> (high-align axes; engines eager, blocks on demand)
-    └── SlabProxy               ← oversized: system new[] / delete[]
+  Pool                            ← lifetime / routing / isolation boundary
+    ├── Slab<ElemSize, Align>     ← size-class engine (alignment class 16 / 32 / 64)
+    │     └── Block               ← one mapped chunk
+    │           └── Slot          ← one ElemSize cell (freemap unit)
+    └── SlabProxy                 ← oversized: system new[] / delete[] (no Block/Slot recycle)
+
+  Item (allocateItem) = backend allocation at the slab layer (= slot base for Slab).
+  User pointer (Pool::allocate) = slot base + header.
 ```
 
 | Concept | Role here |
 |---------|-----------|
-| **`Pool`** | Public facade: choose a backend by footprint + alignment, write the allocation header, own the registry of slabs, provide `trim` / accounting, synchronize routing |
+| **`Pool`** | Public facade: choose a backend by footprint + alignment, write the allocation header, own the set of slabs, provide `trim` / accounting, synchronize routing |
 | **`Slab`** | Per–size-class engine: zero or more **Blocks**, freemap bits, address map, per-slab lock, growth / reclaim |
 | **`SlabProxy`** | Same *interface* as a slab backend, different *strategy* (no Block/Slot recycling) |
 
@@ -221,9 +225,9 @@ space (a 33-byte need may jump to 64). **Intermediate classes** (48, 96, 192,
 384, 768) reduce that waste while keeping the number of classes manageable.
 
 ```
-Axis 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Axis 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Axis 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Alignment class 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
+Alignment class 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+Alignment class 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 ```
 
 ### Internal vs external fragmentation
@@ -256,16 +260,16 @@ If you compare “100 vs 128” without the header, you mis-predict the class an
 mis-estimate waste. Always reason in footprints when studying behavior or
 writing tests.
 
-### Alignment axes
+### Alignment classes
 
 Alignment is part of the size-class story:
 
-- Request align **4 or 8** shares the native **16-byte** axis (slots may be
+- Request align **4 or 8** shares the native **16-byte** alignment class (slots may be
   over-aligned; that is fine).  
 - Align **32** or **64** uses a **separate ladder** so the user pointer can meet
   a stricter align while the header still fits in front.  
-- Those higher axes are created **lazily** — you do not pay for them until
-  something asks.  
+- Higher alignment-class **engines** are installed with the Pool; **Blocks** on
+  those ladders often map on first use (prealloc knobs control warm start).  
 
 Contracts for `allocate(size, alignment)`: [API.md — Pool](API.md#pool).
 
@@ -275,16 +279,16 @@ Real allocators see the same skew repeatedly: **most calls** are small objects;
 **most bytes** sit in fewer large ones. A process-global malloc (jemalloc /
 TCMalloc style) answers with a dense small-size class table. This library is a
 **named domain** pool: a coarser jemalloc-shaped geometric ladder on the hot
-axis, then a large fallback, is intentional — not a goal to match TCMalloc’s
+alignment class, then a large fallback, is intentional — not a goal to match TCMalloc’s
 class count.
 
 Practical takeaways:
 
-- Keep the shipped axis-16 shape unless a **client size histogram** says
+- Keep the shipped alignment-class-16 shape unless a **client size histogram** says
   otherwise; densifying without data buys RSS and engine count for little gain.
-- If you do retune spacing, bias the **bottom** of axis 16 (header-inflated
+- If you do retune spacing, bias the **bottom** of alignment class 16 (header-inflated
   small footprints), not the rare large end.
-- Default cold-start prealloc (axis ≤16, ElemSize ≤256) warms where call rate
+- Default cold-start prealloc (alignment class ≤16, ElemSize ≤256) warms where call rate
   concentrates; raising it is an RSS vs first-touch tradeoff, not a research
   mandate.
 
@@ -325,7 +329,7 @@ recovers the slot base, and asks the owning slab backend to free that base (or
 - Do not free interior pointers (`p + 1`) — free must see a real user pointer
   from `allocate` / a factory.  
 - Header width grows with alignment (`max(8, alignment)`), which is why
-  high-align requests change footprint and sometimes axis.  
+  high-align requests change footprint and sometimes alignment class.  
 
 Byte-level layout: [IMPLEMENTATION.md — Memory layout](IMPLEMENTATION.md#memory-layout).
 
@@ -436,7 +440,7 @@ story — and that granularity mirrors the pool-vs-slab split.
 ### Two levels
 
 1. **Pool lock** — short critical sections for routing (“which slab handles this
-   footprint?”) and size-class routing (including high-align 32/64-axis
+   footprint?”) and size-class routing (including high-align 32/64-class
    slabs).  
 2. **Per-slab lock** — protects that size class’s bitsets and address map.  
 
@@ -748,9 +752,9 @@ line up with - or deliberately differ from - this codebase:
 
 **Alignment note:** Roy's academic chunked example often rounds categories to
 powers of two so contiguous slots stay aligned. This library instead uses
-explicit `Slab<ElemSize, Alignment>` axes and a pool header of
+explicit `Slab<ElemSize, Alignment>` alignment classes and a pool header of
 `max(8, alignment)`, so high-align traffic does not share a layout that cannot
-recover axis and slot base on free.
+recover alignment class and slot base on free.
 
 **Synchronization note:** allocation APIs must be thread-safe. Roy's samples
 often use `std::mutex` and warn that lock cost on free can erase gains. This
@@ -766,8 +770,9 @@ More design detail:
 ## Terminology
 
 Locked stack: **Pool** → **Slab** (size-class engine) → **Block** (mapped chunk)
-→ **Slot**. Keep type name `Slab`; Slot stays. Lifetime: `PoolLifetimeToken`
-pin; `PoolControlBlock` kept. Full glossary:
+→ **Slot**. **Item** = external/backend allocation name (`allocateItem`); for a
+`Slab` that Item is a **slot base**. Lifetime: `PoolLifetimeToken`;
+`PoolControlBlock` kept. Full glossary:
 [terminology-glossary.md](terminology-glossary.md).
 
 ---

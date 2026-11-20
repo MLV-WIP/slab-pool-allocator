@@ -30,10 +30,10 @@ convenience and defines allocator-only size caps.
   - [`trim`](#trim)
   - [`getAllocatedMemory`](#getallocatedmemory)
   - [`stats` / `PoolStats`](#stats--poolstats)
-  - [`selectSlab`](#selectslab)
+  - [`selectClassIndex`](#selectclassindex)
   - [Lifetime models](#lifetime-models)
 - [Slab & SlabProxy](#slab--slabproxy)
-  - [`AbstractSlab`](#abstractslab)
+  - [`ISlab`](#islab)
   - [`Slab`](#slab)
   - [`SlabProxy`](#slabproxy)
   - [`DynBitset`](#dynbitset)
@@ -54,7 +54,7 @@ convenience and defines allocator-only size caps.
 |--------|------------------|
 | `spallocator/pool.hpp` | `Pool`, ladders (includes `pool_lifetime.hpp`) |
 | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolLifetimeToken`, `PoolControlBlock` |
-| `spallocator/slab.hpp` | `AbstractSlab`, `Slab`, `SlabProxy`, `DynBitset` |
+| `spallocator/slab.hpp` | `ISlab`, `Slab`, `SlabProxy`, `DynBitset` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
 | `spallocator/pool_pmr.hpp` | `PoolMemoryResource` (`std::pmr::memory_resource`; additive — not pulled by `spallocator.hpp`) |
 | `spallocator/helper.hpp` | Pool size caps; re-exports mlvlib helpers into `spallocator` |
@@ -67,10 +67,14 @@ convenience and defines allocator-only size caps.
                     └──────────────┬──────────────────────┘
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                    ▼
-     Slab<…> (fixed-size slots)          SlabProxy (large new[])
+     Slab<…> (size-class engine)          SlabProxy (large new[])
+              │
+              └── Block (mapped chunk) → Slot (cell)
   Smart pointers / PoolAllocator / PoolMemoryResource ──► PoolLifetimeToken / PoolHandle
   mlvlib::SpinLock / helpers       (submodule; SpinLock used by Pool/Slab)
 ```
+
+**Stack:** Pool → Slab → Block → Slot. **Item** (`allocateItem` / `deallocateItem`) is the backend allocation handle at the slab layer (a **slot base** for `Slab`); the Pool’s **user pointer** is `slot_base + header_size`.
 
 `Pool` and `Slab` are separate concepts: the Pool is the disposable / isolatable
 allocation domain you construct and pass around; each Slab is a size-class
@@ -129,28 +133,28 @@ Why pools exist as a concept: [CONCEPTS.md — Pool](CONCEPTS.md#what-is-a-pool-
 |------|---------|
 | `kMinAlignment` | Smallest allowed alignment (`4`) |
 | `kMaxAlignment` | Largest allowed alignment (`64`) |
-| `kSlabNativeAlignment` | Native axis for request align 4/8/16 (`16`) |
-| `kLadder16` / `kLadder32` / `kLadder64` | Slot sizes available on each alignment axis |
+| `kSlabNativeAlignment` | Native alignment class for request align 4/8/16 (`16`) |
+| `kLadder16` / `kLadder32` / `kLadder64` | Slot sizes available on each alignment class |
 | `kLadder*Count` | Number of entries in each ladder |
 | `kAllocMagic` | Byte written into the allocation header; checked (then cleared) on free |
 | `kSlabIndexNpos` | Sentinel from class selection meaning “use large path” |
 
 ```
-Axis 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Axis 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Axis 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Alignment class 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
+Alignment class 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+Alignment class 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 ```
 
-If the footprint exceeds the maximum class on that axis, the pool uses
+If the footprint exceeds the maximum class on that alignment class, the pool uses
 `SlabProxy` (system `new[]` / `delete[]`, always 64-byte aligned).
 
 Helpers you may see in headers (usually not called directly from apps):
 
 | Function | Role |
 |----------|------|
-| `nativeAxis(alignment)` | Maps request align 4/8 → 16; otherwise returns 32 or 64 |
-| `axisMaxElem(axis)` | Max size-class slot on that axis |
-| `selectClassIndex(alloc_size, axis)` | Ladder index or `kSlabIndexNpos` for large |
+| `nativeAlignmentClass(alignment)` | Maps request align 4/8 → 16; otherwise returns 32 or 64 |
+| `alignmentClassMaxElem(alignment_class)` | Max size-class slot on that alignment class |
+| `selectClassIndex(alloc_size, alignment_class)` | Ladder index or `kSlabIndexNpos` for large |
 
 ### Construction
 
@@ -166,7 +170,7 @@ PoolControlBlock* control() const noexcept;  // diagnostics
 
 | | |
 |--|--|
-| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); all axis Slabs installed; first **Blocks** follow preallocate knobs (default: axis ≤16 and ElemSize ≤256). |
+| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); all alignment-class Slabs installed; first **Blocks** follow preallocate knobs (default: alignment class ≤16 and ElemSize ≤256). |
 | **`~Pool`** | Marks the control block dead, then destroys slabs. Safe with outstanding `PoolLifetimeToken`s (arena observers). |
 | **Thread safety** | Construct/destroy from one thread; do not use the pool concurrently with its destructor. |
 | **Copy / move** | Deleted. |
@@ -354,7 +358,7 @@ a pointer to that payload (past the hidden header).
 
 ```cpp
 std::byte* p = pool.allocate(100);        // align 8 → typically 8-byte header
-std::byte* q = pool.allocate(64, 64);     // axis-64 size class
+std::byte* q = pool.allocate(64, 64);     // alignment-class-64 size class
 ```
 
 ### `deallocate` / `try_deallocate`
@@ -437,13 +441,13 @@ std::size_t getAllocatedMemory();
 ```cpp
 struct PoolStats {
     std::uint64_t live_allocations;     // outstanding successful allocs
-    std::uint64_t retained_slab_bytes;  // size-class Block bytes held (same basis as getAllocatedMemory; rename backlog)
+    std::uint64_t retained_mapped_bytes;  // size-class Block bytes held (same basis as getAllocatedMemory)
     std::uint64_t alloc_ok;
     std::uint64_t alloc_fail;           // size/align/cap/slab failures
     std::uint64_t free_ok;              // successful non-null frees
     std::uint64_t free_fail;            // try_deallocate returned false
     std::uint64_t live_hwm;             // peak live_allocations
-    std::uint64_t retained_hwm;         // peak retained_slab_bytes observed
+    std::uint64_t retained_hwm;         // peak retained_mapped_bytes observed
 };
 
 PoolStats stats();
@@ -463,29 +467,31 @@ auto s = pool.stats();
 if (s.live_hwm > threshold) { /* alert */ }
 ```
 
-### `selectSlab`
+### `selectClassIndex`
 
 ```cpp
-constexpr std::size_t selectSlab(std::size_t size) const;
-constexpr std::size_t selectSlab(std::size_t size, std::size_t alignment) const;
+constexpr std::size_t selectClassIndex(std::size_t alloc_size,
+                                       std::size_t alignment_class);
 ```
 
-Maps a **footprint** (already including header, when used like the pool’s
-internal path) onto a size-class index for the given axis. The one-argument
-overload uses the native axis 16.
+Free function (namespace `spallocator`). Maps a **footprint** onto a size-class
+**index** for the given **alignment class** (16 / 32 / 64) — not a `Slab*`.
+Use `nativeAlignmentClass(alignment)` to map a request alignment onto a class
+before calling. Overflow past that ladder’s max returns `kSlabIndexNpos`
+(large / `SlabProxy` path).
 
 | Parameter | Description |
 |-----------|-------------|
-| `size` | Footprint to classify (for diagnostics / tooling; apps normally call `allocate` instead). |
-| `alignment` | Request alignment used to pick axis 16 / 32 / 64. |
+| `alloc_size` | Footprint to classify (user size + header when matching the pool path). |
+| `alignment_class` | `16`, `32`, or `64` (from `nativeAlignmentClass` or an explicit ladder). |
 
 | | |
 |--|--|
-| **Returns** | Ladder index, or a sentinel meaning large-allocation path (`kSlabIndexNpos` in the underlying selector). |
+| **Returns** | Ladder index, or `kSlabIndexNpos` for the large-allocation path. |
 | **Thread safety** | Pure / constexpr-friendly; no shared mutable state. |
 
-Most applications never call this; it is useful for tests and tooling that
-want to assert which class a footprint would hit.
+Most applications never call this; tests and tooling use it to assert which
+class a footprint would hit. (`selectSlab` was removed.)
 
 ---
 
@@ -505,35 +511,35 @@ allocator. Conceptual background:
 [CONCEPTS.md — Slab](CONCEPTS.md#what-is-a-slab-and-why-use-one);
 [terminology-glossary.md](terminology-glossary.md).
 
-### `AbstractSlab`
+### `ISlab`
 
 Polymorphic interface shared by size-class Slabs and the large-allocation proxy.
 
 ```cpp
-class AbstractSlab {
+class ISlab {
 public:
     virtual std::byte* allocateItem(std::size_t size) = 0;
     virtual void deallocateItem(std::byte* item) = 0;
     virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
     virtual std::size_t getAllocatedMemory() const;
-    virtual ~AbstractSlab() = default;
+    virtual ~ISlab() = default;
 };
 ```
 
 | Method | Description |
 |--------|-------------|
-| `allocateItem(size)` | Allocate at least `size` bytes from this backend. For `Slab`, `size` must fit the template Slot size. Returns a **slot base** (exact cell start inside a Block) — *not* the user pointer; the Pool writes its header at the base and returns `base + header_size` to the caller. |
-| `deallocateItem(item)` | Free a **slot base** previously returned by `allocateItem` (not a user pointer). Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
+| `allocateItem(size)` | Allocate an **Item** (backend allocation). For `Slab`, returns a **slot base** (exact Slot start inside a Block) — *not* the Pool user pointer. The Pool writes its header at the base and returns `base + header_size`. |
+| `deallocateItem(item)` | Free an **Item** previously returned by `allocateItem` (a **slot base** for `Slab`, not a user pointer). Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
 | `reclaimEmptyBlocks(keep_min)` | Drop fully empty **Blocks**; keep at least `keep_min` (default 1). Default base implementation is a no-op; `Slab` overrides. Returns how many Blocks were deleted. |
 | `getAllocatedMemory()` | Bytes retained by this Slab’s **Blocks** (default `0`). |
 
-Copy/move of `AbstractSlab` are deleted.
+Copy/move of `ISlab` are deleted.
 
 ### `Slab`
 
 ```cpp
 template<std::size_t ElemSize, std::size_t Alignment = 16>
-class Slab : public AbstractSlab;
+class Slab : public ISlab;
 ```
 
 Fixed-size Slot allocator: each Slot is `ElemSize` bytes and `Alignment`-aligned
@@ -543,7 +549,7 @@ base-address map for frees. Owns zero or more **Blocks**.
 
 | Method | Description |
 |--------|-------------|
-| `allocateItem` / `deallocateItem` | See `AbstractSlab`; guarded by the Slab’s `SpinLock`. Slot base in / out — Pool owns the user-pointer offset. |
+| `allocateItem` / `deallocateItem` | See `ISlab`; guarded by the Slab’s `SpinLock`. Slot base in / out — Pool owns the user-pointer offset. |
 | `getElemSize()` / `getAlignment()` / `getAllocSize()` | Compile-time Slot size, alignment, and **Block** bytes (`selectBlockSize`; exact multiple of `ElemSize`; see `kSlabTargetBytes` / `kSlabTargetMultiplier`). |
 | `getAllocatedMemory()` | `getBlockCount() × getAllocSize()` currently retained (**Blocks** × Block bytes). |
 | `getAvailabilityMapBytes()` | Bytes used by the growable availability bitset (diagnostics). |
@@ -557,7 +563,7 @@ monotonic growth for alloc/free latency.
 ### `SlabProxy`
 
 ```cpp
-class SlabProxy : public AbstractSlab;
+class SlabProxy : public ISlab;
 ```
 
 Large / overflow path: each `allocateItem` is a distinct aligned `new[]`;

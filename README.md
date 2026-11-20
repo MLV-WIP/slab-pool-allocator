@@ -175,15 +175,15 @@ int main() {
 
 ### Size Classes
 
-Per-alignment ladders (`Slab<ElemSize, Alignment>`). Align 4/8 use the 16-byte axis.
+Per-alignment ladders (`Slab<ElemSize, Alignment>`). Align 4/8 use the 16-byte alignment class.
 
 ```
-Axis 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Axis 32 (lazy):  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Axis 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Alignment class 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
+Alignment class 32 (lazy):  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+Alignment class 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 ```
 
-Beyond an axis max → `SlabProxy` (always 64-byte aligned `new[]`).
+Beyond an alignment-class max → `SlabProxy` (always 64-byte aligned `new[]`).
 
 Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs are selected by **total footprint** (requested size + allocation header), not the user size alone — see [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 

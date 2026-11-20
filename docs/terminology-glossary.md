@@ -39,13 +39,14 @@ Plus: **SlabProxy** for oversized / beyond-ladder allocations (no slot recycling
 
 | Term | Recommended definition | Why this name |
 |------|------------------------|---------------|
-| **Pool** | Named allocation **domain**: lifetime / ownership / isolation boundary; routes by footprint + alignment; owns the header protocol; owns a registry of Slabs (+ SlabProxy). | Matches existing public API and CONCEPTS framing. Not a layout strategy. |
+| **Pool** | Named allocation **domain**: lifetime / ownership / isolation boundary; routes by footprint + alignment; owns the header protocol; owns Slabs (+ SlabProxy). | Matches existing public API and CONCEPTS framing. Not a layout strategy. |
 | **Slab** | Size-class **engine**: growable container of fixed-size, fixed-alignment **Slots**, implemented as zero or more **Blocks**. Type: `Slab<ElemSize, Alignment>`. | Keep for the object — matches Bonwick/kernel “slab cache” sense (the cache, not one page of objects). Do **not** use “slab” for a single mapped chunk. |
 | **Block** | One contiguous mapped allocation owned by a Slab, divided into a fixed number of Slots (`slab_alloc_size` / `ElemSize`). Growth adds Blocks; `trim` / reclaim drops empty Blocks. | Short, speaks well in APIs (`allocateNewBlock`, `getBlockCount`), and pairs cleanly as Pool → Slab → Block → Slot. See §3 for vs DataBlock / SlabBlock. |
 | **Slot** | One allocatable cell of `ElemSize` bytes inside a Block (exact base required on free). Pool may place a hidden header at the slot base and return `base + header_size` to the user. | Already correct in freemap / CONCEPTS language; make it the only name for that unit. |
+| **Item** | Backend allocation returned by `ISlab::allocateItem` / freed by `deallocateItem`. For `Slab`, the Item **is** the **slot base**; for `SlabProxy`, a standalone `new[]` base. Not the Pool **user pointer**. | Keep the Item API; use Slot/slot base in slab-layer prose; user pointer at Pool. |
 | **SlabProxy** | Backend for large / overflow footprints: each allocate is a standalone system `new[]` (no Block/Slot freemap). Still implements the slab-backend interface. | Keep; optionally later rename interface to “backend” (see fuzzy terms). |
 | **Footprint** | `user_size + header_size` used for class selection — not bare user size. | Keep; already the right teaching term. |
-| **Axis / ladder / size class** | Alignment axis (16/32/64) and its discrete ElemSize rungs. | Keep. |
+| **Alignment class / ladder / size class** | Alignment class (16/32/64) and its discrete ElemSize rungs. | Prefer “alignment class” over retired “axis”. |
 | **Header** | Pool-owned metadata bytes at the slot base (magic, header width, footprint). | Keep; slab backends never interpret it. |
 
 ### Aliases to retire (once locked)
@@ -92,9 +93,9 @@ Surveyed in slab-pool-allocator; mlvlib called out only where it touches the sam
 | **PoolLifetimeToken** | `pool_lifetime.hpp`, factories | “Block” ≠ storage Block | Document as lifetime pin; consider later rename to `PoolLifetimeToken` / `PoolPin` |
 | **PoolControlBlock** | lifetime | Same “block” root; but matches industry “control block” | Keep name; always say **control block** in prose |
 | **arena** | teardown mode vs bump-arena concept | “Arena mode” = destroy Pool first / bulk reclaim; not a bump allocator | Keep **arena teardown** / **arena path**; never “arena” alone for the Pool type |
-| **AbstractSlab** | `slab.hpp` | Fine as interface name; “Abstract” is OO noise | Optional later: `SlabBackend` / `ISlab` — low priority |
-| **retained_slab_bytes** | `PoolStats` | Means retained **Block** bytes across size-class Slabs, not “bytes in Slab objects” abstractly | Doc clarity now; rename later to `retained_block_bytes` if API churn is OK |
-| **selectSlab** | Pool helper | Returns a **class index**, not a Slab* | Prefer emphasizing `selectClassIndex`; deprecate or alias `selectSlab` in docs |
+| **ISlab** | `slab.hpp` | Backend interface (`Slab` / `SlabProxy`) | Renamed from `AbstractSlab` (Phase 4). |
+| **retained_mapped_bytes** | `PoolStats` | Mapped **Block** bytes across size-class Slabs (not live client use; not SlabProxy) | Renamed from `retained_slab_bytes` (Phase 4). |
+| **selectClassIndex** | Free function | Returns a **class index**, not a Slab* | `selectSlab` removed (Phase 4). |
 | **Finding a pointer’s slab** (CONCEPTS heading) | docs | Often means “which **Block** owns this address?” | Retitle to “Finding a pointer’s block” (or “owning block”) |
 | **chunk** | CONCEPTS (Roy “chunked pool”) | External teaching term only | Keep in further-reading mapping; do not adopt as a first-class local name |
 | **mlvlib “control block”** | `LifetimeObserver` | Same phrase as Pool control block; different type | Fine — different library; say `LifetimeObserver` control block when needed |
@@ -150,7 +151,7 @@ Order of operations after Michael locks names — **not started this round**.
 1. Repo copy under `docs/terminology-glossary.md` + README / CONCEPTS pointers.  
 2. CONCEPTS: retitled “Finding a pointer’s owning Block”; Block in growth/reclaim; Pool≠Slab kept.  
 3. IMPLEMENTATION: **Block** preferred over buffer/data-block; locked Slab/Block/Slot note.  
-4. API.md: Block vocabulary; AbstractSlab slot base vs user pointer.
+4. API.md: Block vocabulary; ISlab slot base vs user pointer.
 
 ### Phase 2 — Internal / private code identifiers — **committed** (`cdd6cdb`)
 
@@ -172,13 +173,17 @@ Hard renames (no aliases):
 | `PoolBlockToken` | `PoolLifetimeToken` |
 | `block_token()` | `lifetime_token()` |
 
-Kept: `PoolControlBlock`. Tests / AbstractSlab / docs updated.
+Kept: `PoolControlBlock`. Tests / ISlab / docs updated.
 
-### Phase 4 — Optional clarity renames (separate PR, after core terms)
+### Phase 4 — Clarity renames — **done in working tree** (awaiting review; uncommitted)
 
-- `allocateItem` / `deallocateItem` → slot-oriented names (or document “Item = backend allocation”).  
-- `retained_slab_bytes` → `retained_block_bytes`.  
-- CONCEPTS/API diagrams: show Pool → Slab → Block → Slot explicitly.
+- Keep Item API; document Item (backend) vs Slot (internal) vs user pointer.  
+- `retained_slab_bytes` → `retained_mapped_bytes`.  
+- CONCEPTS/API diagrams: Pool → Slab → Block → Slot.  
+- Retire `selectSlab`; `selectClassIndex` only.  
+- `AbstractSlab` → `ISlab`.  
+- Retire “axis” → alignment class (`nativeAlignmentClass`, etc.).
+
 
 ### Out of scope unless requested
 
