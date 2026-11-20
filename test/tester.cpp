@@ -42,10 +42,13 @@
 #include <vector>
 #include <gtest/gtest.h>
 
+#include <memory_resource>
+
 #include "spallocator/helper.hpp"
 #include "spallocator/slab.hpp"
 #include "spallocator/pool.hpp"
 #include "spallocator/spallocator.hpp"
+#include "spallocator/pool_pmr.hpp"
 
 using namespace std::literals;
 using namespace spallocator;
@@ -1253,6 +1256,84 @@ TEST(PoolAllocatorTest, DeallocateIsNoexcept)
     EXPECT_TRUE(pool.try_deallocate(nullptr));
     std::byte junk[32]{};
     EXPECT_FALSE(pool.try_deallocate(junk + 16));
+}
+
+
+TEST(PoolMemoryResourceTest, AllocateDeallocateRoundTrip)
+{
+    Pool pool;
+    PoolMemoryResource resource(pool);
+
+    void* p = resource.allocate(128, 8);
+    ASSERT_NE(p, nullptr);
+    resource.deallocate(p, 128, 8);
+}
+
+
+TEST(PoolMemoryResourceTest, IsEqualSameControlBlock)
+{
+    Pool pool_a;
+    Pool pool_b;
+    PoolMemoryResource ra(pool_a);
+    PoolMemoryResource ra2(pool_a);
+    PoolMemoryResource rb(pool_b);
+
+    EXPECT_TRUE(ra.is_equal(ra2));
+    EXPECT_TRUE(ra2.is_equal(ra));
+    EXPECT_FALSE(ra.is_equal(rb));
+}
+
+
+TEST(PoolMemoryResourceTest, PmrVectorBasicUse)
+{
+    Pool pool;
+    PoolMemoryResource resource(pool);
+    std::pmr::vector<int> v{&resource};
+    for (int i = 0; i < 100; ++i)
+    {
+        v.push_back(i);
+    }
+    ASSERT_EQ(v.size(), 100u);
+    EXPECT_EQ(v.front(), 0);
+    EXPECT_EQ(v.back(), 99);
+    v.clear();
+}
+
+
+TEST(PoolMemoryResourceTest, ArenaAllocateThrowsDeallocateNoops)
+{
+    void* dangling = nullptr;
+    PoolMemoryResource resource{[&] {
+        Pool pool;
+        PoolMemoryResource live(pool);
+        dangling = live.allocate(32, 8);
+        EXPECT_NE(dangling, nullptr);
+        return PoolMemoryResource(pool.block_token());
+    }()};
+
+    // Pool already destroyed; token observes !alive.
+    EXPECT_THROW((void)resource.allocate(32, 8), std::bad_alloc);
+
+    // deallocate must not throw / abort when the domain is dead.
+    EXPECT_NO_THROW(resource.deallocate(dangling, 32, 8));
+}
+
+
+TEST(PoolMemoryResourceTest, MaxAlignSucceedsOversizeAlignThrows)
+{
+    Pool pool;
+    PoolMemoryResource resource(pool);
+
+    constexpr std::size_t max_align = alignof(std::max_align_t);
+    ASSERT_LE(max_align, kMaxAlignment);
+    void* p = resource.allocate(64, max_align);
+    ASSERT_NE(p, nullptr);
+    resource.deallocate(p, 64, max_align);
+
+    std::size_t oversize = 128;
+    std::size_t not_pow2 = 12;
+    EXPECT_THROW((void)resource.allocate(16, oversize), std::bad_alloc);
+    EXPECT_THROW((void)resource.allocate(16, not_pow2), std::bad_alloc);
 }
 
 
