@@ -77,6 +77,193 @@ TEST(BitsetSearchTest, FindNextClearBit)
 }
 
 
+TEST(SlotFreemapTest, DefaultEmptyState)
+{
+    // Why: a fresh freemap must report every slot free and no occupied bits.
+    constexpr std::size_t N = 200; // partial last word (200 % 64 == 8)
+    SlotFreemap<N> bits;
+
+    EXPECT_EQ(bits.size(), N);
+    EXPECT_EQ(SlotFreemap<N>::kBitCount, N);
+    EXPECT_EQ(SlotFreemap<N>::kWordCount, (N + 63) / 64);
+    EXPECT_TRUE(bits.none());
+    EXPECT_FALSE(bits.all());
+    for (std::size_t i = 0; i < N; ++i)
+    {
+        EXPECT_FALSE(bits.test(i)) << "bit " << i;
+    }
+    for (std::uint64_t w : bits.words())
+    {
+        EXPECT_EQ(w, 0ull);
+    }
+}
+
+
+TEST(SlotFreemapTest, SetTestResetRoundTrip)
+{
+    // Why: set/test/reset must be independent per bit, including word edges.
+    SlotFreemap<128> bits;
+    constexpr std::size_t edges[] = {0u, 1u, 63u, 64u, 65u, 127u};
+
+    for (std::size_t i : edges)
+    {
+        EXPECT_FALSE(bits.test(i));
+        bits.set(i);
+        EXPECT_TRUE(bits.test(i));
+        EXPECT_FALSE(bits.none());
+        bits.reset(i);
+        EXPECT_FALSE(bits.test(i));
+    }
+    EXPECT_TRUE(bits.none());
+    EXPECT_FALSE(bits.all());
+}
+
+
+TEST(SlotFreemapTest, AllAndNoneBoundaries)
+{
+    // Why: all()/none() must honor a partial last word — spare high bits in the
+    // final uint64_t are outside N and must not make all() fail or none() lie.
+    {
+        SlotFreemap<64> exact;
+        EXPECT_TRUE(exact.none());
+        EXPECT_FALSE(exact.all());
+        for (std::size_t i = 0; i < 64; ++i)
+        {
+            exact.set(i);
+        }
+        EXPECT_FALSE(exact.none());
+        EXPECT_TRUE(exact.all());
+        exact.reset(63);
+        EXPECT_FALSE(exact.all());
+        EXPECT_FALSE(exact.none());
+    }
+    {
+        SlotFreemap<65> partial; // 2 words; only bit 0 of word 1 is in-range
+        EXPECT_TRUE(partial.none());
+        EXPECT_FALSE(partial.all());
+        for (std::size_t i = 0; i < 65; ++i)
+        {
+            partial.set(i);
+        }
+        EXPECT_TRUE(partial.all());
+        EXPECT_FALSE(partial.none());
+        // Clearing the sole bit in the second word must clear all().
+        partial.reset(64);
+        EXPECT_FALSE(partial.all());
+        EXPECT_TRUE(partial.test(0));
+        EXPECT_FALSE(partial.test(64));
+    }
+    {
+        SlotFreemap<1> one;
+        EXPECT_TRUE(one.none());
+        EXPECT_FALSE(one.all());
+        one.set(0);
+        EXPECT_TRUE(one.all());
+        EXPECT_FALSE(one.none());
+        one.reset(0);
+        EXPECT_TRUE(one.none());
+        EXPECT_FALSE(one.all());
+    }
+}
+
+
+TEST(SlotFreemapTest, FindNextClearPositive)
+{
+    // Why: find_next_clear must return the first free slot at/after start,
+    // including across 64-bit word boundaries (same cases as BitsetSearchTest).
+    constexpr std::size_t N = 256;
+    SlotFreemap<N> bits;
+
+    EXPECT_EQ(bits.find_next_clear(0), 0u);
+    EXPECT_EQ(bits.find_next_clear(63), 63u);
+    EXPECT_EQ(bits.find_next_clear(64), 64u);
+    EXPECT_EQ(find_next_clear_bit(bits, 0), 0u); // free-function wrapper
+
+    for (std::size_t i = 0; i < N; ++i)
+    {
+        bits.set(i);
+    }
+    bits.reset(0);
+    bits.reset(63);
+    bits.reset(64);
+    bits.reset(200);
+
+    EXPECT_EQ(bits.find_next_clear(0), 0u);
+    EXPECT_EQ(bits.find_next_clear(1), 63u);
+    EXPECT_EQ(bits.find_next_clear(63), 63u);
+    EXPECT_EQ(bits.find_next_clear(64), 64u);
+    EXPECT_EQ(bits.find_next_clear(65), 200u);
+    EXPECT_EQ(find_next_clear_bit(bits, 65), 200u);
+}
+
+
+TEST(SlotFreemapTest, FindNextClearNegativeAndSentinels)
+{
+    // Why: when no clear bit remains at/after start, the API returns N (not a
+    // wrapped index). start >= N is also a hard miss.
+    constexpr std::size_t N = 256;
+    SlotFreemap<N> bits;
+
+    for (std::size_t i = 0; i < N; ++i)
+    {
+        bits.set(i);
+    }
+    EXPECT_EQ(bits.find_next_clear(0), N);
+    EXPECT_EQ(bits.find_next_clear(N - 1), N);
+    EXPECT_EQ(bits.find_next_clear(N), N);
+    EXPECT_EQ(bits.find_next_clear(N + 10), N);
+    EXPECT_EQ(find_next_clear_bit(bits, 0), N);
+
+    bits.reset(50);
+    // Free slot exists, but scanning from past it must still miss.
+    EXPECT_EQ(bits.find_next_clear(51), N);
+    EXPECT_EQ(bits.find_next_clear(50), 50u);
+
+    // Only the last bit free: start at last succeeds; start past N fails.
+    bits.set(50);
+    bits.reset(N - 1);
+    EXPECT_EQ(bits.find_next_clear(0), N - 1);
+    EXPECT_EQ(bits.find_next_clear(N - 1), N - 1);
+    EXPECT_EQ(bits.find_next_clear(N), N);
+}
+
+
+TEST(SlotFreemapTest, FindNextClearWordEdgeAndPartialTail)
+{
+    // Why: CTZ over a partial last word must not report spare high bits as free,
+    // and must still find a clear bit that sits on the final in-range bit.
+    {
+        SlotFreemap<65> bits;
+        for (std::size_t i = 0; i < 65; ++i)
+        {
+            bits.set(i);
+        }
+        // Full map: must not treat bits 65..63 of word 1 as free.
+        EXPECT_EQ(bits.find_next_clear(0), 65u);
+        bits.reset(64);
+        EXPECT_EQ(bits.find_next_clear(0), 64u);
+        EXPECT_EQ(bits.find_next_clear(64), 64u);
+        bits.set(64);
+        bits.reset(0);
+        EXPECT_EQ(bits.find_next_clear(1), 65u); // no clear at/after 1
+        EXPECT_EQ(bits.find_next_clear(0), 0u);
+    }
+    {
+        SlotFreemap<63> bits; // single partial word, no second word
+        for (std::size_t i = 0; i < 63; ++i)
+        {
+            bits.set(i);
+        }
+        EXPECT_TRUE(bits.all());
+        EXPECT_EQ(bits.find_next_clear(0), 63u);
+        bits.reset(62);
+        EXPECT_EQ(bits.find_next_clear(0), 62u);
+        EXPECT_EQ(bits.find_next_clear(62), 62u);
+        EXPECT_EQ(bits.find_next_clear(63), 63u);
+    }
+}
+
+
 TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
 {
     // Why: next-fit must not regress to first-fit. After advancing the cursor,
