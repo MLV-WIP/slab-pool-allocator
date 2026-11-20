@@ -239,6 +239,59 @@ first use.
 | `allocate(64, 16)` | 16 | 80 | 96B class, axis 16 |
 | `allocate(64, 64)` | 64 | 128 | 128B class, axis 64 |
 
+### Ladder and prealloc sizing (empirical context)
+
+Empirical allocator studies (classic Zorn/Grunwald through Costa/Matias and
+Zhou et al. ASPLOS 2024 on TCMalloc fleets) repeat a few stable patterns:
+
+1. **Allocation count** is dominated by small objects (often medians well under
+   100 B; warehouse fleets: objects <1 KiB can be ~98% of *count*).
+2. **Memory volume** is dominated by fewer larger objects (multi-KiB and above).
+3. Most objects **die young**; real programs mix ramps, peaks, and plateaus
+   rather than Poisson arrivals.
+4. A small set of distinct sizes often accounts for most of the call rate
+   (classic result: top ~10 sizes ~90% of allocs in some C workloads).
+
+General-purpose mallocs (jemalloc, TCMalloc, ...) respond with many fine size
+classes in the small regime and a separate large/page path. That density is
+tuned for a *process-global* heap with fleet-wide histograms. This library is a
+**named domain** allocator: a jemalloc-shaped geometric ladder on the hot axis,
+then `SlabProxy` for overflow, is intentional - not a goal to match TCMalloc's
+~60-90 classes.
+
+**How the shipped ladders fit those patterns**
+
+| Choice | Rationale |
+|--------|-----------|
+| Axis-16 rungs through **1024** | Covers the count-dominated <1 KiB band for default align 8/16 |
+| Proxy beyond axis max | Large *volume* should not force every multi-KiB size through slot freemaps |
+| Default prealloc: axis <=16 and `ElemSize` <= **256** | Warm cold RSS where call rate concentrates; leave 384-1024 first-touch unless raised |
+| High-align axes not pre-warmed by default | High-align traffic is rare vs the mass of the size distribution |
+
+Always reason in **footprint** (user + header), not bare user size. Align-8
+`allocate(16)` lands in the **32** class (footprint 24), so the **16** rung is
+often cold for typical payloads - that is header math, not a missing research
+size.
+
+**Fine-tuning guidance (measure first)**
+
+- Do **not** densify toward TCMalloc's class count without a histogram of *this*
+  pool's clients: more rungs cut internal waste but raise empty-class RSS and
+  engine count.
+- If adjusting spacing, bias the **bottom** of axis 16 (systematic round-up
+  cliffs in the <=128 B user / <=~136 B footprint band), not the rare large end.
+- Raising `kPreallocateMaxElemSize` toward 512 or 1024 (still axis 16) trades
+  construct RSS for fewer first-mmap stalls on cold <1 KiB classes; lowering
+  toward 128 only if those mid rungs stay unused.
+- Raising `kPreallocateMaxAlignment` to 32/64 is usually unjustified by size-
+  distribution research alone.
+- Buffer packing (`kSlabTargetBytes` / multiplier) is a separate RSS/growth
+  knob from ladder spacing; tune it from multi-buffer peak/live-set behavior,
+  not from malloc size-class papers.
+
+Without a client size histogram (or future per-class `PoolStats`), treat ladder
+edits as speculative. Configure knobs above are the low-risk experiments.
+
 ---
 
 ## Request lifecycle
@@ -316,6 +369,9 @@ map a first data block at construction. Policy (override via `-D` /
 |------|---------|---------|
 | `kPreallocateMaxElemSize` | 256 | Preallocate when `ElemSize <=` this |
 | `kPreallocateMaxAlignment` | 16 | …and `Alignment <=` this (raise to 32/64 to warm high-align axes) |
+
+Defaults bias warm blocks toward the small-object call-rate band; see
+[Ladder and prealloc sizing](#ladder-and-prealloc-sizing-empirical-context).
 
 Other engines stay at zero blocks until the first `allocateItem` (under the
 per-slab lock). `trim` only reclaims empty **blocks** inside engines — never
