@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "spallocator/pool.hpp"
+#include "spallocator/pool_pmr.hpp"
 #include "spallocator/slab.hpp"
 
 namespace {
@@ -172,7 +173,8 @@ enum class BackendId : unsigned
     PmrUnsync = 1u << 2,
     PmrSync = 1u << 3,
     Slab16 = 1u << 4,
-    All = New | Pool | PmrUnsync | PmrSync | Slab16,
+    PoolPmr = 1u << 5,
+    All = New | Pool | PmrUnsync | PmrSync | Slab16 | PoolPmr,
 };
 
 inline Scenario operator|(Scenario a, Scenario b)
@@ -294,6 +296,10 @@ bool parse_backend_list(std::string_view csv, BackendId& out, std::string& err)
         {
             out |= BackendId::Slab16;
         }
+        else if (tok == "pool_pmr")
+        {
+            out |= BackendId::PoolPmr;
+        }
         else
         {
             err = "unknown --backend value: " + std::string(tok);
@@ -383,6 +389,10 @@ char const* backend_label(BackendId b)
     {
         append("slab16");
     }
+    if (has(b, BackendId::PoolPmr))
+    {
+        append("pool_pmr");
+    }
     return buf.c_str();
 }
 
@@ -395,6 +405,7 @@ struct Options
     SizeMix size_mix = SizeMix::Class;
     Scenario scenarios = Scenario::All;
     BackendId backends = BackendId::All;
+    bool pool_stats = false; // opt-in [PoolStats] / slab retained dumps
     bool help = false;
 };
 
@@ -462,6 +473,10 @@ Options parse_args(int argc, char** argv)
                 opt.help = true;
             }
         }
+        else if (a == "--pool-stats")
+        {
+            opt.pool_stats = true;
+        }
         else
         {
             std::cerr << "unknown argument: " << a << "\n";
@@ -501,7 +516,9 @@ void print_help()
         "  --size-mix=MIX      uniform | class (default class). Class = equal weight per\n"
         "                      reachable axis-16 size class (exact-fit user size).\n"
         "  --scenario=LIST     lifo,multi,bulk,threaded,all (comma-separated; default all)\n"
-        "  --backend=LIST      new,pool,pmr_unsync,pmr_sync,slab16,all (comma-separated; default all)\n"
+        "  --backend=LIST      new,pool,pmr_unsync,pmr_sync,slab16,pool_pmr,all\n"
+        "                      (comma-separated; default all)\n"
+        "  --pool-stats        Print PoolStats / slab retained dumps after scenarios\n"
         "  --help              Show this help\n"
         "\n"
         "Filters skip inapplicable combinations with a note (e.g. slab16 outside\n"
@@ -614,6 +631,25 @@ struct PmrSyncBackend
     static constexpr const char* name = "pmr::synchronized_pool";
 
     std::pmr::synchronized_pool_resource resource;
+
+    void* allocate(std::size_t n, std::size_t align)
+    {
+        return resource.allocate(n, align);
+    }
+
+    void deallocate(void* p, std::size_t n, std::size_t align) noexcept
+    {
+        resource.deallocate(p, n, align);
+    }
+};
+
+// Pool behind std::pmr::memory_resource (virtual dispatch tax vs raw Pool).
+struct PoolPmrBackend
+{
+    static constexpr const char* name = "spallocator::pool_pmr";
+
+    spallocator::Pool pool;
+    spallocator::PoolMemoryResource resource{pool};
 
     void* allocate(std::size_t n, std::size_t align)
     {
@@ -882,8 +918,10 @@ void run_align8_suite(Options const& opt)
     {
         std::vector<Row> rows;
         PoolBackend pool_b;
+        PoolPmrBackend pool_pmr_b;
         Slab16Backend slab_b;
         bool ran_pool = false;
+        bool ran_pool_pmr = false;
         bool ran_slab = false;
 
         if (has(be, BackendId::New))
@@ -897,6 +935,13 @@ void run_align8_suite(Options const& opt)
             rows.push_back(row_from(
                 pool_b, timed_lifo_churn(pool_b, kSize, opt.alignment, opt.iters)));
             ran_pool = true;
+        }
+        if (has(be, BackendId::PoolPmr))
+        {
+            rows.push_back(row_from(
+                pool_pmr_b,
+                timed_lifo_churn(pool_pmr_b, kSize, opt.alignment, opt.iters)));
+            ran_pool_pmr = true;
         }
         if (has(be, BackendId::PmrUnsync))
         {
@@ -915,13 +960,20 @@ void run_align8_suite(Options const& opt)
             ran_slab = true;
         }
         print_table("Warmed LIFO churn (size=16, alloc+free pair)", rows);
-        if (ran_pool)
+        if (opt.pool_stats)
         {
-            print_pool_stats("after LIFO churn", pool_b.pool);
-        }
-        if (ran_slab)
-        {
-            print_slab16_stats("after LIFO churn", slab_b.slab);
+            if (ran_pool)
+            {
+                print_pool_stats("after LIFO churn", pool_b.pool);
+            }
+            if (ran_pool_pmr)
+            {
+                print_pool_stats("pool_pmr after LIFO churn", pool_pmr_b.pool);
+            }
+            if (ran_slab)
+            {
+                print_slab16_stats("after LIFO churn", slab_b.slab);
+            }
         }
         std::cout << "\n";
     }
@@ -931,7 +983,9 @@ void run_align8_suite(Options const& opt)
     {
         std::vector<Row> rows;
         PoolBackend pool_b;
+        PoolPmrBackend pool_pmr_b;
         bool ran_pool = false;
+        bool ran_pool_pmr = false;
 
         if (has(be, BackendId::New))
         {
@@ -947,6 +1001,14 @@ void run_align8_suite(Options const& opt)
                 pool_b,
                 timed_multi_size_churn(pool_b, opt.alignment, opt.size_mix, opt.iters)));
             ran_pool = true;
+        }
+        if (has(be, BackendId::PoolPmr))
+        {
+            rows.push_back(row_from(
+                pool_pmr_b,
+                timed_multi_size_churn(
+                    pool_pmr_b, opt.alignment, opt.size_mix, opt.iters)));
+            ran_pool_pmr = true;
         }
         if (has(be, BackendId::PmrUnsync))
         {
@@ -967,9 +1029,16 @@ void run_align8_suite(Options const& opt)
             std::string("Multi-size mix (size-mix=") + size_mix_label(opt.size_mix) +
                 ", alloc+free pair)",
             rows);
-        if (ran_pool)
+        if (opt.pool_stats)
         {
-            print_pool_stats("after multi-size mix", pool_b.pool);
+            if (ran_pool)
+            {
+                print_pool_stats("after multi-size mix", pool_b.pool);
+            }
+            if (ran_pool_pmr)
+            {
+                print_pool_stats("pool_pmr after multi-size mix", pool_pmr_b.pool);
+            }
         }
         std::cout << "\n";
     }
@@ -984,9 +1053,10 @@ void run_align8_suite(Options const& opt)
 
         const bool want_new = has(be, BackendId::New);
         const bool want_pool = has(be, BackendId::Pool);
+        const bool want_pool_pmr = has(be, BackendId::PoolPmr);
         const bool want_pmr = has(be, BackendId::PmrUnsync);
         const bool want_slab = has(be, BackendId::Slab16);
-        if (!want_new && !want_pool && !want_pmr && !want_slab)
+        if (!want_new && !want_pool && !want_pool_pmr && !want_pmr && !want_slab)
         {
             std::cout << "Alloc-then-free-all skipped (no applicable backends selected).\n\n";
         }
@@ -1044,7 +1114,22 @@ void run_align8_suite(Options const& opt)
                 auto [a, f] =
                     timed_alloc_then_free_all(pool_b, kSize, opt.alignment, bulk_count);
                 print_bulk(PoolBackend::name, a, f);
-                print_pool_stats("after alloc-then-free-all", pool_b.pool);
+                if (opt.pool_stats)
+                {
+                    print_pool_stats("after alloc-then-free-all", pool_b.pool);
+                }
+            }
+            if (want_pool_pmr)
+            {
+                PoolPmrBackend pool_pmr_b;
+                auto [a, f] = timed_alloc_then_free_all(
+                    pool_pmr_b, kSize, opt.alignment, bulk_count);
+                print_bulk(PoolPmrBackend::name, a, f);
+                if (opt.pool_stats)
+                {
+                    print_pool_stats(
+                        "pool_pmr after alloc-then-free-all", pool_pmr_b.pool);
+                }
             }
             if (want_pmr)
             {
@@ -1059,7 +1144,10 @@ void run_align8_suite(Options const& opt)
                 auto [a, f] =
                     timed_alloc_then_free_all(slab_b, kSize, opt.alignment, bulk_count);
                 print_bulk(Slab16Backend::name, a, f);
-                print_slab16_stats("after alloc-then-free-all", slab_b.slab);
+                if (opt.pool_stats)
+                {
+                    print_slab16_stats("after alloc-then-free-all", slab_b.slab);
+                }
             }
             std::cout << "\n";
         }
@@ -1085,7 +1173,9 @@ void run_align8_suite(Options const& opt)
 
             std::vector<Row> rows;
             PoolBackend pool_b;
+            PoolPmrBackend pool_pmr_b;
             bool ran_pool = false;
+            bool ran_pool_pmr = false;
 
             const int peak_live = opt.threads * opt.batch;
             std::cout << "Multi-thread multi-size (shared allocator; size-mix="
@@ -1111,6 +1201,15 @@ void run_align8_suite(Options const& opt)
                         opt.batch)));
                 ran_pool = true;
             }
+            if (has(be, BackendId::PoolPmr))
+            {
+                rows.push_back(row_from(
+                    pool_pmr_b,
+                    timed_threaded_multi_size_churn(
+                        pool_pmr_b, opt.alignment, opt.size_mix, opt.iters,
+                        opt.threads, opt.batch)));
+                ran_pool_pmr = true;
+            }
             if (has(be, BackendId::PmrSync))
             {
                 PmrSyncBackend pmr_b;
@@ -1121,11 +1220,19 @@ void run_align8_suite(Options const& opt)
                         opt.batch)));
             }
             print_table("Multi-thread timing", rows);
-            if (ran_pool)
+            if (opt.pool_stats)
             {
-                print_pool_stats("after multi-thread multi-size", pool_b.pool);
-                std::cout << "    (peak live ≈ " << peak_live
-                          << "; retained_slab_bytes reflects multi-buffer growth)\n";
+                if (ran_pool)
+                {
+                    print_pool_stats("after multi-thread multi-size", pool_b.pool);
+                    std::cout << "    (peak live ≈ " << peak_live
+                              << "; retained_slab_bytes reflects multi-buffer growth)\n";
+                }
+                if (ran_pool_pmr)
+                {
+                    print_pool_stats(
+                        "pool_pmr after multi-thread multi-size", pool_pmr_b.pool);
+                }
             }
             std::cout << "\n";
         }
@@ -1171,7 +1278,7 @@ void run_high_align_spot(Options const& opt)
                   " spot-check is Pool vs ::new only");
     }
     print_table("Warmed LIFO churn", rows);
-    if (ran_pool)
+    if (opt.pool_stats && ran_pool)
     {
         print_pool_stats(
             ("after align-" + std::to_string(opt.alignment) + " LIFO churn").c_str(),
