@@ -265,6 +265,28 @@ Alignment is part of the size-class story:
 
 Contracts for `allocate(size, alignment)`: [API.md — Pool](API.md#pool).
 
+### Why this ladder shape (short)
+
+Real allocators see the same skew repeatedly: **most calls** are small objects;
+**most bytes** sit in fewer large ones. A process-global malloc (jemalloc /
+TCMalloc style) answers with a dense small-size class table. This library is a
+**named domain** pool: a coarser jemalloc-shaped geometric ladder on the hot
+axis, then a large fallback, is intentional — not a goal to match TCMalloc’s
+class count.
+
+Practical takeaways:
+
+- Keep the shipped axis-16 shape unless a **client size histogram** says
+  otherwise; densifying without data buys RSS and engine count for little gain.
+- If you do retune spacing, bias the **bottom** of axis 16 (header-inflated
+  small footprints), not the rare large end.
+- Default cold-start prealloc (axis ≤16, ElemSize ≤256) warms where call rate
+  concentrates; raising it is an RSS vs first-touch tradeoff, not a research
+  mandate.
+
+Full empirical notes and knobs:
+[IMPLEMENTATION.md — Ladder and prealloc sizing](IMPLEMENTATION.md#ladder-and-prealloc-sizing-empirical-context).
+
 ---
 
 ## Headers beside the payload
