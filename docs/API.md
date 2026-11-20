@@ -831,5 +831,15 @@ against the submodule root.
 | `SpinLock::lock` / `unlock` | — | Mutual exclusion + TSan annotations when built with TSan |
 | `runtime_assert` | abort (debug only) | N/A |
 
+**Prose contracts today:** alignment must be a power of two in
+`[kMinAlignment, kMaxAlignment]`; size caps throw; bad frees throw or abort
+on noexcept paths. These remain documentation + runtime checks.
+
+**C++26 language contracts:** intentional follow-on for `pre` / `post` /
+`contract_assert` on allocate/deallocate when the toolchain actually accepts
+contract syntax. `./configure` may already select `-std=c++26` while contract
+keywords are still unsupported — do not gate the library on them yet. See
+[IMPLEMENTATION.md — Future work](IMPLEMENTATION.md#future-work).
+
 See also: [IMPLEMENTATION.md](IMPLEMENTATION.md) for header layout and lock
 ordering; [CONCEPTS.md](CONCEPTS.md) for when to choose each tool.

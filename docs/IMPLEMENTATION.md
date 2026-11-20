@@ -574,6 +574,14 @@ might destroy the pool first. Conceptual vocabulary (finalization vs
 reclamation) and when-to-use guidance:
 [CONCEPTS.md - Choosing a memory strategy](CONCEPTS.md#choosing-a-memory-strategy).
 
+**Destroying delete (non-goal for the generic pool).** A typed destroying
+`operator delete` can combine `~T()` and reclaim with full type context (useful
+for type-local arenas). The shipped path stays `PoolDeleter` +
+`PoolBlockToken`: generic over `T`, arena-safe, and independent of per-type
+`operator new`/`delete`. Do not replace `make_pool_unique` /
+`make_pool_shared` with destroying delete as the library default; document any
+future typed facade separately.
+
 **Why a stateful deleter?** Empty / EBO-friendly `unique_ptr` deleters keep
 `sizeof(unique_ptr)` at a raw pointer. `PoolDeleter` stores a `PoolBlockToken`
 so arena `~Pool` remains observable after storage is gone. That enlarges
@@ -1054,7 +1062,20 @@ and [API.md](API.md); remaining rows are scale/API surface, not silent UB.
 
 ## Future work
 
-Near-term / opportunistic:
+### CMM alignment status
+
+Roy / C++ Memory Management alignment pass on `PR-CMM-alignment`:
+
+| Phase | Status |
+|-------|--------|
+| P0 docs (when-to-use / Roy mapping) | **Done** |
+| P1 baselines (`make bench` / `make profile`) | **Done** |
+| P2 `PoolMemoryResource` | **Done** |
+| P3 size-based / bump arena peer | **Deferred** (see backlog) |
+| P4 measure-gated hot path | **Done** (measure-only; candidates deferred) |
+| P5 modern safety hygiene | **Done** (docs); language contracts toolchain-deferred |
+
+### Near-term / opportunistic
 
 - Per-class breakdown on top of `PoolStats` (counters/HWMs already shipped)  
 - Intrusive freelist — **deferred** (P4 re-baseline; revive if scan dominates)  
@@ -1063,6 +1084,8 @@ Near-term / opportunistic:
 - Thread-local caches; NUMA-aware buffers  
 - Lock-free fast paths / fewer per-op lock acquisitions if TAS tax remains primary  
 - Configurable SpinLock backoff parameters  
+- **C++26 language contracts** (`pre` / `post` / `contract_assert` on allocate/deallocate) — **deferred**: `-std=c++26` may already be selected while contract syntax is still unsupported on current clang; keep prose + runtime checks until a clean probe compiles under default `./configure`  
+- Destroying delete — **documented non-goal** for the generic pool; possible future type-local facade only  
 
 ### Research / design backlog
 
@@ -1079,7 +1102,9 @@ Also tracked on the
 | Baseline ratio benches | **Shipped** — `make bench` (`bench/bench_allocators.cpp`); re-check after toolchain upgrades |
 | C99 wrapper | Opaque pool handle API for C callers |
 | Pluggable lock primitive | **Deferred** (P4) — uncontended TAS dominates profiles; mutex unlikely to win. Revisit if contended threaded workloads show wait time, not TAS |
-| Fail-closed allocate policy | Optional: refuse OS fallback when over caps (timing-critical / bounded domains) |
+| Fail-closed allocate policy | Optional: refuse OS / `new` spill when over caps or domain exhausted (timing-critical / bounded domains); loud `bad_alloc` instead of silent fallback |
+| C++26 language contracts | **Deferred** — wait for toolchain contract syntax under default `-std=c++26` |
+| Destroying delete (typed) | **Non-goal** for generic `Pool` / `PoolDeleter`; future type-local path only |
 
 ---
 

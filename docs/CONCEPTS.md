@@ -515,6 +515,20 @@ deleters are preferable when size matters, but the token is required so arena
 `~Pool` can be observed safely without parking the control block in the slab.
 That size cost is intentional.
 
+### Destroying delete (future, type-local)
+
+C++ also has **destroying delete**: a typed `operator delete` that runs with
+full knowledge of `T`, so one function can finalize and reclaim together.
+That can be attractive for **type-specific** pools (custom `new`/`delete` on a
+`final` class, Roy Ch.7 theme).
+
+This library’s default path stays **generic**: `make_pool_unique` /
+`make_pool_shared` + `PoolDeleter` work for any `T` under the pool’s alignment
+cap and remain arena-observable via `PoolBlockToken`. Replacing that with
+destroying delete is an explicit **non-goal** for the generic pool; it remains
+a possible future for a narrowly typed facade, not for `Pool` itself.
+Details: [IMPLEMENTATION.md — Smart pointers](IMPLEMENTATION.md#smart-pointers-design).
+
 ### Exception safety (the strong guarantee)
 
 When constructing an array of `N` elements, if element *k* throws:
