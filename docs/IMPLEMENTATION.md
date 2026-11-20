@@ -358,10 +358,14 @@ one `(ElemSize, Alignment)`. It owns zero or more **Blocks** (mapped chunks of
 Slots); each **Slot** is one `ElemSize` unit. Full glossary:
 [terminology-glossary.md](terminology-glossary.md).
 
-**Transitional API names** (still say “slab” for a **Block** until Phase 2/3):
-`allocateNewSlab`, `destroySlabAt`, `getSlabCount`, `reclaimEmptySlabs`,
-`findSlabForItem`, members such as `slab_data` / `slab_alloc_size`, and knobs
-like `kSlabTargetBytes` (they size Blocks). Prefer **Block** in prose.
+**Phase 2 (private) done in code:** `allocateNewBlock`, `destroyBlockAt`,
+`block_bases` / `block_freemaps` / `block_available_map` / `block_bytes` /
+`max_blocks` / `slots_per_block` / `alloc_cursor_block_` / `selectBlockSize`.
+
+**Phase 3 (public) still transitional:** `getSlabCount`, `reclaimEmptySlabs`,
+`findSlabForItem`. Configure knobs `kSlabTargetBytes` /
+`SPALLOCATOR_SLAB_TARGET_*` still size Blocks (names kept). Prefer **Block** in
+prose.
 
 **Routing:** `resolveSlab(alloc_size, axis)` runs `selectClassIndex`. A normal
 index picks a size-class Slab; `kSlabIndexNpos` means footprint exceeds that
@@ -395,13 +399,13 @@ one axis.
 
 **Owns**
 
-- Zero or more equally sized **Blocks** (`slab_alloc_size` from
-  `selectBufferSize` — transitional name for Block sizing: exact pack of
+- Zero or more equally sized **Blocks** (`block_bytes` from
+  `selectBlockSize`: exact pack of
   `max(kSlabTargetMultiplier, kSlabTargetBytes / ElemSize)` Slots; defaults
   **8 KiB** target / **16** min Slots, overridable at compile time via
   `./configure --with-slab-target-*`)
   when `ElemSize < 1_KB`, otherwise a small multiple of `ElemSize`)  
-- At most `kMaxClassBytes / slab_alloc_size` Blocks (default **4 GiB** class
+- At most `kMaxClassBytes / block_bytes` Blocks (default **4 GiB** class
   cap; `./configure --with-max-class-mib`)  
 - Per-Block freemap of Slots  
 - Growable availability map (`DynBitset`) across Blocks  
@@ -415,8 +419,8 @@ one axis.
   the pool wrapped with a header  
 - Block count only shrinks via reclaim/trim, not via ordinary free  
 
-**Growth:** if no Block has a free Slot, allocate another Block (`allocateNewSlab`
-— transitional name), zero/init its freemap, register its base, set its
+**Growth:** if no Block has a free Slot, allocate another Block
+(`allocateNewBlock`), zero/init its freemap, register its base, set its
 availability bit. **Monotonic by default:** a fully empty Block is *not*
 returned to the OS on the last free — see [Trim and RSS](#trim-and-rss).
 
@@ -459,10 +463,10 @@ when idle).
 4. Set the bit; if the Block is now full, clear its availability bit  
 5. Advance the cursor past the taken Slot; return
    `base + bit_index * ElemSize` as the slot base  
-6. If a full wrap of live Blocks finds nothing: grow (`allocateNewSlab`), point
+6. If a full wrap of live Blocks finds nothing: grow (`allocateNewBlock`), point
    the cursor at the new Block, retry  
 
-`reclaimEmptySlabs` / `destroySlabAt` **reset** the cursor to `(0,0)` because
+`reclaimEmptySlabs` / `destroyBlockAt` **reset** the cursor to `(0,0)` because
 swap-with-last can invalidate Block indices.
 
 ### Free path (conceptual)
@@ -489,7 +493,7 @@ it as a profile-driven follow-on if cursors are not enough.
 
 On free, the Slab must answer: which **Block** owns this **slot base**?
 
-Blocks are intervals `[base, base + slab_alloc_size)`. The implementation keeps
+Blocks are intervals `[base, base + block_bytes)`. The implementation keeps
 a `std::map` keyed by Block base and uses interval logic (`upper_bound` then
 step back to the candidate owner). Cost **O(log m)** in the number of Blocks
 for that size class.

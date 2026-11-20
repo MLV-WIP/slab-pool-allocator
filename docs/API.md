@@ -545,12 +545,12 @@ base-address map for frees. Owns zero or more **Blocks**.
 | Method | Description |
 |--------|-------------|
 | `allocateItem` / `deallocateItem` | See `AbstractSlab`; guarded by the Slab’s `SpinLock`. Slot base in / out — Pool owns the user-pointer offset. |
-| `getElemSize()` / `getAlignment()` / `getAllocSize()` | Compile-time Slot size, alignment, and **Block** bytes (`selectBufferSize`: transitional name; exact multiple of `ElemSize`; see `kSlabTargetBytes` / `kSlabTargetMultiplier`). |
-| `getAllocatedMemory()` | `block_count × block_size` currently retained (implemented as `getSlabCount() × getAllocSize()` today). |
+| `getElemSize()` / `getAlignment()` / `getAllocSize()` | Compile-time Slot size, alignment, and **Block** bytes (`selectBlockSize`; exact multiple of `ElemSize`; see `kSlabTargetBytes` / `kSlabTargetMultiplier`). |
+| `getAllocatedMemory()` | `getSlabCount() × getAllocSize()` currently retained (**Blocks** × Block bytes). |
 | `getAvailabilityMapBytes()` | Bytes used by the growable availability bitset (diagnostics). |
-| `getSlabCount()` | Number of **Blocks** currently held (transitional name until `getBlockCount`). |
-| `reclaimEmptySlabs(keep_min)` | Deletes empty **Blocks** (swap-with-last), retaining ≥ `keep_min` (transitional name until `reclaimEmptyBlocks`). |
-| `findSlabForItem(item)` | Optional index of the **Block** owning `item`, if it is an exact **slot base** in this Slab (transitional name until `findBlockForSlot` / similar). |
+| `getSlabCount()` | Number of **Blocks** currently held (Phase 3 rename → `getBlockCount`). |
+| `reclaimEmptySlabs(keep_min)` | Deletes empty **Blocks** (swap-with-last), retaining ≥ `keep_min` (Phase 3 → `reclaimEmptyBlocks`). |
+| `findSlabForItem(item)` | Optional index of the **Block** owning `item`, if it is an exact **slot base** in this Slab (Phase 3 → `findBlockForSlot` / similar). |
 
 Empty Blocks remain mapped after free until reclaim/`Pool::trim` — intentional
 monotonic growth for alloc/free latency.

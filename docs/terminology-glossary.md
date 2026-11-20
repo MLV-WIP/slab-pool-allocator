@@ -152,31 +152,31 @@ Order of operations after Michael locks names — **not started this round**.
 3. IMPLEMENTATION: **Block** preferred over buffer/data-block; locked Slab/Block/Slot note; transitional API list.  
 4. API.md: `getSlabCount` / `reclaimEmptySlabs` described as **Blocks**; AbstractSlab slot base vs user pointer.
 
-### Phase 2 — Internal / private code identifiers
+### Phase 2 — Internal / private code identifiers — **done in working tree** (awaiting review; uncommitted)
 
-Prefer first (smaller blast radius than public API):
+Hard renames (no aliases):
 
-| Current | Proposed |
-|---------|----------|
+| Was | Now |
+|-----|-----|
 | `allocateNewSlab` | `allocateNewBlock` |
 | `destroySlabAt` | `destroyBlockAt` |
-| `slab_data` | `block_bases` / `blocks_` |
-| `slab_map` | `block_freemaps_` |
-| `slab_available_map` | `block_available_map_` |
-| `slab_alloc_size` | `block_bytes` / `kBlockSize` |
+| `slab_data` | `block_bases` |
+| `slab_map` | `block_freemaps` |
+| `slab_available_map` | `block_available_map` |
+| `slab_alloc_size` | `block_bytes` |
 | `max_slabs` | `max_blocks` |
 | `alloc_cursor_slab_` | `alloc_cursor_block_` |
 | `slots_per_buffer` | `slots_per_block` |
 | `selectBufferSize` | `selectBlockSize` |
 | local `new_slab` | `new_block` |
 
-Compile knobs (`SPALLOCATOR_SLAB_TARGET_*`) can stay until a deliberate config break, or gain aliases.
+Compile knobs (`SPALLOCATOR_SLAB_TARGET_*` / `kSlabTarget*`) kept; comment notes they size Blocks.
 
 ### Phase 3 — Public / test-facing API on `Slab`
 
 | Current | Proposed | Notes |
 |---------|----------|-------|
-| `getSlabCount()` | `getBlockCount()` | Keep deprecated alias briefly if anything external links |
+| `getSlabCount()` | `getBlockCount()` | Hard rename (no aliases; API still mutable) |
 | `reclaimEmptySlabs` | `reclaimEmptyBlocks` | Virtual on `AbstractSlab` — update override + docs |
 | `findSlabForItem` | `findBlockForSlot` / `findBlockIndex` | Parameter is a **slot base** |
 
