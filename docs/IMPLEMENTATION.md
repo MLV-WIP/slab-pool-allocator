@@ -223,8 +223,8 @@ slot bases would not guarantee the user’s alignment. Separate
 
 ```
 Axis 16 (eager): 16 … 1024
-Axis 32 (lazy):  32 … 2048
-Axis 64 (lazy):  64 … 4096
+Axis 32:  32 … 2048
+Axis 64:  64 … 4096
 ```
 
 Request align 4/8 **over-aligns** into axis 16 (slots are at least 16-aligned).
@@ -237,7 +237,7 @@ first use.
 |------|--------|-----------|------|
 | `allocate(64)` | 8 | 72 | 96B class, axis 16 |
 | `allocate(64, 16)` | 16 | 80 | 96B class, axis 16 |
-| `allocate(64, 64)` | 64 | 128 | 128B class, axis 64 (lazy) |
+| `allocate(64, 64)` | 64 | 128 | 128B class, axis 64 |
 
 ---
 
@@ -252,9 +252,11 @@ of the current code; see [Thread safety](#thread-safety--lock-ordering).
    power-of-two align in `[4, 64]`  
 2. **Compute (pool):** `header_size = 8`, `alloc_size = 108`  
 3. **Classify (pool):** `nativeAxis(8) → 16`; class **128B** (108 > 96)  
-4. **Resolve backend (pool lock, brief):** `slabs16[index]` or lazy create path  
+4. **Resolve backend (lock-free):** pick eager registry slot for the axis
+   (`slabs16` / `slabs32` / `slabs64`); engines are installed at `Pool()` and
+   never replaced  
 5. **Take slot (slab lock):** find free bit, mark freemap / availability; return
-   **slot base**  
+   **slot base** (may map the first data block on a cold engine)  
 6. **Publish header (pool, after slab returns):** write magic / sizes at base;
    return `base + header_size` to the caller  
 
@@ -292,24 +294,32 @@ tests or docs almost always means forgetting the header.
 
 | Registry | When built | Contents |
 |----------|------------|----------|
-| `slabs16[12]` | With the pool (eager) | One `unique_ptr<AbstractSlab>` per ladder rung |
-| `slabs32` / `slabs64` | Lazy via `getOrCreateLazy` | Same shape; empty until first use |
+| `slabs16[12]` | With the pool (eager) | One size-class **engine** (`Slab`) per ladder rung; **never replaced/nulled** |
+| `slabs32` / `slabs64` | With the pool (eager) | Same shape for high-align axes |
 | `large_slab` | With the pool | Single `SlabProxy` instance |
 
+**Terminology (engine vs block vs slot):** a **Slab** here is the size-class
+engine for one `(ElemSize, Alignment)`. It owns zero or more **data blocks**
+(mapped buffers of slots); each **slot** is one `ElemSize` unit. Older APIs
+still say “slab” for a data block (`allocateNewSlab`, `getSlabCount`) — a
+rename pass is backlog, not required for correctness.
+
 **Routing:** `resolveSlab(alloc_size, axis)` runs `selectClassIndex`. A normal
-index picks a size-class slab; `kSlabIndexNpos` means footprint exceeds that
-axis’s max → `large_slab`.
+index picks a size-class engine; `kSlabIndexNpos` means footprint exceeds that
+axis’s max → `large_slab`. All registry lookups are **lock-free**.
 
-**Lazy create sequence (intent):**
+**Cold-start data blocks:** every engine exists after `Pool()`, but only some
+map a first data block at construction. Policy (override via `-D` /
+`./configure`):
 
-1. Under `Pool::lock`, if the slot is already populated, return it  
-2. Otherwise take `slab_init_lock` (heavy construction serialized here)  
-3. Double-check under `Pool::lock` (another thread may have won)  
-4. Construct `Slab<…>` **without** holding `Pool::lock`  
-5. Publish under `Pool::lock`  
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `kPreallocateMaxElemSize` | 256 | Preallocate when `ElemSize <=` this |
+| `kPreallocateMaxAlignment` | 16 | …and `Alignment <=` this (raise to 32/64 to warm high-align axes) |
 
-That keeps ordinary allocate/free routing critical sections short while avoiding
-duplicate lazy slabs under races.
+Other engines stay at zero blocks until the first `allocateItem` (under the
+per-slab lock). `trim` only reclaims empty **blocks** inside engines — never
+registry slots.
 
 `selectSlab` / `selectClassIndex` are pure classification helpers: usable from
 tests and constexpr-friendly call sites, and shared by allocate and free so both
@@ -724,18 +734,17 @@ instances share no locks — isolation is free at the domain boundary.
 
 | Lock | Protects | Hold time intent |
 |------|----------|------------------|
-| `Pool::lock` | Registry / routing snapshots | Brief — look up or publish a pointer |
-| `Pool::slab_init_lock` | Lazy slab construction | May cover heavy `Slab` ctor; not on every alloc |
-| Per-`Slab` `SpinLock` | Freemap, availability, address map | Brief — bit ops and map update |
+| Per-`Slab` `SpinLock` | Freemap, availability, address map, data-block growth | Brief — bit ops, map update, optional first-block map |
+
+Pool no longer holds registry locks: all axis engines are installed in `Pool()`
+and the directory is immutable for the pool lifetime.
 
 ### Ordering intent
 
-Never take locks in opposing orders across threads:
-
-- Common allocate: `Pool::lock` (resolve) → drop → `Slab::lock` (slot)  
-- Lazy publish: `slab_init_lock` → brief `Pool::lock` to install  
-- Avoid: holding `Slab::lock` then blocking on `Pool::lock` while another thread
-  holds pool and waits for that slab  
+- Common allocate / free (any axis): lock-free resolve → `Slab::lock` (slot /
+  block growth)  
+- Avoid nesting unrelated slab locks across classes unless a future API requires
+  it (today’s hot path never does)  
 
 Exact sequences live in `pool.hpp` / `pool_lifetime.hpp` / `slab.hpp` — treat those as source of
 truth if this summary drifts.
@@ -883,7 +892,7 @@ Waste has three buckets:
 |-------|--------|
 | Per-slab locks | Different size classes proceed in parallel after routing |
 | Multiple pools | Isolate shards / tenants; reduce cross-talk and lock sharing |
-| Lazy 32/64 axes | No metadata cost until high-align traffic appears |
+| Eager engines + selective first-block | Lock-free resolve on all axes; cold RSS only for configured warm classes |
 | `trim` | Reclaim RSS after spikes without changing the hot path |
 | `SlabProxy` | Avoids forcing huge objects through size-class bookkeeping |
 
@@ -893,12 +902,16 @@ deliberate simplicity until profiles disagree.
 ### Comparative baselines (`make bench`)
 
 On-demand harness: `bench/bench_allocators.cpp` via `make bench` (not part of
-`make test` / default `all`). Prefer `BUILD_TYPE=release`.
+`make test` / default `all`). Prefer `BUILD_TYPE=release`. The `bench` and
+`profile` make goals force `ENABLE_COVERAGE=no` so gcov arcs do not inflate
+ns/op.
 
 ```bash
 make bench BUILD_TYPE=release
 make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
-make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # optional Pool vs ::new
+make bench BUILD_TYPE=release BENCH_ARGS='--align=32'   # Pool vs ::new axis-32 spot
+make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new axis-64 spot
+make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
 ```
 
 Compares `::operator new`, `spallocator::Pool`, `std::pmr::unsynchronized_pool_resource`,
@@ -911,11 +924,47 @@ per-thread `std::minstd_rand` seeded from a fixed key plus worker index
 bytes. Absolute ns are host/toolchain-specific; re-run after compiler or
 stdlib upgrades and compare ratios on the same machine.
 
-Default alignment is 8. `--align=64` is a Pool axis/header-tax spot-check only
-(not a full alignment matrix).
+Filters (for focused timing or profiling):
+
+| Flag | Values | Notes |
+|------|--------|-------|
+| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all`. `bulk` is alloc-then-free-all (grows many slab buffers) |
+| `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk` |
+| `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
+| `--size-mix=` | `uniform` or `class` (default **class**) | `class` = equal weight per reachable axis-16 size class (exact-fit user size); better multi-slab coverage than uniform bytes |
+
+Default alignment is 8 (full comparative suite). `--align=32` and `--align=64`
+are Pool vs `::new` LIFO spot-checks for high-align axis/header tax (not a full
+alignment matrix).
 
 `SlabTest.AllocFreeChurnMicrobench` remains a light GTest smoke/`RecordProperty`
 check for the slab engine; use `make bench` for comparative baselines.
+
+### Profiling (`make profile`)
+
+`BUILD_TYPE=profile` is release-equivalent (`-O3 -DNDEBUG`) plus `-g` and
+`-fno-omit-frame-pointer` so Linux `perf` / Hotspot can unwind stacks. The
+`profile` goal builds that binary, runs `perf record` into
+`obj/profile/perf.data`, and prints a short `perf report` summary.
+
+```bash
+make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'
+make profile BENCH_ARGS='--scenario=lifo --backend=pool --iters=2000000'
+make profile BENCH_ARGS='--scenario=lifo --backend=pool --align=32 --iters=2000000'
+# Full interactive report / GUI:
+#   perf report -i obj/profile/perf.data
+#   hotspot obj/profile/perf.data
+```
+
+Pin one scenario and one backend so samples concentrate on the path under study.
+Compare Slab-only vs Pool to separate engine cost from Pool routing/header work.
+Do not treat sanitizer or coverage builds as profile baselines.
+
+If `perf record` fails with “Access to performance monitoring…”, the profile
+binary was still built under `obj/profile/`. Relax
+`kernel.perf_event_paranoid` for your session (often `1` or `2`), or grant
+`CAP_PERFMON`, then re-run `make profile`. You can also time the binary
+directly: `./obj/profile/bench_allocators --scenario=lifo --backend=slab16`.
 
 ---
 
@@ -927,7 +976,7 @@ check for the slab engine; use `make bench` for comparative baselines.
 | `BUILD_TYPE=threadsan` | TSan (+ UBSan); exercises locks / annotations |
 | `BUILD_TYPE=release` | `-O3 -DNDEBUG`; coverage on by default in CI |
 | `BUILD_TYPE=memsan` | Valid locally when host provides instrumented C++ runtime/gtest; **omitted from CI** |
-| `-DVDEBUG` | Verbose `debug_println` (slab create/alloc/free, selection, misses) |
+| `-DVDEBUG` | Verbose `debug_println` macros (args evaluated only when verbose; slab create/alloc/free, …) |
 
 Sanitizer instrumentors are mutually exclusive at configure time (ASan/LSan vs
 MSan vs TSan); UBSan may combine. `BUILD_TYPE` always applies the matching
@@ -956,7 +1005,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 | Fixed size-class ladders | Deliberate; exact-pack buffers within classes; non-ladder shaping is backlog R2 |
 | Lock type | Hard-wired `SpinLock`; pluggable primitive is backlog R5 |
 | MSan in CI | Deferred pending host instrumented runtime |
-| Metrics API | `PoolStats` / `Pool::stats()` (alloc/free counters + HWMs); richer per-class breakdown later |
+| Metrics API | `PoolStats` / `Pool::stats()` (HWMs always; alloc/free tallies opt-in via `SPALLOCATOR_POOL_COUNTERS`); richer per-class breakdown later |
 | C API | C++ only today; C99 wrapper is backlog R4 |
 
 These are engineering follow-ons, not soft-pedaled “educational” gaps. Pool

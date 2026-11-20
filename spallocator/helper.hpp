@@ -52,8 +52,8 @@ namespace spallocator
     using mlvlib::operator""_GB;
     using mlvlib::print;
     using mlvlib::println;
-    using mlvlib::debug_print;
-    using mlvlib::debug_println;
+    // debug_print / debug_println are macros from mlvlib/helper.hpp so that
+    // arguments are not evaluated when VERBOSE_DEBUG is off.
     using mlvlib::runtime_assert;
 
     // Compile-time size caps (override via -D / ./configure). Not runtime-tunable.

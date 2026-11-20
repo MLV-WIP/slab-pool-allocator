@@ -2,12 +2,14 @@
  * On-demand allocator comparison harness (not part of make test).
  *
  * Prefer: make bench BUILD_TYPE=release
+ * Profile: make profile BENCH_ARGS='--scenario=lifo --backend=slab16'
  *
  * Compares ::operator new, spallocator::Pool, std::pmr pool resources, and
  * (where applicable) bare Slab. Reports ns/op and ratio vs ::new.
  *
  * Usage:
- *   bench_allocators [--align=8|64] [--iters=N] [--threads=N] [--help]
+ *   bench_allocators [--align=8|32|64] [--iters=N] [--threads=N]
+ *                   [--scenario=...] [--backend=...] [--help]
  */
 
 #include <algorithm>
@@ -46,6 +48,16 @@ inline void sink_ptr(void* p) noexcept
 inline constexpr std::size_t kUserSizeMin = 16;
 inline constexpr std::size_t kUserSizeMax = 1024;
 
+// Default per-thread live batch for --scenario=threaded (peak live ≈ threads×batch).
+// 1024 favors multi-buffer growth across several size classes under --size-mix=class.
+inline constexpr int kDefaultThreadedBatch = 1024;
+
+enum class SizeMix
+{
+    Uniform, // uniform user bytes in [kUserSizeMin, kUserSizeMax]
+    Class,   // uniform over reachable axis-16 size classes (exact-fit user size)
+};
+
 // Per-worker std::minstd_rand (fast LCG from <random>). Deterministic seed per
 // worker index so runs are repeatable and threads do not share RNG state.
 inline constexpr std::uint32_t kBenchRngSeedKey = 0x51AB0001u;
@@ -64,10 +76,54 @@ inline std::minstd_rand make_bench_rng(unsigned worker_index = 0)
     return std::minstd_rand{z};
 }
 
-inline std::size_t pick_user_size(std::minstd_rand& rng)
+inline std::size_t pool_header_size(std::size_t alignment)
 {
-    std::uniform_int_distribution<std::size_t> dist(kUserSizeMin, kUserSizeMax);
-    return dist(rng);
+    return alignment < 8 ? 8 : alignment;
+}
+
+// Exact-fit user sizes that land on each reachable native-axis class when
+// footprint = user + header. With align 8 (header 8) and user ≥ 16, class 16
+// is unreachable; classes 32..1024 are.
+inline std::size_t pick_user_size(std::minstd_rand& rng, SizeMix mix,
+                                 std::size_t alignment)
+{
+    if (mix == SizeMix::Uniform)
+    {
+        std::uniform_int_distribution<std::size_t> dist(kUserSizeMin, kUserSizeMax);
+        return dist(rng);
+    }
+
+    const std::size_t header = pool_header_size(alignment);
+    // Mirror spallocator::kLadder16; keep local to avoid pulling ladder internals
+    // into the bench beyond what Pool already documents.
+    static constexpr std::size_t kLadder[] = {
+        16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024};
+
+    std::size_t choices[sizeof(kLadder) / sizeof(kLadder[0])];
+    std::size_t n = 0;
+    for (std::size_t cls : kLadder)
+    {
+        if (cls <= header)
+        {
+            continue;
+        }
+        const std::size_t user = cls - header;
+        if (user >= kUserSizeMin && user <= kUserSizeMax)
+        {
+            choices[n++] = user;
+        }
+    }
+    if (n == 0)
+    {
+        return kUserSizeMin;
+    }
+    std::uniform_int_distribution<std::size_t> dist(0, n - 1);
+    return choices[dist(rng)];
+}
+
+char const* size_mix_label(SizeMix m)
+{
+    return m == SizeMix::Class ? "class" : "uniform";
 }
 
 void print_pool_stats(std::string_view label, spallocator::Pool& pool)
@@ -81,7 +137,12 @@ void print_pool_stats(std::string_view label, spallocator::Pool& pool)
               << "    alloc_ok=" << s.alloc_ok
               << " alloc_fail=" << s.alloc_fail
               << " free_ok=" << s.free_ok
-              << " free_fail=" << s.free_fail << "\n";
+              << " free_fail=" << s.free_fail;
+    if (!spallocator::kPoolCountersEnabled)
+    {
+        std::cout << " (counters off; -DSPALLOCATOR_POOL_COUNTERS=1 to enable)";
+    }
+    std::cout << "\n";
 }
 
 void print_slab16_stats(std::string_view label, spallocator::Slab<16, 16>& slab)
@@ -93,11 +154,247 @@ void print_slab16_stats(std::string_view label, spallocator::Slab<16, 16>& slab)
               << "\n";
 }
 
+enum class Scenario : unsigned
+{
+    None = 0,
+    Lifo = 1u << 0,
+    Multi = 1u << 1,
+    Bulk = 1u << 2,
+    Threaded = 1u << 3,
+    All = Lifo | Multi | Bulk | Threaded,
+};
+
+enum class BackendId : unsigned
+{
+    None = 0,
+    New = 1u << 0,
+    Pool = 1u << 1,
+    PmrUnsync = 1u << 2,
+    PmrSync = 1u << 3,
+    Slab16 = 1u << 4,
+    All = New | Pool | PmrUnsync | PmrSync | Slab16,
+};
+
+inline Scenario operator|(Scenario a, Scenario b)
+{
+    return static_cast<Scenario>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
+}
+inline Scenario& operator|=(Scenario& a, Scenario b)
+{
+    a = a | b;
+    return a;
+}
+inline bool has(Scenario mask, Scenario bit)
+{
+    return (static_cast<unsigned>(mask) & static_cast<unsigned>(bit)) != 0;
+}
+
+inline BackendId operator|(BackendId a, BackendId b)
+{
+    return static_cast<BackendId>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
+}
+inline BackendId& operator|=(BackendId& a, BackendId b)
+{
+    a = a | b;
+    return a;
+}
+inline bool has(BackendId mask, BackendId bit)
+{
+    return (static_cast<unsigned>(mask) & static_cast<unsigned>(bit)) != 0;
+}
+
+bool parse_scenario_list(std::string_view csv, Scenario& out, std::string& err)
+{
+    out = Scenario::None;
+    std::size_t start = 0;
+    while (start <= csv.size())
+    {
+        std::size_t comma = csv.find(',', start);
+        std::string_view tok =
+            csv.substr(start, comma == std::string_view::npos ? csv.size() - start : comma - start);
+        if (tok.empty())
+        {
+            err = "empty --scenario token";
+            return false;
+        }
+        if (tok == "all")
+        {
+            out = Scenario::All;
+        }
+        else if (tok == "lifo")
+        {
+            out |= Scenario::Lifo;
+        }
+        else if (tok == "multi")
+        {
+            out |= Scenario::Multi;
+        }
+        else if (tok == "bulk")
+        {
+            out |= Scenario::Bulk;
+        }
+        else if (tok == "threaded")
+        {
+            out |= Scenario::Threaded;
+        }
+        else
+        {
+            err = "unknown --scenario value: " + std::string(tok);
+            return false;
+        }
+        if (comma == std::string_view::npos)
+        {
+            break;
+        }
+        start = comma + 1;
+    }
+    if (out == Scenario::None)
+    {
+        err = "--scenario selected nothing";
+        return false;
+    }
+    return true;
+}
+
+bool parse_backend_list(std::string_view csv, BackendId& out, std::string& err)
+{
+    out = BackendId::None;
+    std::size_t start = 0;
+    while (start <= csv.size())
+    {
+        std::size_t comma = csv.find(',', start);
+        std::string_view tok =
+            csv.substr(start, comma == std::string_view::npos ? csv.size() - start : comma - start);
+        if (tok.empty())
+        {
+            err = "empty --backend token";
+            return false;
+        }
+        if (tok == "all")
+        {
+            out = BackendId::All;
+        }
+        else if (tok == "new")
+        {
+            out |= BackendId::New;
+        }
+        else if (tok == "pool")
+        {
+            out |= BackendId::Pool;
+        }
+        else if (tok == "pmr_unsync")
+        {
+            out |= BackendId::PmrUnsync;
+        }
+        else if (tok == "pmr_sync")
+        {
+            out |= BackendId::PmrSync;
+        }
+        else if (tok == "slab16")
+        {
+            out |= BackendId::Slab16;
+        }
+        else
+        {
+            err = "unknown --backend value: " + std::string(tok);
+            return false;
+        }
+        if (comma == std::string_view::npos)
+        {
+            break;
+        }
+        start = comma + 1;
+    }
+    if (out == BackendId::None)
+    {
+        err = "--backend selected nothing";
+        return false;
+    }
+    return true;
+}
+
+char const* scenario_label(Scenario s)
+{
+    if (s == Scenario::All)
+    {
+        return "all";
+    }
+    // Compact banner for common single/multi selections.
+    static thread_local std::string buf;
+    buf.clear();
+    auto append = [&](char const* name) {
+        if (!buf.empty())
+        {
+            buf += ',';
+        }
+        buf += name;
+    };
+    if (has(s, Scenario::Lifo))
+    {
+        append("lifo");
+    }
+    if (has(s, Scenario::Multi))
+    {
+        append("multi");
+    }
+    if (has(s, Scenario::Bulk))
+    {
+        append("bulk");
+    }
+    if (has(s, Scenario::Threaded))
+    {
+        append("threaded");
+    }
+    return buf.c_str();
+}
+
+char const* backend_label(BackendId b)
+{
+    if (b == BackendId::All)
+    {
+        return "all";
+    }
+    static thread_local std::string buf;
+    buf.clear();
+    auto append = [&](char const* name) {
+        if (!buf.empty())
+        {
+            buf += ',';
+        }
+        buf += name;
+    };
+    if (has(b, BackendId::New))
+    {
+        append("new");
+    }
+    if (has(b, BackendId::Pool))
+    {
+        append("pool");
+    }
+    if (has(b, BackendId::PmrUnsync))
+    {
+        append("pmr_unsync");
+    }
+    if (has(b, BackendId::PmrSync))
+    {
+        append("pmr_sync");
+    }
+    if (has(b, BackendId::Slab16))
+    {
+        append("slab16");
+    }
+    return buf.c_str();
+}
+
 struct Options
 {
     std::size_t alignment = 8;
     int iters = 300000;
     int threads = 1;
+    int batch = kDefaultThreadedBatch;
+    SizeMix size_mix = SizeMix::Class;
+    Scenario scenarios = Scenario::All;
+    BackendId backends = BackendId::All;
     bool help = false;
 };
 
@@ -126,6 +423,45 @@ Options parse_args(int argc, char** argv)
         {
             opt.threads = static_cast<int>(std::strtol(a.data() + 10, nullptr, 10));
         }
+        else if (a.rfind("--batch=", 0) == 0)
+        {
+            opt.batch = static_cast<int>(std::strtol(a.data() + 8, nullptr, 10));
+        }
+        else if (a.rfind("--size-mix=", 0) == 0)
+        {
+            std::string_view v = a.substr(11);
+            if (v == "uniform")
+            {
+                opt.size_mix = SizeMix::Uniform;
+            }
+            else if (v == "class")
+            {
+                opt.size_mix = SizeMix::Class;
+            }
+            else
+            {
+                std::cerr << "--size-mix must be uniform or class\n";
+                opt.help = true;
+            }
+        }
+        else if (a.rfind("--scenario=", 0) == 0)
+        {
+            std::string err;
+            if (!parse_scenario_list(a.substr(11), opt.scenarios, err))
+            {
+                std::cerr << err << "\n";
+                opt.help = true;
+            }
+        }
+        else if (a.rfind("--backend=", 0) == 0)
+        {
+            std::string err;
+            if (!parse_backend_list(a.substr(10), opt.backends, err))
+            {
+                std::cerr << err << "\n";
+                opt.help = true;
+            }
+        }
         else
         {
             std::cerr << "unknown argument: " << a << "\n";
@@ -140,9 +476,13 @@ Options parse_args(int argc, char** argv)
     {
         opt.threads = 1;
     }
-    if (opt.alignment != 8 && opt.alignment != 64)
+    if (opt.batch < 1)
     {
-        std::cerr << "--align must be 8 (default suite) or 64 (Pool vs ::new spot-check)\n";
+        opt.batch = 1;
+    }
+    if (opt.alignment != 8 && opt.alignment != 32 && opt.alignment != 64)
+    {
+        std::cerr << "--align must be 8 (default suite) or 32|64 (Pool vs ::new spot-check)\n";
         opt.help = true;
     }
     return opt;
@@ -154,14 +494,27 @@ void print_help()
         "bench_allocators - compare allocation backends (on-demand; not a CI gate)\n"
         "\n"
         "Options:\n"
-        "  --align=8|64     Payload alignment (default 8). 64 runs Pool vs ::new spot-check only.\n"
-        "  --iters=N        Timed alloc/free pairs per scenario (default release 300000)\n"
-        "  --threads=N      Worker threads for multi-thread multi-size churn (default 1)\n"
-        "  --help           Show this help\n"
+        "  --align=8|32|64     Payload alignment (default 8). 32/64 run Pool vs ::new spot-check only.\n"
+        "  --iters=N           Timed alloc/free pairs per scenario (default release 300000)\n"
+        "  --threads=N         Worker threads for multi-thread multi-size churn (default 1)\n"
+        "  --batch=N           Per-thread live batch for threaded scenario (default 1024)\n"
+        "  --size-mix=MIX      uniform | class (default class). Class = equal weight per\n"
+        "                      reachable axis-16 size class (exact-fit user size).\n"
+        "  --scenario=LIST     lifo,multi,bulk,threaded,all (comma-separated; default all)\n"
+        "  --backend=LIST      new,pool,pmr_unsync,pmr_sync,slab16,all (comma-separated; default all)\n"
+        "  --help              Show this help\n"
         "\n"
-        "Multi-size scenarios draw user sizes uniformly from [16, 1024].\n"
+        "Filters skip inapplicable combinations with a note (e.g. slab16 outside\n"
+        "lifo/bulk; pmr_sync outside threaded; threaded needs --threads=N with N>1).\n"
+        "Bulk alloc-then-free-all grows many slab buffers (multi-buffer free uses the map).\n"
+        "Threaded: shared allocator + start barrier (contention); peak live ≈ threads×batch\n"
+        "so multi-buffer growth needs a large batch (default 1024) and --size-mix=class (default).\n"
+        "When ::new is omitted, tables print ns/op only (no vs ::new ratio).\n"
+        "\n"
         "Per-thread std::minstd_rand (seed key + worker index).\n"
-        "Recommended: make bench BUILD_TYPE=release\n";
+        "Recommended: make bench BUILD_TYPE=release\n"
+        "Profiling:   make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'\n"
+        "Threaded:    make bench BUILD_TYPE=release BENCH_ARGS='--scenario=threaded --threads=4'\n";
 }
 
 void print_banner(Options const& opt)
@@ -170,6 +523,10 @@ void print_banner(Options const& opt)
     std::cout << "  alignment: " << opt.alignment << "\n";
     std::cout << "  iters:     " << opt.iters << "\n";
     std::cout << "  threads:   " << opt.threads << "\n";
+    std::cout << "  batch:     " << opt.batch << " (threaded peak live ≈ threads×batch)\n";
+    std::cout << "  size-mix:  " << size_mix_label(opt.size_mix) << "\n";
+    std::cout << "  scenario:  " << scenario_label(opt.scenarios) << "\n";
+    std::cout << "  backend:   " << backend_label(opt.backends) << "\n";
 #if defined(__clang__)
     std::cout << "  compiler:  clang " << __clang_major__ << "." << __clang_minor__
               << "." << __clang_patchlevel__ << "\n";
@@ -325,13 +682,14 @@ Timing timed_lifo_churn(Backend& b, std::size_t size, std::size_t align, int ite
 }
 
 template <class Backend>
-void warm_random_sizes(Backend& b, std::size_t align, std::minstd_rand& rng, int warm_count)
+void warm_random_sizes(Backend& b, std::size_t align, std::minstd_rand& rng,
+                       SizeMix mix, int warm_count)
 {
     std::vector<std::pair<void*, std::size_t>> live;
     live.reserve(static_cast<std::size_t>(warm_count));
     for (int i = 0; i < warm_count; ++i)
     {
-        std::size_t s = pick_user_size(rng);
+        std::size_t s = pick_user_size(rng, mix, align);
         live.emplace_back(b.allocate(s, align), s);
     }
     for (auto& [p, s] : live)
@@ -341,15 +699,15 @@ void warm_random_sizes(Backend& b, std::size_t align, std::minstd_rand& rng, int
 }
 
 template <class Backend>
-Timing timed_multi_size_churn(Backend& b, std::size_t align, int iters,
+Timing timed_multi_size_churn(Backend& b, std::size_t align, SizeMix mix, int iters,
                               unsigned worker_index = 0)
 {
     std::minstd_rand rng = make_bench_rng(worker_index);
-    warm_random_sizes(b, align, rng, 256);
+    warm_random_sizes(b, align, rng, mix, 256);
     const auto t0 = clock_type::now();
     for (int i = 0; i < iters; ++i)
     {
-        std::size_t s = pick_user_size(rng);
+        std::size_t s = pick_user_size(rng, mix, align);
         void* p = b.allocate(s, align);
         sink_ptr(p);
         b.deallocate(p, s, align);
@@ -384,30 +742,38 @@ std::pair<Timing, Timing> timed_alloc_then_free_all(Backend& b, std::size_t size
 }
 
 template <class Backend>
-Timing timed_threaded_multi_size_churn(Backend& shared, std::size_t align,
-                                       int total_iters, int threads)
+Timing timed_threaded_multi_size_churn(Backend& shared, std::size_t align, SizeMix mix,
+                                       int total_iters, int threads, int batch)
 {
     {
         std::minstd_rand warm_rng = make_bench_rng(0);
-        warm_random_sizes(shared, align, warm_rng, 256);
+        warm_random_sizes(shared, align, warm_rng, mix, 256);
     }
     std::atomic<int> ready{0};
     std::vector<std::thread> workers;
     workers.reserve(static_cast<std::size_t>(threads));
 
     // Each worker holds its own batch of live pointers (not shared across threads).
-    constexpr std::size_t kBatch = 16;
-    const int per = total_iters / threads / static_cast<int>(kBatch);
+    // Large batch → peak live ≈ threads×batch for multi-buffer growth under mix=class.
+    const std::size_t kBatch = static_cast<std::size_t>(batch);
+    const int per = total_iters / threads / batch;
+    if (per < 1)
+    {
+        std::cerr << "threaded: iters too small for threads×batch; "
+                     "raise --iters or lower --threads/--batch\n";
+        return {};
+    }
 
     const auto t0 = clock_type::now();
     for (int t = 0; t < threads; ++t)
     {
         const unsigned worker_index = static_cast<unsigned>(t);
-        workers.emplace_back([&shared, &ready, align, per, threads, worker_index] {
+        workers.emplace_back([&shared, &ready, align, mix, per, threads, kBatch,
+                              worker_index] {
             // Per-thread RNG: same seed key every process run; distinct stream
             // per worker_index (not std::thread::id - that is not stable).
             std::minstd_rand rng = make_bench_rng(worker_index);
-            std::vector<std::pair<void*, std::size_t>> batch(kBatch);
+            std::vector<std::pair<void*, std::size_t>> batch_ptrs(kBatch);
 
             ready.fetch_add(1, std::memory_order_acq_rel);
             while (ready.load(std::memory_order_acquire) < threads)
@@ -418,16 +784,16 @@ Timing timed_threaded_multi_size_churn(Backend& shared, std::size_t align,
             {
                 for (std::size_t j = 0; j < kBatch; ++j)
                 {
-                    std::size_t s = pick_user_size(rng);
-                    batch[j].first = shared.allocate(s, align);
-                    batch[j].second = s;
-                    sink_ptr(batch[j].first);
+                    std::size_t s = pick_user_size(rng, mix, align);
+                    batch_ptrs[j].first = shared.allocate(s, align);
+                    batch_ptrs[j].second = s;
+                    sink_ptr(batch_ptrs[j].first);
                 }
                 // Reverse free; use signed index so j >= 0 is well-defined
                 // (size_t would wrap forever after j hits 0).
                 for (int j = static_cast<int>(kBatch) - 1; j >= 0; --j)
                 {
-                    auto& slot = batch[static_cast<std::size_t>(j)];
+                    auto& slot = batch_ptrs[static_cast<std::size_t>(j)];
                     shared.deallocate(slot.first, slot.second, align);
                     slot.first = nullptr;
                 }
@@ -440,13 +806,14 @@ Timing timed_threaded_multi_size_churn(Backend& shared, std::size_t align,
     }
     const auto t1 = clock_type::now();
     // ops = alloc+free pairs (each outer iter does kBatch of them).
-    return make_timing(t1 - t0, per * threads * static_cast<int>(kBatch));
+    return make_timing(t1 - t0, per * threads * batch);
 }
 
 struct Row
 {
     std::string backend;
     Timing timing;
+    bool is_new_baseline = false;
 };
 
 void print_table(std::string_view title, std::vector<Row> const& rows)
@@ -457,151 +824,359 @@ void print_table(std::string_view title, std::vector<Row> const& rows)
         std::cout << "  (no rows)\n\n";
         return;
     }
-    const double baseline = rows.front().timing.ns_per_op;
+    double baseline = 0.0;
+    bool have_baseline = false;
+    for (auto const& r : rows)
+    {
+        if (r.is_new_baseline)
+        {
+            baseline = r.timing.ns_per_op;
+            have_baseline = true;
+            break;
+        }
+    }
     std::cout << std::left << std::setw(28) << "  backend"
               << std::right << std::setw(14) << "ns/op"
               << std::setw(12) << "vs ::new"
               << "\n";
     for (auto const& r : rows)
     {
-        const double ratio = (baseline > 0.0) ? (r.timing.ns_per_op / baseline) : 0.0;
         std::cout << std::left << std::setw(28) << ("  " + r.backend)
                   << std::right << std::fixed << std::setprecision(1)
-                  << std::setw(14) << r.timing.ns_per_op
-                  << std::setprecision(3) << std::setw(12) << ratio
-                  << "\n";
+                  << std::setw(14) << r.timing.ns_per_op;
+        if (have_baseline && baseline > 0.0)
+        {
+            std::cout << std::setprecision(3) << std::setw(12)
+                      << (r.timing.ns_per_op / baseline);
+        }
+        else
+        {
+            std::cout << std::setw(12) << "n/a";
+        }
+        std::cout << "\n";
     }
     std::cout << "\n";
 }
 
 template <class Backend>
-Row row_from(Backend& /*b*/, Timing t)
+Row row_from(Backend& /*b*/, Timing t, bool is_new_baseline = false)
 {
-    return Row{Backend::name, t};
+    return Row{Backend::name, t, is_new_baseline};
+}
+
+void note_skip(std::string_view why)
+{
+    std::cout << "  skip: " << why << "\n";
 }
 
 void run_align8_suite(Options const& opt)
 {
     constexpr std::size_t kSize = 16;
-    const int bulk_count = std::min(opt.iters, 100000);
+    // Cap bulk live-set size (pointer vector + retained slabs). Default packing
+    // is 512 slots/buffer for Slab<16,16>, so counts >> 512 exercise multi-buffer.
+    const int bulk_count = std::min(opt.iters, 500000);
+    const BackendId be = opt.backends;
 
     // --- Warmed LIFO churn (16B) ---
+    if (has(opt.scenarios, Scenario::Lifo))
     {
         std::vector<Row> rows;
-        NewDeleteBackend new_b;
         PoolBackend pool_b;
-        PmrUnsyncBackend pmr_b;
         Slab16Backend slab_b;
+        bool ran_pool = false;
+        bool ran_slab = false;
 
-        rows.push_back(row_from(new_b, timed_lifo_churn(new_b, kSize, opt.alignment, opt.iters)));
-        rows.push_back(row_from(pool_b, timed_lifo_churn(pool_b, kSize, opt.alignment, opt.iters)));
-        rows.push_back(row_from(pmr_b, timed_lifo_churn(pmr_b, kSize, opt.alignment, opt.iters)));
-        rows.push_back(row_from(slab_b, timed_lifo_churn(slab_b, kSize, opt.alignment, opt.iters)));
+        if (has(be, BackendId::New))
+        {
+            NewDeleteBackend new_b;
+            rows.push_back(row_from(
+                new_b, timed_lifo_churn(new_b, kSize, opt.alignment, opt.iters), true));
+        }
+        if (has(be, BackendId::Pool))
+        {
+            rows.push_back(row_from(
+                pool_b, timed_lifo_churn(pool_b, kSize, opt.alignment, opt.iters)));
+            ran_pool = true;
+        }
+        if (has(be, BackendId::PmrUnsync))
+        {
+            PmrUnsyncBackend pmr_b;
+            rows.push_back(row_from(
+                pmr_b, timed_lifo_churn(pmr_b, kSize, opt.alignment, opt.iters)));
+        }
+        if (has(be, BackendId::PmrSync))
+        {
+            note_skip("pmr_sync not used in single-thread LIFO (use --scenario=threaded)");
+        }
+        if (has(be, BackendId::Slab16))
+        {
+            rows.push_back(row_from(
+                slab_b, timed_lifo_churn(slab_b, kSize, opt.alignment, opt.iters)));
+            ran_slab = true;
+        }
         print_table("Warmed LIFO churn (size=16, alloc+free pair)", rows);
-        print_pool_stats("after LIFO churn", pool_b.pool);
-        print_slab16_stats("after LIFO churn", slab_b.slab);
+        if (ran_pool)
+        {
+            print_pool_stats("after LIFO churn", pool_b.pool);
+        }
+        if (ran_slab)
+        {
+            print_slab16_stats("after LIFO churn", slab_b.slab);
+        }
         std::cout << "\n";
     }
 
     // --- Multi-size mix (uniform random user sizes in [16, 1024]) ---
+    if (has(opt.scenarios, Scenario::Multi))
     {
         std::vector<Row> rows;
-        NewDeleteBackend new_b;
         PoolBackend pool_b;
-        PmrUnsyncBackend pmr_b;
+        bool ran_pool = false;
 
-        rows.push_back(row_from(new_b, timed_multi_size_churn(new_b, opt.alignment, opt.iters)));
-        rows.push_back(row_from(pool_b, timed_multi_size_churn(pool_b, opt.alignment, opt.iters)));
-        rows.push_back(row_from(pmr_b, timed_multi_size_churn(pmr_b, opt.alignment, opt.iters)));
+        if (has(be, BackendId::New))
+        {
+            NewDeleteBackend new_b;
+                rows.push_back(row_from(
+                new_b,
+                timed_multi_size_churn(new_b, opt.alignment, opt.size_mix, opt.iters),
+                true));
+        }
+        if (has(be, BackendId::Pool))
+        {
+            rows.push_back(row_from(
+                pool_b,
+                timed_multi_size_churn(pool_b, opt.alignment, opt.size_mix, opt.iters)));
+            ran_pool = true;
+        }
+        if (has(be, BackendId::PmrUnsync))
+        {
+            PmrUnsyncBackend pmr_b;
+            rows.push_back(row_from(
+                pmr_b,
+                timed_multi_size_churn(pmr_b, opt.alignment, opt.size_mix, opt.iters)));
+        }
+        if (has(be, BackendId::PmrSync))
+        {
+            note_skip("pmr_sync not used in single-thread multi (use --scenario=threaded)");
+        }
+        if (has(be, BackendId::Slab16))
+        {
+            note_skip("slab16 only supports size<=16 (use --scenario=lifo or bulk)");
+        }
         print_table(
-            "Multi-size mix (uniform random user size in [16, 1024], alloc+free pair)",
+            std::string("Multi-size mix (size-mix=") + size_mix_label(opt.size_mix) +
+                ", alloc+free pair)",
             rows);
-        print_pool_stats("after multi-size mix", pool_b.pool);
+        if (ran_pool)
+        {
+            print_pool_stats("after multi-size mix", pool_b.pool);
+        }
         std::cout << "\n";
     }
 
-    // --- Alloc-all then free-all ---
+    // --- Alloc-all then free-all (grows many slab buffers; not single-slot churn) ---
+    if (has(opt.scenarios, Scenario::Bulk))
     {
-        std::cout << "Alloc-then-free-all (size=16, count=" << bulk_count << ")\n";
-        std::cout << std::left << std::setw(28) << "  backend"
-                  << std::right << std::setw(14) << "alloc ns/op"
-                  << std::setw(14) << "free ns/op"
-                  << std::setw(12) << "alloc vs"
-                  << std::setw(12) << "free vs"
-                  << "\n";
+        if (has(be, BackendId::PmrSync))
+        {
+            note_skip("pmr_sync omitted from alloc-then-free-all (use --scenario=threaded)");
+        }
 
-        NewDeleteBackend baseline_b;
-        auto [base_a, base_f] =
-            timed_alloc_then_free_all(baseline_b, kSize, opt.alignment, bulk_count);
-
-        auto print_bulk = [&](char const* name, Timing a, Timing f) {
-            std::cout << std::left << std::setw(28) << (std::string("  ") + name)
-                      << std::right << std::fixed << std::setprecision(1)
-                      << std::setw(14) << a.ns_per_op
-                      << std::setw(14) << f.ns_per_op
-                      << std::setprecision(3)
-                      << std::setw(12) << (a.ns_per_op / base_a.ns_per_op)
-                      << std::setw(12) << (f.ns_per_op / base_f.ns_per_op)
+        const bool want_new = has(be, BackendId::New);
+        const bool want_pool = has(be, BackendId::Pool);
+        const bool want_pmr = has(be, BackendId::PmrUnsync);
+        const bool want_slab = has(be, BackendId::Slab16);
+        if (!want_new && !want_pool && !want_pmr && !want_slab)
+        {
+            std::cout << "Alloc-then-free-all skipped (no applicable backends selected).\n\n";
+        }
+        else
+        {
+            // Slab<16,16> holds 512 slots/buffer at default packing; count>>512
+            // forces multi-buffer growth (and map-backed free when m>1).
+            std::cout << "Alloc-then-free-all (size=16, count=" << bulk_count
+                      << "; multi-buffer growth)\n";
+            std::cout << std::left << std::setw(28) << "  backend"
+                      << std::right << std::setw(14) << "alloc ns/op"
+                      << std::setw(14) << "free ns/op"
+                      << std::setw(12) << "alloc vs"
+                      << std::setw(12) << "free vs"
                       << "\n";
-        };
 
-        print_bulk(NewDeleteBackend::name, base_a, base_f);
-        PoolBackend pool_b;
-        {
-            auto [a, f] = timed_alloc_then_free_all(pool_b, kSize, opt.alignment, bulk_count);
-            print_bulk(PoolBackend::name, a, f);
+            Timing base_a{};
+            Timing base_f{};
+            bool have_baseline = false;
+            if (want_new)
+            {
+                NewDeleteBackend baseline_b;
+                auto pair =
+                    timed_alloc_then_free_all(baseline_b, kSize, opt.alignment, bulk_count);
+                base_a = pair.first;
+                base_f = pair.second;
+                have_baseline = true;
+            }
+
+            auto print_bulk = [&](char const* name, Timing a, Timing f) {
+                std::cout << std::left << std::setw(28) << (std::string("  ") + name)
+                          << std::right << std::fixed << std::setprecision(1)
+                          << std::setw(14) << a.ns_per_op
+                          << std::setw(14) << f.ns_per_op;
+                if (have_baseline && base_a.ns_per_op > 0.0 && base_f.ns_per_op > 0.0)
+                {
+                    std::cout << std::setprecision(3)
+                              << std::setw(12) << (a.ns_per_op / base_a.ns_per_op)
+                              << std::setw(12) << (f.ns_per_op / base_f.ns_per_op);
+                }
+                else
+                {
+                    std::cout << std::setw(12) << "n/a" << std::setw(12) << "n/a";
+                }
+                std::cout << "\n";
+            };
+
+            if (want_new)
+            {
+                print_bulk(NewDeleteBackend::name, base_a, base_f);
+            }
+            PoolBackend pool_b;
+            if (want_pool)
+            {
+                auto [a, f] =
+                    timed_alloc_then_free_all(pool_b, kSize, opt.alignment, bulk_count);
+                print_bulk(PoolBackend::name, a, f);
+                print_pool_stats("after alloc-then-free-all", pool_b.pool);
+            }
+            if (want_pmr)
+            {
+                PmrUnsyncBackend b;
+                auto [a, f] =
+                    timed_alloc_then_free_all(b, kSize, opt.alignment, bulk_count);
+                print_bulk(PmrUnsyncBackend::name, a, f);
+            }
+            if (want_slab)
+            {
+                Slab16Backend slab_b;
+                auto [a, f] =
+                    timed_alloc_then_free_all(slab_b, kSize, opt.alignment, bulk_count);
+                print_bulk(Slab16Backend::name, a, f);
+                print_slab16_stats("after alloc-then-free-all", slab_b.slab);
+            }
+            std::cout << "\n";
         }
-        {
-            PmrUnsyncBackend b;
-            auto [a, f] = timed_alloc_then_free_all(b, kSize, opt.alignment, bulk_count);
-            print_bulk(PmrUnsyncBackend::name, a, f);
-        }
-        print_pool_stats("after alloc-then-free-all", pool_b.pool);
-        std::cout << "\n";
     }
 
     // --- Multi-thread multi-size (shared backends that are thread-safe) ---
-    if (opt.threads > 1)
+    if (has(opt.scenarios, Scenario::Threaded))
     {
-        std::vector<Row> rows;
-        NewDeleteBackend new_b;
-        PoolBackend pool_b;
-        PmrSyncBackend pmr_b;
+        if (opt.threads <= 1)
+        {
+            std::cout << "Multi-thread multi-size skipped (pass --threads=N with N>1).\n\n";
+        }
+        else
+        {
+            if (has(be, BackendId::PmrUnsync))
+            {
+                note_skip("pmr_unsync not thread-safe (use pmr_sync for threaded)");
+            }
+            if (has(be, BackendId::Slab16))
+            {
+                note_skip("slab16 omitted from threaded multi-size (size<=16 only; use lifo/bulk)");
+            }
 
-        rows.push_back(row_from(
-            new_b, timed_threaded_multi_size_churn(
-                       new_b, opt.alignment, opt.iters, opt.threads)));
-        rows.push_back(row_from(
-            pool_b, timed_threaded_multi_size_churn(
-                        pool_b, opt.alignment, opt.iters, opt.threads)));
-        rows.push_back(row_from(
-            pmr_b, timed_threaded_multi_size_churn(
-                       pmr_b, opt.alignment, opt.iters, opt.threads)));
-        print_table(
-            "Multi-thread multi-size (uniform random [16, 1024], shared allocator)",
-            rows);
-        print_pool_stats("after multi-thread multi-size", pool_b.pool);
-        std::cout << "\n";
-    }
-    else
-    {
-        std::cout << "Multi-thread multi-size skipped (pass --threads=N with N>1).\n\n";
+            std::vector<Row> rows;
+            PoolBackend pool_b;
+            bool ran_pool = false;
+
+            const int peak_live = opt.threads * opt.batch;
+            std::cout << "Multi-thread multi-size (shared allocator; size-mix="
+                      << size_mix_label(opt.size_mix) << "; batch=" << opt.batch
+                      << "; peak live ≈ " << peak_live << ")\n";
+
+            if (has(be, BackendId::New))
+            {
+                NewDeleteBackend new_b;
+                rows.push_back(row_from(
+                    new_b,
+                    timed_threaded_multi_size_churn(
+                        new_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
+                        opt.batch),
+                    true));
+            }
+            if (has(be, BackendId::Pool))
+            {
+                rows.push_back(row_from(
+                    pool_b,
+                    timed_threaded_multi_size_churn(
+                        pool_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
+                        opt.batch)));
+                ran_pool = true;
+            }
+            if (has(be, BackendId::PmrSync))
+            {
+                PmrSyncBackend pmr_b;
+                rows.push_back(row_from(
+                    pmr_b,
+                    timed_threaded_multi_size_churn(
+                        pmr_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
+                        opt.batch)));
+            }
+            print_table("Multi-thread timing", rows);
+            if (ran_pool)
+            {
+                print_pool_stats("after multi-thread multi-size", pool_b.pool);
+                std::cout << "    (peak live ≈ " << peak_live
+                          << "; retained_slab_bytes reflects multi-buffer growth)\n";
+            }
+            std::cout << "\n";
+        }
     }
 }
 
-void run_align64_spot(Options const& opt)
+void run_high_align_spot(Options const& opt)
 {
     constexpr std::size_t kSize = 16;
-    std::cout << "Align-64 spot-check (Pool axis/header tax vs ::new; size=16)\n";
-    std::cout << "Other backends omitted on purpose.\n\n";
+    std::cout << "Align-" << opt.alignment
+              << " spot-check (Pool axis/header tax vs ::new; size=16)\n";
+    std::cout << "Only ::new and Pool participate; other --backend values are skipped.\n\n";
 
+    // High-align spots are LIFO-only tax checks (axis 32 or 64).
+    if (!has(opt.scenarios, Scenario::Lifo))
+    {
+        std::cout << "Align-" << opt.alignment
+                  << " spot-check skipped (--scenario without lifo).\n\n";
+        return;
+    }
+
+    const BackendId be = opt.backends;
     std::vector<Row> rows;
-    NewDeleteBackend new_b;
     PoolBackend pool_b;
-    rows.push_back(row_from(new_b, timed_lifo_churn(new_b, kSize, opt.alignment, opt.iters)));
-    rows.push_back(row_from(pool_b, timed_lifo_churn(pool_b, kSize, opt.alignment, opt.iters)));
+    bool ran_pool = false;
+
+    if (has(be, BackendId::New))
+    {
+        NewDeleteBackend new_b;
+        rows.push_back(row_from(
+            new_b, timed_lifo_churn(new_b, kSize, opt.alignment, opt.iters), true));
+    }
+    if (has(be, BackendId::Pool))
+    {
+        rows.push_back(row_from(
+            pool_b, timed_lifo_churn(pool_b, kSize, opt.alignment, opt.iters)));
+        ran_pool = true;
+    }
+    if (has(be, BackendId::PmrUnsync) || has(be, BackendId::PmrSync) ||
+        has(be, BackendId::Slab16))
+    {
+        note_skip("align=" + std::to_string(opt.alignment) +
+                  " spot-check is Pool vs ::new only");
+    }
     print_table("Warmed LIFO churn", rows);
-    print_pool_stats("after align-64 LIFO churn", pool_b.pool);
+    if (ran_pool)
+    {
+        print_pool_stats(
+            ("after align-" + std::to_string(opt.alignment) + " LIFO churn").c_str(),
+            pool_b.pool);
+    }
     std::cout << "\n";
 }
 
@@ -613,16 +1188,23 @@ int main(int argc, char** argv)
     if (opt.help)
     {
         print_help();
-        return opt.alignment == 8 || opt.alignment == 64 ? 0 : 2;
+        return (opt.alignment == 8 || opt.alignment == 32 || opt.alignment == 64) ? 0 : 2;
     }
 
     print_banner(opt);
-    std::cout << "Ratios are ns/op divided by ::operator new on this run.\n"
-                 "Absolute ns are host/toolchain-specific; re-check after upgrades.\n\n";
-
-    if (opt.alignment == 64)
+    if (has(opt.backends, BackendId::New))
     {
-        run_align64_spot(opt);
+        std::cout << "Ratios are ns/op divided by ::operator new on this run.\n";
+    }
+    else
+    {
+        std::cout << "Backend filter omits ::new; vs ::new column is n/a.\n";
+    }
+    std::cout << "Absolute ns are host/toolchain-specific; re-check after upgrades.\n\n";
+
+    if (opt.alignment == 32 || opt.alignment == 64)
+    {
+        run_high_align_spot(opt);
     }
     else
     {

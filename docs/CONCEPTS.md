@@ -182,7 +182,7 @@ API: [API.md — Slab & SlabProxy](API.md#slab--slabproxy).
 ```text
   Pool                          ← lifetime / routing / isolation boundary
     ├── Slab<16>, Slab<32>, …   ← fixed-size slot recycling per size class
-    ├── Slab<…, 32>, Slab<…, 64> (lazy axes)
+    ├── Slab<…, 32>, Slab<…, 64> (high-align axes; engines eager, blocks on demand)
     └── SlabProxy               ← oversized: system new[] / delete[]
 ```
 
@@ -218,8 +218,8 @@ space (a 33-byte need may jump to 64). **Intermediate classes** (48, 96, 192,
 
 ```
 Axis 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Axis 32 (lazy):  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Axis 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Axis 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+Axis 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 ```
 
 ### Internal vs external fragmentation
@@ -408,7 +408,7 @@ story — and that granularity mirrors the pool-vs-slab split.
 ### Two levels
 
 1. **Pool lock** — short critical sections for routing (“which slab handles this
-   footprint?”) and registry updates (including lazy creation of 32/64-axis
+   footprint?”) and size-class routing (including high-align 32/64-axis
    slabs).  
 2. **Per-slab lock** — protects that size class’s bitsets and address map.  
 

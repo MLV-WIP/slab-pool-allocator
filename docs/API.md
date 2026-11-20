@@ -132,8 +132,8 @@ Why pools exist as a concept: [CONCEPTS.md — Pool](CONCEPTS.md#what-is-a-pool-
 
 ```
 Axis 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Axis 32 (lazy):  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Axis 64 (lazy):  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Axis 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
+Axis 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
 ```
 
 If the footprint exceeds the maximum class on that axis, the pool uses
@@ -161,7 +161,7 @@ PoolControlBlock* control() const noexcept;  // diagnostics
 
 | | |
 |--|--|
-| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); axis-16 slabs prepared; axis 32/64 lazy. |
+| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); all axis engines installed; first data blocks follow preallocate knobs (default: axis ≤16 and ElemSize ≤256). |
 | **`~Pool`** | Marks the control block dead, then destroys slabs. Safe with outstanding `PoolBlockToken`s (arena observers). |
 | **Thread safety** | Construct/destroy from one thread; do not use the pool concurrently with its destructor. |
 | **Copy / move** | Deleted. |
@@ -349,7 +349,7 @@ a pointer to that payload (past the hidden header).
 
 ```cpp
 std::byte* p = pool.allocate(100);        // align 8 → typically 8-byte header
-std::byte* q = pool.allocate(64, 64);     // axis-64 lazy size class
+std::byte* q = pool.allocate(64, 64);     // axis-64 size class
 ```
 
 ### `deallocate` / `try_deallocate`
@@ -448,8 +448,10 @@ PoolStats stats();
 |--|--|
 | **Returns** | Best-effort snapshot of counters and high-water marks (HWMs). Not a single transactional freeze under concurrency. |
 | **`live_*` vs `retained_*`** | Live = outstanding client allocations. Retained = bytes in size-class slab buffers still mapped (may stay high after free until `trim`). |
+| **`live_hwm`** | Best-effort peak live count: cheap relaxed max on each successful allocate, and refreshed in `stats()`. |
 | **`retained_hwm`** | Advanced when `stats()` or `trim()` observes a higher retained total (not on every allocate). |
-| **Thread safety** | Safe; counters use relaxed atomics. |
+| **`alloc_ok` / `free_ok` / `*_fail`** | Hot-path tallies; **off by default** (`SPALLOCATOR_POOL_COUNTERS=0`) so allocate/free avoid extra atomic RMWs. Enable with `-DSPALLOCATOR_POOL_COUNTERS=1` or `./configure --enable-pool-counters`. When disabled, these fields read as 0. `kPoolCountersEnabled` reports the build setting. |
+| **Thread safety** | Safe; enabled counters use relaxed atomics. |
 
 ```cpp
 auto s = pool.stats();
