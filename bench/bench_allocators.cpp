@@ -149,7 +149,7 @@ void print_pool_stats(std::string_view label, spallocator::Pool& pool)
 void print_slab16_stats(std::string_view label, spallocator::Slab<16, 16>& slab)
 {
     std::cout << "  [Slab<16,16>] " << label << "\n"
-              << "    slab_count=" << slab.getSlabCount()
+              << "    slab_count=" << slab.getBlockCount()
               << " retained_bytes=" << slab.getAllocatedMemory()
               << " availability_map_bytes=" << slab.getAvailabilityMapBytes()
               << "\n";

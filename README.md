@@ -26,7 +26,7 @@ README.md             # this overview + build/run
 - **Pool as allocation domain** — construct, share `Pool&` / `PoolHandle`, destroy to dispose; shard pools to isolate or reduce contention
 - **Slab size classes** — native 16-byte ladder (16B–1KB); lazy 32/64-byte ladders up to 2KB/4KB; large fallback via `SlabProxy`
 - **Thread-safe routing** — pool + per-slab locking
-- **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolBlockToken`)
+- **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolLifetimeToken`)
 - **Optional PMR bridge** — `PoolMemoryResource` in `pool_pmr.hpp` for `std::pmr` containers (prefer `PoolAllocator` when types can bake it in)
 - **Defined pool lifetime** — orderly RAII, arena bulk reclaim, or `PoolHandle::create()` auto-retire
 - **mlvlib dependency** — `SpinLock`, helpers, and optional `LifetimeObserver` via the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule
@@ -162,7 +162,7 @@ int main() {
 | Component | File | Description |
 |-----------|------|-------------|
 | **Pool** | `spallocator/pool.hpp` | Allocation domain: route by footprint/alignment, header protocol, `trim`, dispose as a unit |
-| **Pool lifetime** | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolBlockToken`, `PoolControlBlock` (also via `pool.hpp`) |
+| **Pool lifetime** | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolLifetimeToken`, `PoolControlBlock` (also via `pool.hpp`) |
 | **Slab** | `spallocator/slab.hpp` | Fixed-size slot recycler for one size class (bitmaps, growth, reclaim) |
 | **SlabProxy** | `spallocator/slab.hpp` | Large / overflow path via system `new[]` / `delete[]` |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a pool domain |

@@ -296,7 +296,7 @@ TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
     std::byte* next = slab.allocateItem(16);
     EXPECT_EQ(next, base + kCursor * 16); // continues forward, ignores hole
     items.push_back(next);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 
     for (auto* p : items)
     {
@@ -327,7 +327,7 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
     {
         items.push_back(slab.allocateItem(16));
     }
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     std::byte* const base = items.front();
 
     // Re-take kHigh so the cursor sits at kHigh + 1 (past the only soon-free hole).
@@ -340,7 +340,7 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
 
     std::byte* wrapped = slab.allocateItem(16);
     EXPECT_EQ(wrapped, base + kLow * 16);
-    EXPECT_EQ(slab.getSlabCount(), 1u); // wrap, do not grow
+    EXPECT_EQ(slab.getBlockCount(), 1u); // wrap, do not grow
     items[kLow] = wrapped;
 
     for (auto* p : items)
@@ -352,7 +352,7 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
 
 TEST(SlabTest, NextFitSurvivesReclaim)
 {
-    // Why: reclaimEmptySlabs swap-with-last invalidates buffer indices, so the
+    // Why: reclaimEmptyBlocks swap-with-last invalidates Block indices, so the
     // next-fit cursor must be reset. After growing to two buffers, freeing all,
     // and reclaiming one, alloc/free on the survivor must still work.
     Slab<16, 16> slab;
@@ -363,14 +363,14 @@ TEST(SlabTest, NextFitSurvivesReclaim)
     {
         items.push_back(slab.allocateItem(16));
     }
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
 
     for (auto* p : items)
     {
         slab.deallocateItem(p);
     }
-    EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.reclaimEmptyBlocks(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 
     auto* p = slab.allocateItem(16);
     ASSERT_NE(p, nullptr);
@@ -420,19 +420,19 @@ TEST(SlabTest, AllocFreeChurnMicrobench)
     RecordProperty("total_ms", static_cast<int>(ns / 1'000'000));
     RecordProperty("ns_per_alloc_free", static_cast<int>(ns_per_op));
     // Sanity: churn must complete and stay on the warmed single buffer.
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     EXPECT_GT(ns, 0);
 }
 
 
-TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
+TEST(SlabTest, ReclaimEmptyBlocksReturnsBuffers)
 {
     // Why: empty buffers are retained by default (monotonic growth); reclaim
     // must drop extras while keeping ≥ keep_min. Capacity is selectBlockSize
     // based so “fill one buffer + 1” still forces a second buffer after packing.
     Slab<16, 16> slab(/*preallocate_first_block=*/true);
     constexpr std::size_t kSlotsPerSlab = selectBlockSize<16>() / 16;
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     const std::size_t baseline = slab.getAllocatedMemory();
 
     std::vector<std::byte*> items;
@@ -441,7 +441,7 @@ TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
     {
         items.push_back(slab.allocateItem(16));
     }
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
     EXPECT_EQ(slab.getAllocatedMemory(), baseline * 2);
 
     for (auto* p : items)
@@ -449,11 +449,11 @@ TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
         slab.deallocateItem(p);
     }
     // Monotonic by default: empty slabs stay until reclaim.
-    EXPECT_EQ(slab.getSlabCount(), 2u);
-    EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
+    EXPECT_EQ(slab.reclaimEmptyBlocks(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     EXPECT_EQ(slab.getAllocatedMemory(), baseline);
-    EXPECT_EQ(slab.reclaimEmptySlabs(), 0u);
+    EXPECT_EQ(slab.reclaimEmptyBlocks(), 0u);
 
     // Live allocations block reclaim of their slab.
     auto* live = slab.allocateItem(16);
@@ -462,13 +462,13 @@ TEST(SlabTest, ReclaimEmptySlabsReturnsBuffers)
     {
         items.push_back(slab.allocateItem(16));
     }
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
     for (auto* p : items)
     {
         slab.deallocateItem(p);
     }
-    EXPECT_EQ(slab.reclaimEmptySlabs(), 1u);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.reclaimEmptyBlocks(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     slab.deallocateItem(live);
 }
 
@@ -824,7 +824,7 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
     constexpr std::size_t kLegacyFixedBytes = 128_KB;
 
     Slab<16, 16> slab(/*preallocate_first_block=*/true);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     EXPECT_GT(slab.getAvailabilityMapBytes(), 0u);
     EXPECT_LT(slab.getAvailabilityMapBytes(), kLegacyFixedBytes);
     EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
@@ -837,9 +837,9 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
         items.push_back(slab.allocateItem(16));
         ASSERT_NE(items.back(), nullptr);
     }
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     items.push_back(slab.allocateItem(16));
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
     EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
 
     for (auto* p : items)
@@ -849,7 +849,7 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
 }
 
 
-TEST(SlabTest, SelectBufferSizeExactPackAndFloors)
+TEST(SlabTest, SelectBlockSizeExactPackAndFloors)
 {
     // Why: buffer packing must leave zero unused tail bytes (old fixed 4 KiB
     // buffers wasted up to 6.25% on 384/768) and honor both knobs:
@@ -947,18 +947,18 @@ TEST(SlabTest, ZeroBlockEngineGrowsOnFirstAlloc)
     // Why: Pool leaves large / high-align engines empty until first use.
     // allocateItem must create the first data block without a prior warm map.
     Slab<512, 16> slab(/*preallocate_first_block=*/false);
-    EXPECT_EQ(slab.getSlabCount(), 0u);
+    EXPECT_EQ(slab.getBlockCount(), 0u);
     EXPECT_EQ(slab.getAllocatedMemory(), 0u);
 
     auto* p = slab.allocateItem(512);
     ASSERT_NE(p, nullptr);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
     EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<512>());
 
     slab.deallocateItem(p);
-    EXPECT_EQ(slab.getSlabCount(), 1u); // monotonic until reclaim
-    EXPECT_EQ(slab.reclaimEmptySlabs(/*keep_min=*/1), 0u);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u); // monotonic until reclaim
+    EXPECT_EQ(slab.reclaimEmptyBlocks(/*keep_min=*/1), 0u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 }
 
 
@@ -1005,7 +1005,7 @@ TEST(SlabTest, AllocateItems)
     constexpr std::size_t kBuf = selectBlockSize<128>();
     constexpr std::size_t kSlots = kBuf / 128;
     EXPECT_EQ(slab.getAllocatedMemory(), kBuf);
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 
     std::vector<std::byte*> items;
     items.reserve(2 * kSlots + 1);
@@ -1015,21 +1015,21 @@ TEST(SlabTest, AllocateItems)
         EXPECT_NE(p, nullptr);
         items.push_back(p);
     }
-    EXPECT_EQ(slab.getSlabCount(), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
 
     // One past capacity → second buffer.
     items.push_back(slab.allocateItem(120));
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
     EXPECT_EQ(slab.getAllocatedMemory(), 2 * kBuf);
 
     for (std::size_t i = 1; i < kSlots; ++i)
     {
         items.push_back(slab.allocateItem(120));
     }
-    EXPECT_EQ(slab.getSlabCount(), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
 
     items.push_back(slab.allocateItem(120));
-    EXPECT_EQ(slab.getSlabCount(), 3u);
+    EXPECT_EQ(slab.getBlockCount(), 3u);
     EXPECT_EQ(slab.getAllocatedMemory(), 3 * kBuf);
 
     for (auto* p : items)
@@ -1308,7 +1308,7 @@ TEST(PoolMemoryResourceTest, ArenaAllocateThrowsDeallocateNoops)
         PoolMemoryResource live(pool);
         dangling = live.allocate(32, 8);
         EXPECT_NE(dangling, nullptr);
-        return PoolMemoryResource(pool.block_token());
+        return PoolMemoryResource(pool.lifetime_token());
     }()};
 
     // Pool already destroyed; token observes !alive.

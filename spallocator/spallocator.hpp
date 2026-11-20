@@ -51,7 +51,7 @@ namespace spallocator
     // noexcept free for unique_ptr / allocator paths. Invalid pointers are
     // programming errors; abort rather than throw through a noexcept boundary.
     // No-op if the pool is already dead (arena bulk reclaim).
-    inline void pool_deallocate_noexcept(PoolBlockToken& token, std::byte* p) noexcept
+    inline void pool_deallocate_noexcept(PoolLifetimeToken& token, std::byte* p) noexcept
     {
         Pool* pool = token.get();
         if (!pool)
@@ -66,22 +66,22 @@ namespace spallocator
 
     inline void pool_deallocate_noexcept(Pool& pool, std::byte* p) noexcept
     {
-        PoolBlockToken token = pool.block_token();
+        PoolLifetimeToken token = pool.lifetime_token();
         pool_deallocate_noexcept(token, p);
     }
 
     // Custom deleter for unique_ptr that uses Pool::try_deallocate.
-    // Holds a PoolBlockToken so arena ~Pool can mark dead and this no-ops
+    // Holds a PoolLifetimeToken so arena ~Pool can mark dead and this no-ops
     // (skips ~T and free — documented bulk-reclaim model).
     template<typename T>
     struct PoolDeleter
     {
-        PoolBlockToken token;
+        PoolLifetimeToken token;
 
-        explicit PoolDeleter(PoolBlockToken t) noexcept : token(std::move(t)) {}
-        explicit PoolDeleter(Pool& pool) noexcept : token(pool.block_token()) {}
+        explicit PoolDeleter(PoolLifetimeToken t) noexcept : token(std::move(t)) {}
+        explicit PoolDeleter(Pool& pool) noexcept : token(pool.lifetime_token()) {}
         explicit PoolDeleter(PoolHandle const& handle) noexcept
-            : token(handle.block_token())
+            : token(handle.lifetime_token())
         {
         }
 
@@ -109,19 +109,19 @@ namespace spallocator
     template<typename T>
     struct PoolDeleter<T[]>
     {
-        PoolBlockToken token;
+        PoolLifetimeToken token;
         const std::size_t size;
 
-        PoolDeleter(PoolBlockToken t, std::size_t n) noexcept
+        PoolDeleter(PoolLifetimeToken t, std::size_t n) noexcept
             : token(std::move(t)), size(n)
         {
         }
         PoolDeleter(Pool& pool, std::size_t n) noexcept
-            : token(pool.block_token()), size(n)
+            : token(pool.lifetime_token()), size(n)
         {
         }
         PoolDeleter(PoolHandle const& handle, std::size_t n) noexcept
-            : token(handle.block_token()), size(n)
+            : token(handle.lifetime_token()), size(n)
         {
         }
 
@@ -152,7 +152,7 @@ namespace spallocator
 
     namespace detail
     {
-        inline Pool* require_live_pool(PoolBlockToken const& token)
+        inline Pool* require_live_pool(PoolLifetimeToken const& token)
         {
             Pool* pool = token.get();
             if (!pool)
@@ -167,9 +167,9 @@ namespace spallocator
     // Single object: placement new; on ctor throw, return the slot (strong guarantee).
     template<typename T, typename... Args>
         requires (!std::is_array_v<T>)
-    // Not constexpr: PoolBlockToken is not a literal type (non-trivial dtor),
+    // Not constexpr: PoolLifetimeToken is not a literal type (non-trivial dtor),
     // and these helpers perform runtime pool allocation / placement-new.
-    unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, Args&&... args)
+    unique_pool_ptr<T> make_pool_unique(PoolLifetimeToken token, Args&&... args)
     {
         static_assert(alignof(T) <= kMaxAlignment,
             "make_pool_unique: alignof(T) exceeds Pool max alignment (64)");
@@ -192,21 +192,21 @@ namespace spallocator
         requires (!std::is_array_v<T>)
     unique_pool_ptr<T> make_pool_unique(Pool& pool, Args&&... args)
     {
-        return make_pool_unique<T>(pool.block_token(), std::forward<Args>(args)...);
+        return make_pool_unique<T>(pool.lifetime_token(), std::forward<Args>(args)...);
     }
 
     template<typename T, typename... Args>
         requires (!std::is_array_v<T>)
     unique_pool_ptr<T> make_pool_unique(PoolHandle const& handle, Args&&... args)
     {
-        return make_pool_unique<T>(handle.block_token(), std::forward<Args>(args)...);
+        return make_pool_unique<T>(handle.lifetime_token(), std::forward<Args>(args)...);
     }
 
     // Unbounded array: Pool::allocate returns the user pointer (header already
     // written). Strong exception guarantee if an element ctor throws.
     template<typename T>
         requires std::is_unbounded_array_v<T>
-    unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, std::size_t size)
+    unique_pool_ptr<T> make_pool_unique(PoolLifetimeToken token, std::size_t size)
     {
         using ElementType = std::remove_extent_t<T>;
         static_assert(alignof(ElementType) <= kMaxAlignment,
@@ -245,14 +245,14 @@ namespace spallocator
         requires std::is_unbounded_array_v<T>
     unique_pool_ptr<T> make_pool_unique(Pool& pool, std::size_t size)
     {
-        return make_pool_unique<T>(pool.block_token(), size);
+        return make_pool_unique<T>(pool.lifetime_token(), size);
     }
 
     template<typename T>
         requires std::is_unbounded_array_v<T>
     unique_pool_ptr<T> make_pool_unique(PoolHandle const& handle, std::size_t size)
     {
-        return make_pool_unique<T>(handle.block_token(), size);
+        return make_pool_unique<T>(handle.lifetime_token(), size);
     }
 
     // Known bound array version (deleted - use std::array instead)
@@ -271,7 +271,7 @@ namespace spallocator
 
     // C++17-compliant allocator for STL containers (and optional allocate_shared).
     // Design decisions (see also IMPLEMENTATION.md — Smart pointers):
-    // 1. Holds PoolBlockToken (block_refs) — survives arena ~Pool; not handle_refs
+    // 1. Holds PoolLifetimeToken (block_refs) — survives arena ~Pool; not handle_refs
     // 2. Stateful — unequal when control blocks differ
     // 3. Alignment-aware via Pool::allocate(bytes, alignof(T))
     // 4. POCCA/POCMA/POCS false — token is not transferred by container assign
@@ -294,16 +294,16 @@ namespace spallocator
         static_assert(alignof(T) <= kMaxAlignment,
             "PoolAllocator: alignof(T) exceeds Pool max alignment (64)");
 
-        explicit PoolAllocator(PoolBlockToken token) noexcept
+        explicit PoolAllocator(PoolLifetimeToken token) noexcept
             : token_(std::move(token))
         {
         }
         explicit PoolAllocator(Pool& pool) noexcept
-            : token_(pool.block_token())
+            : token_(pool.lifetime_token())
         {
         }
         explicit PoolAllocator(PoolHandle const& handle) noexcept
-            : token_(handle.block_token())
+            : token_(handle.lifetime_token())
         {
         }
 
@@ -359,10 +359,10 @@ namespace spallocator
         template<typename U>
         friend class PoolAllocator;
 
-        PoolBlockToken const& token() const noexcept { return token_; }
+        PoolLifetimeToken const& token() const noexcept { return token_; }
 
     private:
-        PoolBlockToken token_;
+        PoolLifetimeToken token_;
     };
 
     // =========================================================================
@@ -371,11 +371,11 @@ namespace spallocator
 
     // Object storage from the pool; shared_ptr control block from the ordinary
     // heap (std::allocator). Same arena model as unique_pool_ptr: PoolDeleter
-    // holds a PoolBlockToken outside the slab and no-ops when !alive.
+    // holds a PoolLifetimeToken outside the slab and no-ops when !alive.
     // Tradeoff vs allocate_shared: two allocations (pool object + heap CB).
     template<typename T, typename... Args>
         requires (!std::is_array_v<T>)
-    std::shared_ptr<T> make_pool_shared(PoolBlockToken token, Args&&... args)
+    std::shared_ptr<T> make_pool_shared(PoolLifetimeToken token, Args&&... args)
     {
         static_assert(alignof(T) <= kMaxAlignment,
             "make_pool_shared: alignof(T) exceeds Pool max alignment (64)");
@@ -397,20 +397,20 @@ namespace spallocator
         requires (!std::is_array_v<T>)
     std::shared_ptr<T> make_pool_shared(Pool& pool, Args&&... args)
     {
-        return make_pool_shared<T>(pool.block_token(), std::forward<Args>(args)...);
+        return make_pool_shared<T>(pool.lifetime_token(), std::forward<Args>(args)...);
     }
 
     template<typename T, typename... Args>
         requires (!std::is_array_v<T>)
     std::shared_ptr<T> make_pool_shared(PoolHandle const& handle, Args&&... args)
     {
-        return make_pool_shared<T>(handle.block_token(), std::forward<Args>(args)...);
+        return make_pool_shared<T>(handle.lifetime_token(), std::forward<Args>(args)...);
     }
 
     // Unbounded array: element count lives in PoolDeleter (same as unique).
     template<typename T>
         requires std::is_unbounded_array_v<T>
-    std::shared_ptr<T> make_pool_shared(PoolBlockToken token, std::size_t size)
+    std::shared_ptr<T> make_pool_shared(PoolLifetimeToken token, std::size_t size)
     {
         using ElementType = std::remove_extent_t<T>;
         static_assert(alignof(ElementType) <= kMaxAlignment,
@@ -449,20 +449,20 @@ namespace spallocator
         requires std::is_unbounded_array_v<T>
     std::shared_ptr<T> make_pool_shared(Pool& pool, std::size_t size)
     {
-        return make_pool_shared<T>(pool.block_token(), size);
+        return make_pool_shared<T>(pool.lifetime_token(), size);
     }
 
     template<typename T>
         requires std::is_unbounded_array_v<T>
     std::shared_ptr<T> make_pool_shared(PoolHandle const& handle, std::size_t size)
     {
-        return make_pool_shared<T>(handle.block_token(), size);
+        return make_pool_shared<T>(handle.lifetime_token(), size);
     }
 
     // Unbounded array with fill value.
     template<typename T>
         requires std::is_unbounded_array_v<T>
-    std::shared_ptr<T> make_pool_shared(PoolBlockToken token, std::size_t size,
+    std::shared_ptr<T> make_pool_shared(PoolLifetimeToken token, std::size_t size,
                                         const std::remove_extent_t<T>& init_value)
     {
         using ElementType = std::remove_extent_t<T>;
@@ -503,7 +503,7 @@ namespace spallocator
     std::shared_ptr<T> make_pool_shared(Pool& pool, std::size_t size,
                                         const std::remove_extent_t<T>& init_value)
     {
-        return make_pool_shared<T>(pool.block_token(), size, init_value);
+        return make_pool_shared<T>(pool.lifetime_token(), size, init_value);
     }
 
     template<typename T>
@@ -511,7 +511,7 @@ namespace spallocator
     std::shared_ptr<T> make_pool_shared(PoolHandle const& handle, std::size_t size,
                                         const std::remove_extent_t<T>& init_value)
     {
-        return make_pool_shared<T>(handle.block_token(), size, init_value);
+        return make_pool_shared<T>(handle.lifetime_token(), size, init_value);
     }
 
     template<typename T, typename... Args>

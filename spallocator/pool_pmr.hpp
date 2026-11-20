@@ -51,16 +51,16 @@ namespace spallocator
     // bake the allocator in (no virtual dispatch). Use this for polymorphic
     // pmr containers / composition.
     //
-    // Holds a PoolBlockToken (block_refs) — same arena model as PoolAllocator:
+    // Holds a PoolLifetimeToken (block_refs) — same arena model as PoolAllocator:
     // allocate throws bad_alloc if !alive; deallocate no-ops if dead.
     class PoolMemoryResource : public std::pmr::memory_resource
     {
     public: // methods
-        explicit PoolMemoryResource(PoolBlockToken token) noexcept;
+        explicit PoolMemoryResource(PoolLifetimeToken token) noexcept;
         explicit PoolMemoryResource(Pool& pool) noexcept;
         explicit PoolMemoryResource(PoolHandle const& handle) noexcept;
 
-        PoolBlockToken const& token() const noexcept { return token_; }
+        PoolLifetimeToken const& token() const noexcept { return token_; }
 
     protected: // methods
         void* do_allocate(std::size_t bytes, std::size_t alignment) override;
@@ -69,13 +69,13 @@ namespace spallocator
         bool do_is_equal(std::pmr::memory_resource const& other) const noexcept override;
 
     private: // data members
-        PoolBlockToken token_;
+        PoolLifetimeToken token_;
     };
 
 } // namespace spallocator
 
 
-// Pool::allocate / block_token / alignment constants (Pool was forward-declared).
+// Pool::allocate / lifetime_token / alignment constants (Pool was forward-declared).
 #include "pool.hpp"
 
 
@@ -85,20 +85,20 @@ namespace spallocator
     // PoolMemoryResource
     // ---------------------------------------------------------------------------
 
-    inline PoolMemoryResource::PoolMemoryResource(PoolBlockToken token) noexcept
+    inline PoolMemoryResource::PoolMemoryResource(PoolLifetimeToken token) noexcept
         : token_(std::move(token))
     {
     }
 
 
     inline PoolMemoryResource::PoolMemoryResource(Pool& pool) noexcept
-        : token_(pool.block_token())
+        : token_(pool.lifetime_token())
     {
     }
 
 
     inline PoolMemoryResource::PoolMemoryResource(PoolHandle const& handle) noexcept
-        : token_(handle.block_token())
+        : token_(handle.lifetime_token())
     {
     }
 

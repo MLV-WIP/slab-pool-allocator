@@ -101,8 +101,7 @@ namespace spallocator
 
         // Release fully empty Blocks back to the OS. Default: no-op
         // (SlabProxy). Returns the number of Blocks deleted.
-        // Name is Phase 3 rename backlog (reclaimEmptyBlocks).
-        virtual std::size_t reclaimEmptySlabs(std::size_t keep_min = 1);
+        virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
         virtual std::size_t getAllocatedMemory() const { return 0; }
 
         virtual ~AbstractSlab() = default;
@@ -166,13 +165,14 @@ namespace spallocator
         constexpr std::size_t getAllocSize() const { return block_bytes; }
         std::size_t getAllocatedMemory() const override { return block_bases.size() * block_bytes; }
         std::size_t getAvailabilityMapBytes() const { return block_available_map.bytes(); }
-        std::size_t getSlabCount() const { return block_bases.size(); }
+        std::size_t getBlockCount() const { return block_bases.size(); }
 
         // Delete fully empty data blocks; always retain at least keep_min
         // blocks (clamped to ≥ 1). Not called from the alloc/free hot path.
-        std::size_t reclaimEmptySlabs(std::size_t keep_min = 1) override;
+        std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1) override;
 
-        std::optional<std::size_t> findSlabForItem(std::byte* item) const;
+        // `slot_base` must be an exact Slot start (not a Pool user pointer).
+        std::optional<std::size_t> findBlockForSlot(std::byte* slot_base) const;
 
         // preallocate_first_block: map one data block at construction (warm
         // start). false leaves the engine empty until the first allocateItem
@@ -282,7 +282,7 @@ namespace spallocator
     // AbstractSlab
     // ---------------------------------------------------------------------------
 
-    inline std::size_t AbstractSlab::reclaimEmptySlabs(std::size_t /*keep_min*/)
+    inline std::size_t AbstractSlab::reclaimEmptyBlocks(std::size_t /*keep_min*/)
     {
         return 0;
     }
@@ -644,26 +644,26 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    std::optional<std::size_t> Slab<ElemSize, Alignment>::findSlabForItem(std::byte* item) const
+    std::optional<std::size_t> Slab<ElemSize, Alignment>::findBlockForSlot(std::byte* slot_base) const
     {
         // Single-Block fast path: skip the address map (common steady state).
         if (block_bases.size() == 1)
         {
             std::byte* const block_start = block_bases[0];
             std::byte* const block_end = block_start + block_bytes;
-            if (item >= block_start && item < block_end)
+            if (slot_base >= block_start && slot_base < block_end)
             {
                 return 0;
             }
             debug_println(
-                "Item {} is not within sole block range {} - {}; treating as unknown pointer",
-                static_cast<void*>(item),
+                "Slot base {} is not within sole block range {} - {}; treating as unknown pointer",
+                static_cast<void*>(slot_base),
                 static_cast<void*>(block_start),
                 static_cast<void*>(block_end));
             return std::nullopt;
         }
 
-        auto it = base_address_map.upper_bound(item);
+        auto it = base_address_map.upper_bound(slot_base);
         if (it != base_address_map.begin())
         {
             --it;
@@ -672,14 +672,14 @@ namespace spallocator
             // Predecessor start is only a candidate. Invalid pointers (or
             // addresses in gaps between Blocks) can upper_bound into this path
             // without falling inside [block_start, block_end).
-            if (item >= block_start && item < block_end)
+            if (slot_base >= block_start && slot_base < block_end)
             {
                 return it->second;
             }
 
             debug_println(
-                "Item {} is not within candidate block range {} - {}; treating as unknown pointer",
-                static_cast<void*>(item),
+                "Slot base {} is not within candidate block range {} - {}; treating as unknown pointer",
+                static_cast<void*>(slot_base),
                 static_cast<void*>(block_start),
                 static_cast<void*>(block_end));
         }
@@ -698,7 +698,7 @@ namespace spallocator
         std::scoped_lock<SpinLock> guard(slab_lock);
 
         // Find which Block this item belongs to
-        if (auto block_index_opt = findSlabForItem(item); !block_index_opt.has_value())
+        if (auto block_index_opt = findBlockForSlot(item); !block_index_opt.has_value())
         {
             throw std::invalid_argument("Invalid item pointer; no corresponding block found");
         }
@@ -781,7 +781,7 @@ namespace spallocator
     }
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    std::size_t Slab<ElemSize, Alignment>::reclaimEmptySlabs(std::size_t keep_min)
+    std::size_t Slab<ElemSize, Alignment>::reclaimEmptyBlocks(std::size_t keep_min)
     {
         // Retain at least one Block so the class stays warm for the next alloc.
         if (keep_min < 1)
@@ -812,7 +812,7 @@ namespace spallocator
         }
 
         debug_println(
-            "reclaimEmptySlabs<{},{}>: removed {}, remaining blocks={}",
+            "reclaimEmptyBlocks<{},{}>: removed {}, remaining blocks={}",
             ElemSize, Alignment, reclaimed, block_bases.size());
         return reclaimed;
     }

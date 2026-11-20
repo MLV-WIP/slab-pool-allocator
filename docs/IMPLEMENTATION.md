@@ -76,7 +76,7 @@ you need the “why pools / why slabs” story without code structure.
               │
               └── per-slab SpinLock, bitsets, base_address_map
 
-  Smart pointers / PoolAllocator / PoolMemoryResource ──► clients via PoolBlockToken / PoolHandle
+  Smart pointers / PoolAllocator / PoolMemoryResource ──► clients via PoolLifetimeToken / PoolHandle
   LifetimeObserver                 (stand-alone; not part of Pool)
 ```
 
@@ -85,7 +85,7 @@ you need the “why pools / why slabs” story without code structure.
 | **`Pool`** | Allocation *domain*: construct/destroy as a unit, isolate shards, route by footprint + alignment, write/validate the allocation header, `trim` / accounting, pool-level locks |
 | **`Slab`** | Size-class *engine*: freemap, address map, growth/reclaim of empty **Blocks**, per-slab lock |
 | **`SlabProxy`** | Same backend interface; system `new[]` / `delete[]` for oversized requests (no Block/Slot freemap) |
-| **Smart pointers** | Clients via `PoolBlockToken` / `PoolHandle` (typed RAII; `PoolBlockToken` → `PoolLifetimeToken` in Phase 3) |
+| **Smart pointers** | Clients via `PoolLifetimeToken` / `PoolHandle` (typed RAII) |
 | **`LifetimeObserver`** | Independent of pool/slab |
 
 Destroying a `Pool` destroys its slab backends. Speeding up 64-byte churn is
@@ -362,10 +362,10 @@ Slots); each **Slot** is one `ElemSize` unit. Full glossary:
 `block_bases` / `block_freemaps` / `block_available_map` / `block_bytes` /
 `max_blocks` / `slots_per_block` / `alloc_cursor_block_` / `selectBlockSize`.
 
-**Phase 3 (public) still transitional:** `getSlabCount`, `reclaimEmptySlabs`,
-`findSlabForItem`. Configure knobs `kSlabTargetBytes` /
-`SPALLOCATOR_SLAB_TARGET_*` still size Blocks (names kept). Prefer **Block** in
-prose.
+**Phase 3 (public) hard-renamed:** `getBlockCount`, `reclaimEmptyBlocks`,
+`findBlockForSlot`, `PoolLifetimeToken` (keep `PoolControlBlock`). Configure
+knobs `kSlabTargetBytes` / `SPALLOCATOR_SLAB_TARGET_*` still size Blocks
+(names kept). Prefer **Block** in prose.
 
 **Routing:** `resolveSlab(alloc_size, axis)` runs `selectClassIndex`. A normal
 index picks a size-class Slab; `kSlabIndexNpos` means footprint exceeds that
@@ -466,7 +466,7 @@ when idle).
 6. If a full wrap of live Blocks finds nothing: grow (`allocateNewBlock`), point
    the cursor at the new Block, retry  
 
-`reclaimEmptySlabs` / `destroyBlockAt` **reset** the cursor to `(0,0)` because
+`reclaimEmptyBlocks` / `destroyBlockAt` **reset** the cursor to `(0,0)` because
 swap-with-last can invalidate Block indices.
 
 ### Free path (conceptual)
@@ -529,7 +529,7 @@ empty **Blocks**.
 | Mechanism | Layer | Behavior |
 |-----------|-------|----------|
 | Ordinary free | Slab | Slot free; empty Block stays mapped |
-| `Slab::reclaimEmptySlabs(keep_min)` | Slab | Deletes fully empty **Blocks** (swap-with-last); retains ≥ `keep_min` (name transitional until `reclaimEmptyBlocks`) |
+| `Slab::reclaimEmptyBlocks(keep_min)` | Slab | Deletes fully empty **Blocks** (swap-with-last); retains ≥ `keep_min` |
 | `Pool::trim(keep_min)` | Pool | Walks size-class Slabs and asks each to reclaim; domain policy knob |
 | `SlabProxy` free | Proxy | Memory returned immediately every time |
 
@@ -558,15 +558,15 @@ full heap profiler.
 ## Smart pointers (design)
 
 Factories and deleters are **clients of the pool domain** via
-`PoolBlockToken` (and convenience overloads on `Pool&` / `PoolHandle`). They do
+`PoolLifetimeToken` (and convenience overloads on `Pool&` / `PoolHandle`). They do
 not change slab internals; they enforce RAII and exception safety on top.
 
 ### Roles
 
 | Piece | Design point |
 |-------|----------------|
-| `PoolBlockToken` | `block_refs` pin on `PoolControlBlock`; observes `alive`; not a handle pin |
-| `PoolDeleter` | Placement-new counterpart: **finalize** (`~T()`) then **reclaim** (`try_deallocate`); arrays destroy **reverse** order; if `!alive`, **no-op** both steps (arena); abort on bad free while alive. Stateful (`PoolBlockToken`) by necessity - see below |
+| `PoolLifetimeToken` | `block_refs` pin on `PoolControlBlock`; observes `alive`; not a handle pin |
+| `PoolDeleter` | Placement-new counterpart: **finalize** (`~T()`) then **reclaim** (`try_deallocate`); arrays destroy **reverse** order; if `!alive`, **no-op** both steps (arena); abort on bad free while alive. Stateful (`PoolLifetimeToken`) by necessity - see below |
 | `make_pool_unique` | Placement `new`; on ctor throw, return slot (**strong guarantee**); overloads for `Pool&` / `PoolHandle` / token |
 | `make_pool_shared` | Placement `new` + `shared_ptr(p, PoolDeleter)`; object in pool, CB on heap |
 | `PoolAllocator` | Stateful token; no POCCA/POCMA/POCS; equal iff **same control block**; allocate throws `bad_alloc` if `!alive`; deallocate no-ops if dead |
@@ -574,7 +574,7 @@ not change slab internals; they enforce RAII and exception safety on top.
 
 ### `PoolAllocator` design decisions
 
-1. Holds a **`PoolBlockToken`**, not a raw `Pool&` — survives arena `~Pool` so
+1. Holds a **`PoolLifetimeToken`**, not a raw `Pool&` — survives arena `~Pool` so
    deallocate can no-op instead of UAF.  
 2. Stateful — different control blocks compare unequal.  
 3. Uses the pool’s alignment-aware `allocate` for proper object placement
@@ -621,7 +621,7 @@ Unbounded array overloads store the element count in `PoolDeleter` (same as
 
 ### Lifetime coupling
 
-`PoolDeleter` / `PoolAllocator` hold a **`PoolBlockToken`** (`block_refs` only —
+`PoolDeleter` / `PoolAllocator` hold a **`PoolLifetimeToken`** (`block_refs` only —
 not `handle_refs`). That keeps the control block alive so `alive` remains
 readable after `~Pool`, without pinning an empty heap pool the way
 `PoolHandle` does.
@@ -642,18 +642,18 @@ reclamation) and when-to-use guidance:
 **Destroying delete (non-goal for the generic pool).** A typed destroying
 `operator delete` can combine `~T()` and reclaim with full type context (useful
 for type-local arenas). The shipped path stays `PoolDeleter` +
-`PoolBlockToken`: generic over `T`, arena-safe, and independent of per-type
+`PoolLifetimeToken`: generic over `T`, arena-safe, and independent of per-type
 `operator new`/`delete`. Do not replace `make_pool_unique` /
 `make_pool_shared` with destroying delete as the library default; document any
 future typed facade separately.
 
 **Why a stateful deleter?** Empty / EBO-friendly `unique_ptr` deleters keep
-`sizeof(unique_ptr)` at a raw pointer. `PoolDeleter` stores a `PoolBlockToken`
+`sizeof(unique_ptr)` at a raw pointer. `PoolDeleter` stores a `PoolLifetimeToken`
 so arena `~Pool` remains observable after storage is gone. That enlarges
 `unique_pool_ptr` relative to a stateless deleter; the cost buys defined
 arena behavior instead of UAF.
 
-Factories accept `Pool&`, `PoolHandle`, or `PoolBlockToken`. Prefer
+Factories accept `Pool&`, `PoolHandle`, or `PoolLifetimeToken`. Prefer
 `PoolHandle::create()` for heap domains that should auto-retire when idle —
 see [Pool lifetime](#pool-lifetime-controlblock--poolhandle).
 

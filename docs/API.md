@@ -24,7 +24,7 @@ convenience and defines allocator-only size caps.
   - [Constants](#constants)
   - [Construction](#construction)
   - [`PoolHandle`](#poolhandle)
-  - [`PoolBlockToken`](#poolblocktoken)
+  - [`PoolLifetimeToken`](#poollifetimetoken)
   - [`allocate`](#allocate)
   - [`deallocate` / `try_deallocate`](#deallocate--try_deallocate)
   - [`trim`](#trim)
@@ -53,7 +53,7 @@ convenience and defines allocator-only size caps.
 | Header | Primary contents |
 |--------|------------------|
 | `spallocator/pool.hpp` | `Pool`, ladders (includes `pool_lifetime.hpp`) |
-| `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolBlockToken`, `PoolControlBlock` |
+| `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolLifetimeToken`, `PoolControlBlock` |
 | `spallocator/slab.hpp` | `AbstractSlab`, `Slab`, `SlabProxy`, `DynBitset` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
 | `spallocator/pool_pmr.hpp` | `PoolMemoryResource` (`std::pmr::memory_resource`; additive — not pulled by `spallocator.hpp`) |
@@ -68,7 +68,7 @@ convenience and defines allocator-only size caps.
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                    ▼
      Slab<…> (fixed-size slots)          SlabProxy (large new[])
-  Smart pointers / PoolAllocator / PoolMemoryResource ──► PoolBlockToken / PoolHandle
+  Smart pointers / PoolAllocator / PoolMemoryResource ──► PoolLifetimeToken / PoolHandle
   mlvlib::SpinLock / helpers       (submodule; SpinLock used by Pool/Slab)
 ```
 
@@ -158,7 +158,7 @@ Helpers you may see in headers (usually not called directly from apps):
 Pool();
 ~Pool();
 PoolHandle handle();
-PoolBlockToken block_token();
+PoolLifetimeToken lifetime_token();
 std::uint64_t live_allocation_count() const noexcept;
 PoolStats stats();
 PoolControlBlock* control() const noexcept;  // diagnostics
@@ -167,7 +167,7 @@ PoolControlBlock* control() const noexcept;  // diagnostics
 | | |
 |--|--|
 | **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); all axis Slabs installed; first **Blocks** follow preallocate knobs (default: axis ≤16 and ElemSize ≤256). |
-| **`~Pool`** | Marks the control block dead, then destroys slabs. Safe with outstanding `PoolBlockToken`s (arena observers). |
+| **`~Pool`** | Marks the control block dead, then destroys slabs. Safe with outstanding `PoolLifetimeToken`s (arena observers). |
 | **Thread safety** | Construct/destroy from one thread; do not use the pool concurrently with its destructor. |
 | **Copy / move** | Deleted. |
 
@@ -190,7 +190,7 @@ public:
     Pool* get() const noexcept;
     explicit operator bool() const noexcept;
     PoolControlBlock* control() const noexcept;
-    PoolBlockToken block_token() const noexcept;
+    PoolLifetimeToken lifetime_token() const noexcept;
 };
 ```
 
@@ -207,12 +207,12 @@ h.get()->deallocate(p);
 // drop last handle with no live allocs → heap Pool retired
 ```
 
-### `PoolBlockToken`
+### `PoolLifetimeToken`
 
 **Header:** `spallocator/pool_lifetime.hpp` (also via `pool.hpp`)
 
 ```cpp
-class PoolBlockToken {
+class PoolLifetimeToken {
 public:
     Pool* get() const noexcept;
     bool alive() const noexcept;
@@ -222,7 +222,7 @@ public:
 ```
 
 Deleter/allocator pin: bumps **`block_refs` only** (not `handle_refs`). Obtained
-via `pool.block_token()` or `handle.block_token()`. Keeps the control block
+via `pool.lifetime_token()` or `handle.lifetime_token()`. Keeps the control block
 readable after arena `~Pool` so free paths can no-op when `!alive`.
 
 ### Lifetime models
@@ -284,7 +284,7 @@ void scratch_phase() {
         auto b = spallocator::make_pool_unique<ScratchNode>(arena);
         // … build a large graph in `arena` …
 
-        leak_into_outer = std::move(a);  // still holds a PoolBlockToken
+        leak_into_outer = std::move(a);  // still holds a PoolLifetimeToken
         // b destroyed here while arena is alive → normal ~ScratchNode + free
     }   // ~arena: mark dead, free all slabs (including storage for *leak_into_outer)
 
@@ -401,8 +401,7 @@ std::size_t trim(std::size_t keep_min = 1);
 
 Reclaims **fully empty** size-class **Blocks** so peak RSS can drop after a
 burst. Default growth is monotonic: ordinary free reuses Slots but keeps empty
-Blocks mapped. (Under the hood each Slab’s transitional `reclaimEmptySlabs`
-counts/deletes Blocks.)
+Blocks mapped. (Under the hood each Slab’s `reclaimEmptyBlocks` counts/deletes Blocks.)
 
 | Parameter | Description |
 |-----------|-------------|
@@ -515,7 +514,7 @@ class AbstractSlab {
 public:
     virtual std::byte* allocateItem(std::size_t size) = 0;
     virtual void deallocateItem(std::byte* item) = 0;
-    virtual std::size_t reclaimEmptySlabs(std::size_t keep_min = 1);
+    virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
     virtual std::size_t getAllocatedMemory() const;
     virtual ~AbstractSlab() = default;
 };
@@ -525,7 +524,7 @@ public:
 |--------|-------------|
 | `allocateItem(size)` | Allocate at least `size` bytes from this backend. For `Slab`, `size` must fit the template Slot size. Returns a **slot base** (exact cell start inside a Block) — *not* the user pointer; the Pool writes its header at the base and returns `base + header_size` to the caller. |
 | `deallocateItem(item)` | Free a **slot base** previously returned by `allocateItem` (not a user pointer). Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
-| `reclaimEmptySlabs(keep_min)` | Drop fully empty **Blocks**; keep at least `keep_min` (default 1). Name is transitional until `reclaimEmptyBlocks`. Default base implementation is a no-op; `Slab` overrides. Returns how many Blocks were deleted. |
+| `reclaimEmptyBlocks(keep_min)` | Drop fully empty **Blocks**; keep at least `keep_min` (default 1). Default base implementation is a no-op; `Slab` overrides. Returns how many Blocks were deleted. |
 | `getAllocatedMemory()` | Bytes retained by this Slab’s **Blocks** (default `0`). |
 
 Copy/move of `AbstractSlab` are deleted.
@@ -546,11 +545,11 @@ base-address map for frees. Owns zero or more **Blocks**.
 |--------|-------------|
 | `allocateItem` / `deallocateItem` | See `AbstractSlab`; guarded by the Slab’s `SpinLock`. Slot base in / out — Pool owns the user-pointer offset. |
 | `getElemSize()` / `getAlignment()` / `getAllocSize()` | Compile-time Slot size, alignment, and **Block** bytes (`selectBlockSize`; exact multiple of `ElemSize`; see `kSlabTargetBytes` / `kSlabTargetMultiplier`). |
-| `getAllocatedMemory()` | `getSlabCount() × getAllocSize()` currently retained (**Blocks** × Block bytes). |
+| `getAllocatedMemory()` | `getBlockCount() × getAllocSize()` currently retained (**Blocks** × Block bytes). |
 | `getAvailabilityMapBytes()` | Bytes used by the growable availability bitset (diagnostics). |
-| `getSlabCount()` | Number of **Blocks** currently held (Phase 3 rename → `getBlockCount`). |
-| `reclaimEmptySlabs(keep_min)` | Deletes empty **Blocks** (swap-with-last), retaining ≥ `keep_min` (Phase 3 → `reclaimEmptyBlocks`). |
-| `findSlabForItem(item)` | Optional index of the **Block** owning `item`, if it is an exact **slot base** in this Slab (Phase 3 → `findBlockForSlot` / similar). |
+| `getBlockCount()` | Number of **Blocks** currently held. |
+| `reclaimEmptyBlocks(keep_min)` | Deletes empty **Blocks** (swap-with-last), retaining ≥ `keep_min`. |
+| `findBlockForSlot(slot_base)` | Optional index of the **Block** owning an exact **slot base** in this Slab. |
 
 Empty Blocks remain mapped after free until reclaim/`Pool::trim` — intentional
 monotonic growth for alloc/free latency.
@@ -588,13 +587,13 @@ using unique_pool_ptr = std::unique_ptr<T, PoolDeleter<T>>;
 
 template<typename T>
 struct PoolDeleter {
-    PoolBlockToken token;
+    PoolLifetimeToken token;
     void operator()(T* p) const noexcept;   // if alive: ~T() then try_deallocate
 };
 
 template<typename T>
 struct PoolDeleter<T[]> {
-    PoolBlockToken token;
+    PoolLifetimeToken token;
     const std::size_t size;                 // element count
     void operator()(T* p) const noexcept;   // reverse-order dtors, then free
 };
@@ -602,7 +601,7 @@ struct PoolDeleter<T[]> {
 
 | Piece | Description |
 |-------|-------------|
-| `token` | `PoolBlockToken` for the domain (from `Pool&` / `PoolHandle` / token ctors). |
+| `token` | `PoolLifetimeToken` for the domain (from `Pool&` / `PoolHandle` / token ctors). |
 | `size` (array) | Number of elements to destroy; stored in the deleter when the array was created. |
 | `operator()` | If `p` is null or `!token.alive()`: no-op (arena). Else: destructor(s), then `try_deallocate`. On free failure while alive, **`std::abort()`**. |
 
@@ -614,12 +613,12 @@ destroyed).
 ```cpp
 template<typename T, typename... Args>
     requires (!std::is_array_v<T>)
-unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, Args&&... args);
+unique_pool_ptr<T> make_pool_unique(PoolLifetimeToken token, Args&&... args);
 // also: Pool&, PoolHandle const&
 
 template<typename T>  // T = U[]
     requires std::is_unbounded_array_v<T>
-unique_pool_ptr<T> make_pool_unique(PoolBlockToken token, std::size_t size);
+unique_pool_ptr<T> make_pool_unique(PoolLifetimeToken token, std::size_t size);
 // also: Pool&, PoolHandle const&
 
 // Bounded array forms are deleted — use std::array or U[].
@@ -662,17 +661,17 @@ auto u2 = spallocator::make_pool_unique<Widget>(h, arg1);
 ```cpp
 template<typename T, typename... Args>
     requires (!std::is_array_v<T>)
-std::shared_ptr<T> make_pool_shared(PoolBlockToken token, Args&&... args);
+std::shared_ptr<T> make_pool_shared(PoolLifetimeToken token, Args&&... args);
 // also: Pool&, PoolHandle const&
 
 template<typename T>
     requires std::is_unbounded_array_v<T>
-std::shared_ptr<T> make_pool_shared(PoolBlockToken token, std::size_t size);
+std::shared_ptr<T> make_pool_shared(PoolLifetimeToken token, std::size_t size);
 // also: Pool&, PoolHandle const&
 
 template<typename T>
     requires std::is_unbounded_array_v<T>
-std::shared_ptr<T> make_pool_shared(PoolBlockToken token, std::size_t size,
+std::shared_ptr<T> make_pool_shared(PoolLifetimeToken token, std::size_t size,
                                     const std::remove_extent_t<T>& init_value);
 // also: Pool&, PoolHandle const&
 ```
@@ -717,7 +716,7 @@ public:
     using value_type = T;
     // POCCA / POCMA / POCS = false_type; is_always_equal = false_type
 
-    explicit PoolAllocator(PoolBlockToken token) noexcept;
+    explicit PoolAllocator(PoolLifetimeToken token) noexcept;
     explicit PoolAllocator(Pool& pool) noexcept;
     explicit PoolAllocator(PoolHandle const& handle) noexcept;
     PoolAllocator(const PoolAllocator&) noexcept = default;
@@ -731,7 +730,7 @@ public:
 
 | Member / parameter | Description |
 |--------------------|-------------|
-| Constructor | Takes `PoolBlockToken`, `Pool&`, or `PoolHandle` (token = `block_refs` pin). |
+| Constructor | Takes `PoolLifetimeToken`, `Pool&`, or `PoolHandle` (token = `block_refs` pin). |
 | Rebind ctor | Shares the same control block when containers rebind to node types. |
 | `allocate(n)` | Space for `n` × `T` at `alignof(T)`. Throws `bad_array_new_length` on overflow; **`bad_alloc`** if the pool is already dead; otherwise same as `Pool::allocate`. |
 | `deallocate(p, n)` | Returns storage for `p`. `n` ignored. `noexcept`; bad pointers **abort** while alive; **no-op** if `!alive` (arena). |
@@ -759,23 +758,23 @@ v.push_back(42);
 virtual dispatch). Use this for polymorphic `std::pmr` containers and runtime
 composition (for example a tracing decorator over the resource).
 
-Same arena model as `PoolAllocator`: holds a `PoolBlockToken`; allocate throws
+Same arena model as `PoolAllocator`: holds a `PoolLifetimeToken`; allocate throws
 `bad_alloc` if `!alive`; deallocate no-ops if dead.
 
 ```cpp
 class PoolMemoryResource : public std::pmr::memory_resource {
 public:
-    explicit PoolMemoryResource(PoolBlockToken token) noexcept;
+    explicit PoolMemoryResource(PoolLifetimeToken token) noexcept;
     explicit PoolMemoryResource(Pool& pool) noexcept;
     explicit PoolMemoryResource(PoolHandle const& handle) noexcept;
 
-    PoolBlockToken const& token() const noexcept;
+    PoolLifetimeToken const& token() const noexcept;
 };
 ```
 
 | Surface | Behavior |
 |---------|----------|
-| Constructors | `PoolBlockToken`, `Pool&`, or `PoolHandle` (token = `block_refs` pin). |
+| Constructors | `PoolLifetimeToken`, `Pool&`, or `PoolHandle` (token = `block_refs` pin). |
 | `allocate(bytes, alignment)` | Alignment below `kMinAlignment` (4) is raised to 4. Non-power-of-two or `> kMaxAlignment` (64) throws `bad_alloc`. Dead pool throws `bad_alloc`. Pool contract failures (`invalid_argument` / `out_of_range`) are mapped to `bad_alloc` (PMR contract). |
 | `deallocate(p, bytes, alignment)` | `noexcept`. Null is a no-op. Bad pointers **abort** while alive; **no-op** if `!alive` (arena). `bytes` / `alignment` are unused (pool frees by header). |
 | `is_equal` | True iff `other` is a `PoolMemoryResource` on the same `PoolControlBlock*`. |

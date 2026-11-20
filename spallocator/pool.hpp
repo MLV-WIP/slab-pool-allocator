@@ -233,7 +233,7 @@ namespace spallocator
         PoolHandle handle();
 
         // Deleter/allocator token (block_refs only).
-        PoolBlockToken block_token();
+        PoolLifetimeToken lifetime_token();
 
         PoolControlBlock* control() const noexcept { return control_; }
 
@@ -541,21 +541,21 @@ namespace spallocator
         {
             if (slab)
             {
-                reclaimed += slab->reclaimEmptySlabs(keep_min);
+                reclaimed += slab->reclaimEmptyBlocks(keep_min);
             }
         }
         for (auto& slab : slabs32)
         {
             if (slab)
             {
-                reclaimed += slab->reclaimEmptySlabs(keep_min);
+                reclaimed += slab->reclaimEmptyBlocks(keep_min);
             }
         }
         for (auto& slab : slabs64)
         {
             if (slab)
             {
-                reclaimed += slab->reclaimEmptySlabs(keep_min);
+                reclaimed += slab->reclaimEmptyBlocks(keep_min);
             }
         }
 
@@ -681,9 +681,9 @@ namespace spallocator
     }
 
 
-    inline PoolBlockToken Pool::block_token()
+    inline PoolLifetimeToken Pool::lifetime_token()
     {
-        return PoolBlockToken(control_);
+        return PoolLifetimeToken(control_);
     }
 
 

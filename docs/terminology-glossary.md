@@ -14,11 +14,11 @@ Today **“slab”** names two different things:
 | Sense | Meaning in this codebase | Examples |
 |-------|--------------------------|----------|
 | **(A) Object / engine** | The growable size-class container: `Slab<ElemSize, Alignment>` — one fixed slot size + alignment, freemaps, growth, reclaim | type `Slab`, registry `slabs16[]`, “per-slab lock” |
-| **(B) Chunk of memory** | One mapped buffer holding a fixed count of those slots | `allocateNewSlab()`, `getSlabCount()`, `reclaimEmptySlabs()`, `slab_data`, debug “New slab … allocated” |
+| **(B) Chunk of memory** | One mapped buffer holding a fixed count of those slots | `allocateNewSlab()`, `getBlockCount()`, `reclaimEmptyBlocks()`, `slab_data`, debug “New slab … allocated” |
 
 Docs already partially disambiguate (IMPLEMENTATION.md calls the type an **engine** and the chunks **data blocks** / **buffers**), but APIs, members, and many comments still use sense (B). That is the primary clarity bug.
 
-Secondary collisions: **“block”** also means lifetime metadata (`PoolControlBlock`, `PoolBlockToken`), and **“slot”** / **“item”** / **“buffer”** / **“engine”** overlap in prose.
+Secondary collisions: **“block”** also means lifetime metadata (`PoolControlBlock`, `PoolLifetimeToken`), and **“slot”** / **“item”** / **“buffer”** / **“engine”** overlap in prose.
 
 ---
 
@@ -63,7 +63,7 @@ Plus: **SlabProxy** for oversized / beyond-ladder allocations (no slot recycling
 
 | Candidate | Pros | Cons | Verdict |
 |-----------|------|------|---------|
-| **Block** | Short; clear hierarchy; already used in IMPLEMENTATION (“data blocks”) and ctor flag `preallocate_first_block`; API names read well | Collides in the same repo with **control block** / `PoolBlockToken` | **Recommend** as the storage-chunk term |
+| **Block** | Short; clear hierarchy; already used in IMPLEMENTATION (“data blocks”) and ctor flag `preallocate_first_block`; API names read well | Collides in the same repo with **control block** / `PoolLifetimeToken` | **Recommend** as the storage-chunk term |
 | **DataBlock** | Disambiguates from control-block jargon; matches current doc phrase “data block” | Longer identifiers (`allocateNewDataBlock`, `getDataBlockCount`); still two words in prose | Acceptable fallback if Michael wants zero overlap with “block” in lifetime types |
 | **SlabBlock** | Signals ownership by a Slab | Re-embeds “slab” into the chunk name → readers again ask “is a SlabBlock a Slab?”; awkward next to type `Slab` | **Not recommended** |
 
@@ -73,7 +73,7 @@ Disambiguation rule when both appear in one paragraph:
 
 - **Block** (capital B in glossary/docs when first introduced) = storage chunk inside a Slab.  
 - **control block** / `PoolControlBlock` = lifetime metadata for a Pool.  
-- **`PoolBlockToken`** = pin on that control block (`block_refs`) — *not* a storage Block.
+- **`PoolLifetimeToken`** = pin on that control block (`block_refs`) — *not* a storage Block.
 
 If that dual use of “block” feels too sharp after review, prefer renaming the **lifetime** side later (`PoolLifetimeToken` / keep `PoolControlBlock` as shared_ptr-style jargon) rather than lengthening the hot-path storage term to DataBlock. That is a separate decision; not required to lock Block for chunks.
 
@@ -89,7 +89,7 @@ Surveyed in slab-pool-allocator; mlvlib called out only where it touches the sam
 | **engine** | IMPLEMENTATION routing section | Informal synonym for `Slab` | Prefer **Slab**; optional one-line alias in glossary |
 | **item** | `allocateItem` / `deallocateItem`, `Pool::deallocate(item)`, many vars | Ambiguous: slot base? user pointer? any pointer? | Prefer **slot** / **slot base** in slab layer; **user pointer** at Pool; eventual API rename `allocateSlot` / `deallocateSlot` (or keep Item as “opaque backend allocation”) |
 | **registry slot** | Pool array index into `slabs16[i]` | Collides with allocatable **Slot** | Say **registry index** / **class index** |
-| **PoolBlockToken** | `pool_lifetime.hpp`, factories | “Block” ≠ storage Block | Document as lifetime pin; consider later rename to `PoolLifetimeToken` / `PoolPin` |
+| **PoolLifetimeToken** | `pool_lifetime.hpp`, factories | “Block” ≠ storage Block | Document as lifetime pin; consider later rename to `PoolLifetimeToken` / `PoolPin` |
 | **PoolControlBlock** | lifetime | Same “block” root; but matches industry “control block” | Keep name; always say **control block** in prose |
 | **arena** | teardown mode vs bump-arena concept | “Arena mode” = destroy Pool first / bulk reclaim; not a bump allocator | Keep **arena teardown** / **arena path**; never “arena” alone for the Pool type |
 | **AbstractSlab** | `slab.hpp` | Fine as interface name; “Abstract” is OO noise | Optional later: `SlabBackend` / `ISlab` — low priority |
@@ -114,12 +114,12 @@ mlvlib itself has **no** Pool/Slab/Slot/Block storage vocabulary worth renaming 
 
 | Kind | Location | Examples |
 |------|----------|----------|
-| Methods | `spallocator/slab.hpp` | `allocateNewSlab`, `destroySlabAt`, `getSlabCount`, `reclaimEmptySlabs`, `findSlabForItem` |
+| Methods | `spallocator/slab.hpp` | `allocateNewSlab`, `destroySlabAt`, `getBlockCount`, `reclaimEmptyBlocks`, `findBlockForSlot` |
 | Members | `slab.hpp` | `slab_data`, `slab_map`, `slab_available_map`, `slab_alloc_size`, `max_slabs`, `alloc_cursor_slab_` |
 | Knobs | `slab.hpp` / configure | `kSlabTargetBytes`, `kSlabTargetMultiplier`, `--with-slab-target-*` (these size **Blocks**, not the Slab type) |
 | Messages | `slab.hpp` | “New slab … allocated”, “remaining slabs=”, “no corresponding slab found” |
-| Tests | `test/tester.cpp` | Many `getSlabCount` / `reclaimEmptySlabs` expectations; comments mix “data block” and count-as-slab |
-| Docs | API / IMPLEMENTATION / CONCEPTS | “slab buffers”, `reclaimEmptySlabs`, “Finding a pointer’s slab”, trim “per size class” buffer language |
+| Tests | `test/tester.cpp` | Many `getBlockCount` / `reclaimEmptyBlocks` expectations; comments mix “data block” and count-as-slab |
+| Docs | API / IMPLEMENTATION / CONCEPTS | “slab buffers”, `reclaimEmptyBlocks`, “Finding a pointer’s slab”, trim “per size class” buffer language |
 
 ### Hotspots where naming is OK but should stay consistent
 
@@ -131,7 +131,7 @@ mlvlib itself has **no** Pool/Slab/Slot/Block storage vocabulary worth renaming 
 
 ### Lifetime “block” (do not casually rename with storage Blocks)
 
-- `PoolControlBlock`, `PoolBlockToken`, `block_refs`, `block_token()`  
+- `PoolControlBlock`, `PoolLifetimeToken`, `block_refs`, `lifetime_token()`  
 - Document side-by-side with storage **Block**; optional later lifetime rename
 
 ---
@@ -145,48 +145,39 @@ Order of operations after Michael locks names — **not started this round**.
 - Agree: Pool / Slab / **Block** / Slot (+ SlabProxy, footprint, header).  
 - Agree: whether lifetime types keep “Block” in the name.
 
-### Phase 1 — Documentation pass (low risk) — **done in working tree** (awaiting Michael review; uncommitted)
+### Phase 1 — Documentation pass — **committed** (`640ab02`)
 
 1. Repo copy under `docs/terminology-glossary.md` + README / CONCEPTS pointers.  
 2. CONCEPTS: retitled “Finding a pointer’s owning Block”; Block in growth/reclaim; Pool≠Slab kept.  
-3. IMPLEMENTATION: **Block** preferred over buffer/data-block; locked Slab/Block/Slot note; transitional API list.  
-4. API.md: `getSlabCount` / `reclaimEmptySlabs` described as **Blocks**; AbstractSlab slot base vs user pointer.
+3. IMPLEMENTATION: **Block** preferred over buffer/data-block; locked Slab/Block/Slot note.  
+4. API.md: Block vocabulary; AbstractSlab slot base vs user pointer.
 
-### Phase 2 — Internal / private code identifiers — **done in working tree** (awaiting review; uncommitted)
+### Phase 2 — Internal / private code identifiers — **committed** (`cdd6cdb`)
+
+Hard renames (no aliases): `allocateNewBlock`, `destroyBlockAt`, `block_bases`,
+`block_freemaps`, `block_available_map`, `block_bytes`, `max_blocks`,
+`slots_per_block`, `alloc_cursor_block_`, `selectBlockSize`, local `new_block`.
+
+Compile knobs (`SPALLOCATOR_SLAB_TARGET_*` / `kSlabTarget*`) kept; comment notes they size Blocks.
+
+### Phase 3 — Public / test-facing API — **done in working tree** (awaiting review; uncommitted)
 
 Hard renames (no aliases):
 
 | Was | Now |
 |-----|-----|
-| `allocateNewSlab` | `allocateNewBlock` |
-| `destroySlabAt` | `destroyBlockAt` |
-| `slab_data` | `block_bases` |
-| `slab_map` | `block_freemaps` |
-| `slab_available_map` | `block_available_map` |
-| `slab_alloc_size` | `block_bytes` |
-| `max_slabs` | `max_blocks` |
-| `alloc_cursor_slab_` | `alloc_cursor_block_` |
-| `slots_per_buffer` | `slots_per_block` |
-| `selectBufferSize` | `selectBlockSize` |
-| local `new_slab` | `new_block` |
+| `getSlabCount()` | `getBlockCount()` |
+| `reclaimEmptySlabs` | `reclaimEmptyBlocks` |
+| `findSlabForItem` | `findBlockForSlot` |
+| `PoolBlockToken` | `PoolLifetimeToken` |
+| `block_token()` | `lifetime_token()` |
 
-Compile knobs (`SPALLOCATOR_SLAB_TARGET_*` / `kSlabTarget*`) kept; comment notes they size Blocks.
-
-### Phase 3 — Public / test-facing API on `Slab`
-
-| Current | Proposed | Notes |
-|---------|----------|-------|
-| `getSlabCount()` | `getBlockCount()` | Hard rename (no aliases; API still mutable) |
-| `reclaimEmptySlabs` | `reclaimEmptyBlocks` | Virtual on `AbstractSlab` — update override + docs |
-| `findSlabForItem` | `findBlockForSlot` / `findBlockIndex` | Parameter is a **slot base** |
-
-Tests (`test/tester.cpp`) and bench comments follow.
+Kept: `PoolControlBlock`. Tests / AbstractSlab / docs updated.
 
 ### Phase 4 — Optional clarity renames (separate PR, after core terms)
 
 - `allocateItem` / `deallocateItem` → slot-oriented names (or document “Item = backend allocation”).  
 - `retained_slab_bytes` → `retained_block_bytes`.  
-- `PoolBlockToken` → **`PoolLifetimeToken`** (locked; do in Phase 3 with public API renames; keep `PoolControlBlock`).  
 - CONCEPTS/API diagrams: show Pool → Slab → Block → Slot explicitly.
 
 ### Out of scope unless requested
@@ -201,7 +192,7 @@ Tests (`test/tester.cpp`) and bench comments follow.
 
 1. **Chunk term:** **Block**
 2. **Keep type name `Slab`** for the size-class engine: **yes**
-3. **Lifetime side:** rename `PoolBlockToken` → **`PoolLifetimeToken`** in **Phase 2 or 3** (recommend Phase 3 with public API); keep **`PoolControlBlock`** unchanged
+3. **Lifetime side:** rename `PoolBlockToken` → **`PoolLifetimeToken`** in Phase 3 (done in working tree); keep **`PoolControlBlock`** unchanged
 4. **Slot** stays for freemap cells: **yes**
 5. **Phase order:** as in §6 (docs → private identifiers → public API + LifetimeToken → optional clarity) — **approved**
 

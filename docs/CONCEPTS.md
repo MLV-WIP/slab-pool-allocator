@@ -111,7 +111,7 @@ individual allocation site.
 - You want multiple independent allocators (shards) rather than one process-wide
   heap  
 - You need a handle to pass into factories / STL allocators (`Pool&`,
-  `PoolHandle`, or `PoolBlockToken`)  
+  `PoolHandle`, or `PoolLifetimeToken`)  
 
 ### When you may not need a named pool
 
@@ -380,8 +380,7 @@ When a Block becomes completely empty, the Slab **keeps it mapped by default**
 
 Reclaim is exposed on the **Pool** as `Pool::trim()`, which asks each size-class
 Slab to drop empty Blocks — a pool-level policy knob over slab-level storage.
-(APIs such as `reclaimEmptySlabs` still say “slab” for a Block until the Phase 3
-rename.) Large (`SlabProxy`) allocations already return memory on each free.
+Large (`SlabProxy`) allocations already return memory on each free.
 
 ### Next-fit cursor vs freelist
 
@@ -417,8 +416,7 @@ the latter; address lookup answers the former.
 This project uses an ordered map keyed by Block base addresses. The *concept*
 matters more than the container choice: free must identify a **slot base**, not
 an arbitrary interior address. Interior frees are rejected so a misaligned free
-cannot flip a neighboring object’s freemap bit. (`findSlabForItem` is the
-transitional name for “find owning Block index.”)
+cannot flip a neighboring object’s freemap bit. (`findBlockForSlot` answers “which Block owns this slot base?”)
 
 **Teaching angle:** ownership maps and interval trees appear in kernels (vma
 trees), JITs, and sanitizers — same shape of question.
@@ -540,7 +538,7 @@ payloads; for types with meaningful destructors, prefer orderly teardown (or
 accept that `~T()` will not run). Do not rely on one arena-reclaimed object
 observing another during skipped finalization - there is no destruction order.
 
-`PoolDeleter` is **stateful** (it holds a `PoolBlockToken`). Empty / EBO-friendly
+`PoolDeleter` is **stateful** (it holds a `PoolLifetimeToken`). Empty / EBO-friendly
 deleters are preferable when size matters, but the token is required so arena
 `~Pool` can be observed safely without parking the control block in the slab.
 That size cost is intentional.
@@ -554,7 +552,7 @@ That can be attractive for **type-specific** pools (custom `new`/`delete` on a
 
 This library’s default path stays **generic**: `make_pool_unique` /
 `make_pool_shared` + `PoolDeleter` work for any `T` under the pool’s alignment
-cap and remain arena-observable via `PoolBlockToken`. Replacing that with
+cap and remain arena-observable via `PoolLifetimeToken`. Replacing that with
 destroying delete is an explicit **non-goal** for the generic pool; it remains
 a possible future for a narrowly typed facade, not for `Pool` itself.
 Details: [IMPLEMENTATION.md — Smart pointers](IMPLEMENTATION.md#smart-pointers-design).
@@ -768,9 +766,8 @@ More design detail:
 ## Terminology
 
 Locked stack: **Pool** → **Slab** (size-class engine) → **Block** (mapped chunk)
-→ **Slot**. Keep type name `Slab`; Slot stays. Lifetime types keep
-`PoolControlBlock`; `PoolBlockToken` → `PoolLifetimeToken` is Phase 3 (not this
-docs pass). Full glossary and rename sketch:
+→ **Slot**. Keep type name `Slab`; Slot stays. Lifetime: `PoolLifetimeToken`
+pin; `PoolControlBlock` kept. Full glossary:
 [terminology-glossary.md](terminology-glossary.md).
 
 ---
