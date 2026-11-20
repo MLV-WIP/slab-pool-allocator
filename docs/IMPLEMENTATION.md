@@ -900,6 +900,39 @@ Waste has three buckets:
 Measure before replacing the address map or moving to a freelist — both are
 deliberate simplicity until profiles disagree.
 
+### P4 re-baseline (measure-gated hot path)
+
+Re-measured on `PR-CMM-alignment` tip after SpinLock N1a, `SlotFreemap` (N2b),
+and P2 (`22f7439` era). Prefer `make bench BUILD_TYPE=release` and
+`make profile` with the on-demand harness; absolute ns are host-specific.
+
+**Release ratios (illustrative single run, align 8, iters 300k):**
+
+| Scenario | `::new` | `Pool` | `Slab<16,16>` |
+|----------|---------|--------|---------------|
+| LIFO churn (16B pair) | 1.0× (24.5 ns) | ~3.0× | ~1.8× |
+| Multi-size mix | 1.0× | ~2.4× | n/a |
+| Bulk alloc / free | 1.0× / 1.0× | ~0.84× / ~4.8× | ~0.45× / ~4.0× |
+
+**`perf` (LIFO `pool`):** top symbols are `Slab::allocateItem` /
+`deallocateItem` and `Pool::allocate` / `try_deallocate`. No standalone
+freemap/CTZ, `std::map`, virtual thunk, or `SpinLock::lock_contended` hotspot.
+Annotate shows **uncontended** `SpinLock` TAS (`xchg`) as a large share of
+samples *inside* the slab methods — lock cost without contention.
+
+**Go / no-go (classic P4 candidates):**
+
+| Candidate | Decision |
+|-----------|----------|
+| `AbstractSlab` de-virtualization | **Deferred** — no measurable vtable/thunk hotspot |
+| Intrusive freelist | **Deferred** — scan/freemap not dominating post-`SlotFreemap` |
+| Denser free address map | **Deferred** — not a clear top-level hotspot; single-buffer free fast path remains |
+| Pluggable `SpinLock` vs `std::mutex` | **Deferred** — cost is uncontended TAS, not contention; mutex unlikely to help |
+
+No hot-path code shipped in P4. Optional future probe (separate from this list):
+reduce per-op lock acquisitions if the TAS tax remains the primary gap vs
+`::new` after further workload-shaped profiles.
+
 ### Comparative baselines (`make bench`)
 
 On-demand harness: `bench/bench_allocators.cpp` via `make bench` (not part of
@@ -1004,10 +1037,11 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 | Topic | Status |
 |-------|--------|
 | Pool destroy while clients hold pointers | **Addressed** — ControlBlock / Handle / BlockToken; orderly + arena + heap auto-retire |
-| Alloc bit scan | Next-fit + CTZ word search (production); freelist if still hot |
-| Address map | O(log m); denser structures if free is hot |
+| Alloc bit scan | Next-fit + CTZ + `SlotFreemap` (production); freelist deferred (P4 re-baseline) |
+| Address map | O(log m); denser structures deferred (P4 re-baseline) |
 | Fixed size-class ladders | Deliberate; exact-pack buffers within classes; non-ladder shaping is backlog R2 |
-| Lock type | Hard-wired `SpinLock`; pluggable primitive is backlog R5 |
+| Lock type | Hard-wired `SpinLock`; pluggable mutex deferred (P4: uncontended TAS dominates, not contention) |
+| `AbstractSlab` virtuals | Deferred de-virt (P4: no measurable thunk hotspot) |
 | MSan in CI | Deferred pending host instrumented runtime |
 | Metrics API | `PoolStats` / `Pool::stats()` (HWMs always; alloc/free tallies opt-in via `SPALLOCATOR_POOL_COUNTERS`); richer per-class breakdown later |
 | C API | C++ only today; C99 wrapper is backlog R4 |
@@ -1023,10 +1057,11 @@ and [API.md](API.md); remaining rows are scale/API surface, not silent UB.
 Near-term / opportunistic:
 
 - Per-class breakdown on top of `PoolStats` (counters/HWMs already shipped)  
-- Intrusive freelist if next-fit + CTZ still dominate profiles  
-- Denser free address lookup if `std::map` shows hot at large `m`  
+- Intrusive freelist — **deferred** (P4 re-baseline; revive if scan dominates)  
+- Denser free address lookup — **deferred** (P4 re-baseline; revive if map hot at large `m`)  
+- `AbstractSlab` de-virt — **deferred** (P4 re-baseline)  
 - Thread-local caches; NUMA-aware buffers  
-- Lock-free fast paths for common size classes  
+- Lock-free fast paths / fewer per-op lock acquisitions if TAS tax remains primary  
 - Configurable SpinLock backoff parameters  
 
 ### Research / design backlog
@@ -1043,7 +1078,7 @@ Also tracked on the
 | PMR `memory_resource` adapter | **Done** — `PoolMemoryResource` in `pool_pmr.hpp` (additive; virtual cost); keep `PoolAllocator` as the primary / non-virtual STL path |
 | Baseline ratio benches | **Shipped** — `make bench` (`bench/bench_allocators.cpp`); re-check after toolchain upgrades |
 | C99 wrapper | Opaque pool handle API for C callers |
-| Pluggable lock primitive | Compile-time choice of `SpinLock` vs `std::mutex` (or similar) for Pool/Slab |
+| Pluggable lock primitive | **Deferred** (P4) — uncontended TAS dominates profiles; mutex unlikely to win. Revisit if contended threaded workloads show wait time, not TAS |
 | Fail-closed allocate policy | Optional: refuse OS fallback when over caps (timing-critical / bounded domains) |
 
 ---
