@@ -69,11 +69,11 @@ namespace spallocator
     inline constexpr std::size_t kMaxClassBytes =
         static_cast<std::size_t>(SPALLOCATOR_MAX_CLASS_BYTES);
 
-    // Largest ladder slot today is 4096; max header/alignment class is 64.
-    static_assert(kMaxAllocationBytes >= 4096u + 64u,
+    // Largest ladder slot today is 16384 (alignment class 64); max header is 64.
+    static_assert(kMaxAllocationBytes >= 16384u + 64u,
         "kMaxAllocationBytes must cover largest size-class footprint plus header");
-    static_assert(kMaxClassBytes >= 16u * 4096u,
-        "kMaxClassBytes must fit at least one max-ladder buffer (16 x 4096)");
+    static_assert(kMaxClassBytes >= 16u * 16384u,
+        "kMaxClassBytes must fit at least one max-ladder Block (16 x 16384)");
     static_assert(kMaxClassBytes >= kMaxAllocationBytes,
         "kMaxClassBytes should be at least kMaxAllocationBytes");
 

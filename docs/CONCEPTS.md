@@ -225,9 +225,9 @@ space (a 33-byte need may jump to 64). **Intermediate classes** (48, 96, 192,
 384, 768) reduce that waste while keeping the number of classes manageable.
 
 ```
-Alignment class 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
-Alignment class 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048
-Alignment class 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Alignment class 16 (eager): 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096
+Alignment class 32:  32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192
+Alignment class 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384
 ```
 
 ### Internal vs external fragmentation
