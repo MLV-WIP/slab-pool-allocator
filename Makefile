@@ -234,10 +234,12 @@ $(OBJDIR):
 	$(ECHO) "  MKDIR   $(OBJDIR)"
 	$(Q)mkdir -p $(OBJDIR)
 
-# Build tester (enable PoolStats success/fail counters for metrics tests)
+# Build tester (enable PoolStats success/fail counters for metrics tests).
+# -U then -D so we override config.mk's SPALLOCATOR_POOL_COUNTERS=0 without
+# -Werror,-Wmacro-redefined.
 $(OBJDIR)/$(TESTER_TARGET): $(TESTER_SRC) $(HEADERS) | $(OBJDIR)
 	$(ECHO) "  CXX     $@"
-	$(Q)$(CXX) $(CXXFLAGS) -DSPALLOCATOR_POOL_COUNTERS=1 $< -o $@ $(LDFLAGS)
+	$(Q)$(CXX) $(CXXFLAGS) -USPALLOCATOR_POOL_COUNTERS -DSPALLOCATOR_POOL_COUNTERS=1 $< -o $@ $(LDFLAGS)
 	$(Q)rm -f $(BASEOBJDIR)/$(TESTER_TARGET)
 	$(Q)ln -s $(OBJDIRNAME)/$(TESTER_TARGET) $(BASEOBJDIR)/$(TESTER_TARGET)
 ifeq ($(ENABLE_COVERAGE),yes)
