@@ -33,6 +33,7 @@ SLAB_TARGET_BYTES="8192"
 SLAB_TARGET_MULTIPLIER="16"
 PREALLOCATE_MAX_ELEM_SIZE="256"
 PREALLOCATE_MAX_ALIGNMENT="16"
+ENABLE_POOL_COUNTERS="no"           # hot-path alloc_ok/free_ok tallies
 MAX_ALLOCATION_MIB="1024"           # 1 GiB
 MAX_CLASS_MIB="4096"                # 4 GiB
 # Empty => auto-select newest of c++26/c++23/c++20. Set via --with-cxxstd=.
@@ -123,6 +124,8 @@ Optional Packages:
                           Pool cold-start: also require Alignment <= N
                           (16, 32, or 64). Raise to warm high-align axes.
                           [default: 16]
+  --enable-pool-counters  Count alloc_ok/free_ok/*_fail on every op (slower)
+  --disable-pool-counters Leave success/fail tallies at 0 (default; faster)
 
 Examples:
   ./configure
@@ -167,6 +170,12 @@ for arg in "$@"; do
             ;;
         --disable-bench)
             ENABLE_BENCH="no"
+            ;;
+        --enable-pool-counters)
+            ENABLE_POOL_COUNTERS="yes"
+            ;;
+        --disable-pool-counters)
+            ENABLE_POOL_COUNTERS="no"
             ;;
         --enable-asan)
             ENABLE_ASAN="yes"
@@ -718,6 +727,7 @@ echo "  Slab target bytes:    $SLAB_TARGET_BYTES"
 echo "  Slab target mult:     $SLAB_TARGET_MULTIPLIER"
 echo "  Prealloc max elem:    $PREALLOCATE_MAX_ELEM_SIZE"
 echo "  Prealloc max align:   $PREALLOCATE_MAX_ALIGNMENT"
+echo "  Pool counters:        $ENABLE_POOL_COUNTERS"
 echo "  Max allocation MiB:   $MAX_ALLOCATION_MIB ($MAX_ALLOCATION_BYTES bytes)"
 echo "  Max class MiB:        $MAX_CLASS_MIB ($MAX_CLASS_BYTES bytes)"
 echo ""
@@ -726,7 +736,12 @@ echo ""
 print_info "Generating config.mk..."
 
 # Append size knobs as -D so headers' #ifndef defaults are overridden.
-SIZE_CXXFLAGS="-DSPALLOCATOR_SLAB_TARGET_BYTES=$SLAB_TARGET_BYTES -DSPALLOCATOR_SLAB_TARGET_MULTIPLIER=$SLAB_TARGET_MULTIPLIER -DSPALLOCATOR_PREALLOCATE_MAX_ELEM_SIZE=$PREALLOCATE_MAX_ELEM_SIZE -DSPALLOCATOR_PREALLOCATE_MAX_ALIGNMENT=$PREALLOCATE_MAX_ALIGNMENT -DSPALLOCATOR_MAX_ALLOCATION_BYTES=$MAX_ALLOCATION_BYTES -DSPALLOCATOR_MAX_CLASS_BYTES=$MAX_CLASS_BYTES"
+if [ "$ENABLE_POOL_COUNTERS" = "yes" ]; then
+    POOL_COUNTERS_VAL=1
+else
+    POOL_COUNTERS_VAL=0
+fi
+SIZE_CXXFLAGS="-DSPALLOCATOR_SLAB_TARGET_BYTES=$SLAB_TARGET_BYTES -DSPALLOCATOR_SLAB_TARGET_MULTIPLIER=$SLAB_TARGET_MULTIPLIER -DSPALLOCATOR_PREALLOCATE_MAX_ELEM_SIZE=$PREALLOCATE_MAX_ELEM_SIZE -DSPALLOCATOR_PREALLOCATE_MAX_ALIGNMENT=$PREALLOCATE_MAX_ALIGNMENT -DSPALLOCATOR_POOL_COUNTERS=$POOL_COUNTERS_VAL -DSPALLOCATOR_MAX_ALLOCATION_BYTES=$MAX_ALLOCATION_BYTES -DSPALLOCATOR_MAX_CLASS_BYTES=$MAX_CLASS_BYTES"
 if [ -n "$CXXFLAGS" ]; then
     USER_CXXFLAGS_VALUE="$CXXFLAGS $SIZE_CXXFLAGS"
 else
@@ -768,6 +783,7 @@ SLAB_TARGET_BYTES := $SLAB_TARGET_BYTES
 SLAB_TARGET_MULTIPLIER := $SLAB_TARGET_MULTIPLIER
 PREALLOCATE_MAX_ELEM_SIZE := $PREALLOCATE_MAX_ELEM_SIZE
 PREALLOCATE_MAX_ALIGNMENT := $PREALLOCATE_MAX_ALIGNMENT
+ENABLE_POOL_COUNTERS := $ENABLE_POOL_COUNTERS
 
 # User-specified flags (+ slab packing -D knobs)
 USER_CXXFLAGS := $USER_CXXFLAGS_VALUE

@@ -448,8 +448,10 @@ PoolStats stats();
 |--|--|
 | **Returns** | Best-effort snapshot of counters and high-water marks (HWMs). Not a single transactional freeze under concurrency. |
 | **`live_*` vs `retained_*`** | Live = outstanding client allocations. Retained = bytes in size-class slab buffers still mapped (may stay high after free until `trim`). |
+| **`live_hwm`** | Best-effort peak live count: cheap relaxed max on each successful allocate, and refreshed in `stats()`. |
 | **`retained_hwm`** | Advanced when `stats()` or `trim()` observes a higher retained total (not on every allocate). |
-| **Thread safety** | Safe; counters use relaxed atomics. |
+| **`alloc_ok` / `free_ok` / `*_fail`** | Hot-path tallies; **off by default** (`SPALLOCATOR_POOL_COUNTERS=0`) so allocate/free avoid extra atomic RMWs. Enable with `-DSPALLOCATOR_POOL_COUNTERS=1` or `./configure --enable-pool-counters`. When disabled, these fields read as 0. `kPoolCountersEnabled` reports the build setting. |
+| **Thread safety** | Safe; enabled counters use relaxed atomics. |
 
 ```cpp
 auto s = pool.stats();

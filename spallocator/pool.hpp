@@ -178,17 +178,26 @@ namespace spallocator
     }
 
 
+    // Hot-path success/fail tallies (alloc_ok / free_ok / *_fail). Off by
+    // default — each bump is a locked atomic RMW on every op. Enable with
+    // -DSPALLOCATOR_POOL_COUNTERS=1 or ./configure --enable-pool-counters.
+    // live_allocs_ (lifetime) and live_hwm_ (cheap relaxed max) stay on.
+#ifndef SPALLOCATOR_POOL_COUNTERS
+#  define SPALLOCATOR_POOL_COUNTERS 0
+#endif
+    inline constexpr bool kPoolCountersEnabled = (SPALLOCATOR_POOL_COUNTERS != 0);
+
     // Best-effort ops snapshot. Counters use relaxed atomics; fields may
     // not form a single transactional freeze under concurrency.
     struct PoolStats
     {
         std::uint64_t live_allocations{0};     // outstanding successful allocs
         std::uint64_t retained_slab_bytes{0};  // size-class buffers held (not "in use")
-        std::uint64_t alloc_ok{0};
+        std::uint64_t alloc_ok{0};             // 0 unless kPoolCountersEnabled
         std::uint64_t alloc_fail{0};           // size/align/cap/slab throws
         std::uint64_t free_ok{0};              // successful non-null frees
         std::uint64_t free_fail{0};            // try_deallocate returned false
-        std::uint64_t live_hwm{0};             // peak live_allocations
+        std::uint64_t live_hwm{0};             // peak live_allocations (relaxed max)
         std::uint64_t retained_hwm{0};         // peak retained_slab_bytes observed
     };
 
@@ -247,6 +256,7 @@ namespace spallocator
         void note_alloc_fail() noexcept;
         void note_free_ok() noexcept;
         void note_free_fail() noexcept;
+        void observe_live_hwm(std::uint64_t live) noexcept;
         void observe_retained_hwm(std::uint64_t retained_bytes) noexcept;
 
         // Scratch for allocate's header path (not part of the public API).
@@ -269,10 +279,12 @@ namespace spallocator
         std::array<std::unique_ptr<AbstractSlab>, kLadder64Count> slabs64{};
         SlabProxy large_slab;
 
+#if SPALLOCATOR_POOL_COUNTERS
         std::atomic<std::uint64_t> alloc_ok_{0};
         std::atomic<std::uint64_t> alloc_fail_{0};
         std::atomic<std::uint64_t> free_ok_{0};
         std::atomic<std::uint64_t> free_fail_{0};
+#endif
         std::atomic<std::uint64_t> live_hwm_{0};
         std::atomic<std::uint64_t> retained_hwm_{0};
     };
@@ -599,35 +611,48 @@ namespace spallocator
     }
 
 
+    inline void Pool::observe_live_hwm(std::uint64_t live) noexcept
+    {
+        // Best-effort peak: relaxed load/store (no CAS). Concurrent allocs may
+        // rarely under-report HWM; PoolStats already documents that looseness.
+        const std::uint64_t cur = live_hwm_.load(std::memory_order_relaxed);
+        if (live > cur)
+        {
+            live_hwm_.store(live, std::memory_order_relaxed);
+        }
+    }
+
+
     inline void Pool::note_alloc_ok() noexcept
     {
+#if SPALLOCATOR_POOL_COUNTERS
         alloc_ok_.fetch_add(1, std::memory_order_relaxed);
-        const std::uint64_t live = live_allocation_count();
-        std::uint64_t cur = live_hwm_.load(std::memory_order_relaxed);
-        while (live > cur &&
-               !live_hwm_.compare_exchange_weak(
-                   cur, live,
-                   std::memory_order_relaxed, std::memory_order_relaxed))
-        {
-        }
+#endif
+        observe_live_hwm(live_allocation_count());
     }
 
 
     inline void Pool::note_alloc_fail() noexcept
     {
+#if SPALLOCATOR_POOL_COUNTERS
         alloc_fail_.fetch_add(1, std::memory_order_relaxed);
+#endif
     }
 
 
     inline void Pool::note_free_ok() noexcept
     {
+#if SPALLOCATOR_POOL_COUNTERS
         free_ok_.fetch_add(1, std::memory_order_relaxed);
+#endif
     }
 
 
     inline void Pool::note_free_fail() noexcept
     {
+#if SPALLOCATOR_POOL_COUNTERS
         free_fail_.fetch_add(1, std::memory_order_relaxed);
+#endif
     }
 
 
@@ -636,11 +661,14 @@ namespace spallocator
         PoolStats s;
         s.live_allocations = live_allocation_count();
         s.retained_slab_bytes = getAllocatedMemory();
+        observe_live_hwm(s.live_allocations);
         observe_retained_hwm(s.retained_slab_bytes);
+#if SPALLOCATOR_POOL_COUNTERS
         s.alloc_ok = alloc_ok_.load(std::memory_order_relaxed);
         s.alloc_fail = alloc_fail_.load(std::memory_order_relaxed);
         s.free_ok = free_ok_.load(std::memory_order_relaxed);
         s.free_fail = free_fail_.load(std::memory_order_relaxed);
+#endif
         s.live_hwm = live_hwm_.load(std::memory_order_relaxed);
         s.retained_hwm = retained_hwm_.load(std::memory_order_relaxed);
         return s;

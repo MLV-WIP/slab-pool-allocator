@@ -137,7 +137,12 @@ void print_pool_stats(std::string_view label, spallocator::Pool& pool)
               << "    alloc_ok=" << s.alloc_ok
               << " alloc_fail=" << s.alloc_fail
               << " free_ok=" << s.free_ok
-              << " free_fail=" << s.free_fail << "\n";
+              << " free_fail=" << s.free_fail;
+    if (!spallocator::kPoolCountersEnabled)
+    {
+        std::cout << " (counters off; -DSPALLOCATOR_POOL_COUNTERS=1 to enable)";
+    }
+    std::cout << "\n";
 }
 
 void print_slab16_stats(std::string_view label, spallocator::Slab<16, 16>& slab)

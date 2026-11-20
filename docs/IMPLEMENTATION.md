@@ -1005,7 +1005,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 | Fixed size-class ladders | Deliberate; exact-pack buffers within classes; non-ladder shaping is backlog R2 |
 | Lock type | Hard-wired `SpinLock`; pluggable primitive is backlog R5 |
 | MSan in CI | Deferred pending host instrumented runtime |
-| Metrics API | `PoolStats` / `Pool::stats()` (alloc/free counters + HWMs); richer per-class breakdown later |
+| Metrics API | `PoolStats` / `Pool::stats()` (HWMs always; alloc/free tallies opt-in via `SPALLOCATOR_POOL_COUNTERS`); richer per-class breakdown later |
 | C API | C++ only today; C99 wrapper is backlog R4 |
 
 These are engineering follow-ons, not soft-pedaled “educational” gaps. Pool

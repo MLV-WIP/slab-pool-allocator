@@ -470,6 +470,8 @@ TEST(PoolTest, StatsTracksAllocFreeAndLiveHwm)
 {
     // Why: ops need live vs retained pressure and peak live (HWM) before hard
     // caps trip. HWM must not fall when frees drop the current live count.
+    // Tester builds with SPALLOCATOR_POOL_COUNTERS=1 so alloc_ok/free_ok move.
+    ASSERT_TRUE(kPoolCountersEnabled);
     Pool pool;
     PoolStats empty = pool.stats();
     EXPECT_EQ(empty.live_allocations, 0u);
@@ -508,6 +510,7 @@ TEST(PoolTest, StatsCountsAllocAndFreeFailures)
 {
     // Why: alloc_fail / free_fail are the alert signals for bad clients and
     // approaching/hitting policy errors (align, size cap) without scraping logs.
+    ASSERT_TRUE(kPoolCountersEnabled);
     Pool pool;
     EXPECT_THROW(pool.allocate(16, 12), std::invalid_argument); // not power of two
     EXPECT_THROW(pool.allocate(kMaxAllocationBytes + 1), std::out_of_range);
@@ -520,6 +523,21 @@ TEST(PoolTest, StatsCountsAllocAndFreeFailures)
     EXPECT_GE(s.alloc_fail, 2u);
     EXPECT_EQ(s.free_ok, 0u);
     EXPECT_GE(s.free_fail, 1u);
+}
+
+
+TEST(PoolTest, LiveHwmTracksPeakWithoutCallingStatsMidFlight)
+{
+    // Why: live_hwm uses a cheap on-alloc relaxed max (not stats()-only), so a
+    // post-churn stats() still sees the peak after live drops to zero.
+    Pool pool;
+    auto* a = pool.allocate(16);
+    auto* b = pool.allocate(32);
+    pool.deallocate(a);
+    pool.deallocate(b);
+    PoolStats s = pool.stats();
+    EXPECT_EQ(s.live_allocations, 0u);
+    EXPECT_EQ(s.live_hwm, 2u);
 }
 
 
