@@ -195,7 +195,11 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 | Deallocation | O(log n) | Address map lookup (n = Blocks in that Slab) |
 | SpinLock lock/unlock | O(1) | No contention case |
 
-**Space Overhead**: Default header is 8 bytes (`header_size = max(8, alignment)`), so ~6% for a 128-byte user request before bitset amortization. Details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#memory-layout).
+**Space Overhead**: Header width is `header_size = max(8, alignment)`. With the
+default alignment (`kDefaultAlignment` / `__STDCPP_DEFAULT_NEW_ALIGNMENT__`,
+typically 16) that is a **16-byte** header — ~12.5% for a 128-byte user request
+before bitset amortization. Explicit `allocate(N, 8)` still uses an 8-byte
+header. Details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#memory-layout).
 
 ## Requirements
 
