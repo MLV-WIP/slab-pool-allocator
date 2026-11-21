@@ -106,7 +106,9 @@ metadata behind it. The **slab** (or `SlabProxy`) only ever sees the **slot
 base**; the pool is responsible for the header protocol.
 
 ```
-Default layout (alignment ≤ 8 → header_size = 8):
+Layout when header_size = 8 (request align ≤ 8). Default allocate() uses
+kDefaultAlignment (__STDCPP_DEFAULT_NEW_ALIGNMENT__, typically 16) →
+header_size = 16 (same fields; more pad before magic).
 
   slab slot base                                                user pointer
   │                                                             │
@@ -169,9 +171,10 @@ first, then re-poisons if the peek path fails.
 
 | User N | Align | Header | Footprint | Typical class | Header / N |
 |--------|-------|--------|-----------|---------------|------------|
+| 128 | 16 (default) | 16 | 144 | 192B | 12.5% |
+| 100 | 16 (default) | 16 | 116 | 128B | 16% |
+| 16 | 16 (default) | 16 | 32 | 32B | 100% |
 | 128 | 8 | 8 | 136 | 192B | ~6% |
-| 100 | 8 | 8 | 108 | 128B | 8% |
-| 16 | 8 | 8 | 24 | 32B | 50% |
 | 64 | 64 | 64 | 128 | 128B (alignment class 64) | 100% |
 
 Tiny objects pay a higher relative header tax; that is expected. Bitset and
@@ -197,7 +200,7 @@ Alignment is both a **user contract** (`allocate`’s second argument /
 
 | Rule | Detail |
 |------|--------|
-| Default | `alignment = 8` |
+| Default | `alignment = kDefaultAlignment` (`__STDCPP_DEFAULT_NEW_ALIGNMENT__`, typically **16**) |
 | Allowed | Power of two in `[4, 64]`; else `invalid_argument` in **all** builds (including release) |
 | Header width | `header_size = max(8, alignment)` |
 | Native alignment class | `nativeAlignmentClass`: 4/8/16 → **16**; 32 → 32; 64 → 64 |
@@ -237,8 +240,8 @@ first use.
 
 | Call | Header | Footprint | Path |
 |------|--------|-----------|------|
-| `allocate(64)` | 8 | 72 | 96B class, alignment class 16 |
-| `allocate(64, 16)` | 16 | 80 | 96B class, alignment class 16 |
+| `allocate(64)` | 16 | 80 | 96B class, alignment class 16 |
+| `allocate(64, 8)` | 8 | 72 | 96B class, alignment class 16 |
 | `allocate(64, 64)` | 64 | 128 | 128B class, alignment class 64 |
 
 ### Ladder and prealloc sizing (empirical context)
@@ -265,15 +268,16 @@ then `SlabProxy` for overflow, is intentional - not a goal to match TCMalloc's
 
 | Choice | Rationale |
 |--------|-----------|
-| Alignment-class-16 rungs through **4096** | Covers small/medium count-dominated traffic for default align 8/16 |
+| Alignment-class-16 rungs through **4096** | Covers small/medium count-dominated traffic for default / native-class traffic |
 | Proxy beyond alignment-class max | Large *volume* should not force every multi-KiB size through slot freemaps |
 | Default prealloc: alignment class <=16 and `ElemSize` <= **256** | Warm cold RSS where call rate concentrates; leave 384-1024 first-touch unless raised |
 | High-align alignment classes not pre-warmed by default | High-align traffic is rare vs the mass of the size distribution |
 
-Always reason in **footprint** (user + header), not bare user size. Align-8
-`allocate(16)` lands in the **32** class (footprint 24), so the **16** rung is
-often cold for typical payloads - that is header math, not a missing research
-size.
+Always reason in **footprint** (user + header), not bare user size. Default
+`allocate(16)` lands in the **32** class (footprint 32 with a 16-byte header),
+so the **16** rung is often cold for typical payloads — that is header math,
+not a missing research size. Explicit `allocate(N, 8)` can still hit the 16B
+rung for small `N`.
 
 **Fine-tuning guidance (measure first)**
 
@@ -301,12 +305,12 @@ edits as speculative. Configure knobs above are the low-risk experiments.
 End-to-end path shows how pool and slab hand off. Locks noted are the *intent*
 of the current code; see [Thread safety](#thread-safety--lock-ordering).
 
-### Allocate — `pool.allocate(100)` (default align 8)
+### Allocate — `pool.allocate(100)` (default align, typically 16)
 
 1. **Validate (pool, unlocked):** reject `N > kMaxAllocationBytes`; require
    power-of-two align in `[4, 64]`  
-2. **Compute (pool):** `header_size = 8`, `alloc_size = 108`  
-3. **Classify (pool):** `nativeAlignmentClass(8) → 16`; class **128B** (108 > 96)  
+2. **Compute (pool):** `header_size = 16`, `alloc_size = 116`  
+3. **Classify (pool):** `nativeAlignmentClass(16) → 16`; class **128B** (116 > 96)  
 4. **Resolve backend (lock-free):** pick eager registry index for the alignment class
    (`slabs16` / `slabs32` / `slabs64`); Slabs are installed at `Pool()` and
    never replaced  
@@ -329,14 +333,14 @@ Exclusive ownership of the user pointer begins at step 6.
 Free must re-select the backend from the header rather than trusting the caller
 to pass a size: that is the point of the metadata.
 
-### Footprint → class (align 8 → +8 header)
+### Footprint → class (default align → typically +16 header)
 
 | User N | Footprint | Size class |
 |--------|-----------|------------|
-| 8 | 16 | 16 |
-| 16 | 24 | 32 |
-| 100 | 108 | 128 |
-| 128 | 136 | 192 |
+| 16 | 32 | 32 |
+| 100 | 116 | 128 |
+| 128 | 144 | 192 |
+| 8 (explicit align 8) | 16 | 16 |
 
 Always classify by **footprint**, not bare user size. Mis-estimating waste in
 tests or docs almost always means forgetting the header.
@@ -979,7 +983,7 @@ Re-measured on `PR-CMM-alignment` tip after SpinLock N1a, `SlotFreemap` (N2b),
 and P2 (`22f7439` era). Prefer `make bench BUILD_TYPE=release` and
 `make profile` with the on-demand harness; absolute ns are host-specific.
 
-**Release ratios (illustrative single run, align 8, iters 300k):**
+**Release ratios (illustrative single run, default align, iters 300k):**
 
 | Scenario | `::new` | `Pool` | `Slab<16,16>` |
 |----------|---------|--------|---------------|
@@ -1043,9 +1047,10 @@ Filters (for focused timing or profiling):
 | `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
 | `--size-mix=` | `uniform` or `class` (default **class**) | `class` = equal weight per reachable alignment-class-16 size class (exact-fit user size); better multi-slab coverage than uniform bytes |
 
-Default alignment is 8 (full comparative suite). `--align=32` and `--align=64`
-are Pool vs `::new` LIFO spot-checks for high-align alignment-class/header tax (not a full
-alignment matrix).
+Default alignment is `kDefaultAlignment` (typically 16; full comparative suite).
+`--align=8` remains available for an 8-byte-header comparison; `--align=32`
+and `--align=64` are Pool vs `::new` LIFO spot-checks for high-align
+alignment-class/header tax (not a full alignment matrix).
 
 `SlabTest.AllocFreeChurnMicrobench` remains a light GTest smoke/`RecordProperty`
 check for the slab engine; use `make bench` for comparative baselines.

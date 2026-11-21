@@ -8,7 +8,7 @@
  * (where applicable) bare Slab. Reports ns/op and ratio vs ::new.
  *
  * Usage:
- *   bench_allocators [--align=8|32|64] [--iters=N] [--threads=N]
+ *   bench_allocators [--align=8|16|32|64] [--iters=N] [--threads=N]
  *                   [--scenario=...] [--backend=...] [--help]
  */
 
@@ -83,8 +83,8 @@ inline std::size_t pool_header_size(std::size_t alignment)
 }
 
 // Exact-fit user sizes that land on each reachable native alignment-class ladder when
-// footprint = user + header. With align 8 (header 8) and user ≥ 16, class 16
-// is unreachable; classes 32..1024 are.
+// footprint = user + header. With default align 16 (header 16) and user ≥ 16,
+// class 16 is unreachable; classes 32..1024 are.
 inline std::size_t pick_user_size(std::minstd_rand& rng, SizeMix mix,
                                  std::size_t alignment)
 {
@@ -398,7 +398,7 @@ char const* backend_label(BackendId b)
 
 struct Options
 {
-    std::size_t alignment = 8;
+    std::size_t alignment = spallocator::kDefaultAlignment;
     int iters = 300000;
     int threads = 1;
     int batch = kDefaultThreadedBatch;
@@ -495,9 +495,12 @@ Options parse_args(int argc, char** argv)
     {
         opt.batch = 1;
     }
-    if (opt.alignment != 8 && opt.alignment != 32 && opt.alignment != 64)
+    if (opt.alignment != 8 && opt.alignment != 16 && opt.alignment != 32 &&
+        opt.alignment != 64)
     {
-        std::cerr << "--align must be 8 (default suite) or 32|64 (Pool vs ::new spot-check)\n";
+        std::cerr << "--align must be 8|16 (full suite; default "
+                  << spallocator::kDefaultAlignment
+                  << ") or 32|64 (Pool vs ::new spot-check)\n";
         opt.help = true;
     }
     return opt;
@@ -509,7 +512,8 @@ void print_help()
         "bench_allocators - compare allocation backends (on-demand; not a CI gate)\n"
         "\n"
         "Options:\n"
-        "  --align=8|32|64     Payload alignment (default 8). 32/64 run Pool vs ::new spot-check only.\n"
+        "  --align=8|16|32|64  Payload alignment (default kDefaultAlignment, typically 16).\n"
+        "                      8|16 run the full suite; 32|64 are Pool vs ::new spot-checks.\n"
         "  --iters=N           Timed alloc/free pairs per scenario (default release 300000)\n"
         "  --threads=N         Worker threads for multi-thread multi-size churn (default 1)\n"
         "  --batch=N           Per-thread live batch for threaded scenario (default 1024)\n"
@@ -905,7 +909,7 @@ void note_skip(std::string_view why)
     std::cout << "  skip: " << why << "\n";
 }
 
-void run_align8_suite(Options const& opt)
+void run_default_align_suite(Options const& opt)
 {
     constexpr std::size_t kSize = 16;
     // Cap bulk live-set size (pointer vector + retained slabs). Default packing
@@ -1315,7 +1319,7 @@ int main(int argc, char** argv)
     }
     else
     {
-        run_align8_suite(opt);
+        run_default_align_suite(opt);
     }
     return 0;
 }

@@ -68,6 +68,17 @@ namespace spallocator
     inline constexpr std::size_t kMinAlignment = 4;
     inline constexpr std::size_t kSlabNativeAlignment = 16;
     inline constexpr std::size_t kMaxAlignment = 64;
+
+    // Default request alignment for Pool::allocate — matches ::operator new
+    // (C++17 __STDCPP_DEFAULT_NEW_ALIGNMENT__). Prefer that macro over
+    // alignof(std::max_align_t): both are often 16, but the macro is the
+    // allocation-function guarantee rather than a scalar-type property.
+    inline constexpr std::size_t kDefaultAlignment = __STDCPP_DEFAULT_NEW_ALIGNMENT__;
+    static_assert(kDefaultAlignment >= kMinAlignment &&
+                      kDefaultAlignment <= kMaxAlignment,
+                  "kDefaultAlignment must be within Pool alignment range");
+    static_assert((kDefaultAlignment & (kDefaultAlignment - 1)) == 0,
+                  "kDefaultAlignment must be a power of two");
     inline constexpr std::size_t kSlabIndexNpos = std::numeric_limits<std::size_t>::max();
     // Written at user_ptr − 6; validated (then cleared) on deallocate.
     inline constexpr std::uint8_t kAllocMagic = 0xA7;
@@ -206,7 +217,8 @@ namespace spallocator
     class Pool
     {
     public: // methods
-        std::byte* allocate(std::size_t size, std::size_t alignment = 8);
+        std::byte* allocate(std::size_t size,
+                            std::size_t alignment = kDefaultAlignment);
 
         // Throws std::invalid_argument (or from the slab layer) on bad pointers.
         void deallocate(std::byte* item);
@@ -340,7 +352,8 @@ namespace spallocator
     }
 
 
-    std::byte* Pool::allocate(std::size_t item_size, std::size_t alignment /* = 8 */)
+    std::byte* Pool::allocate(std::size_t item_size,
+                              std::size_t alignment /* = kDefaultAlignment */)
     {
         Allocation alloc;
         alloc.size = item_size;

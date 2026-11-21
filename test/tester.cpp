@@ -795,7 +795,7 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
     Pool pool;
     const std::size_t before = pool.getAllocatedMemory();
 
-    // allocate(16) → footprint 24 → 32 B class on alignment class 16.
+    // allocate(16) → footprint 32 (default 16-byte header) → 32 B class.
     constexpr std::size_t kSlotsPerSlab = selectBlockSize<32>() / 32;
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);

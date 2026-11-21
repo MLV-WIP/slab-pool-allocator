@@ -339,7 +339,8 @@ set heap-owned: dropping those handles never `delete`s the stack object.
 ### `allocate`
 
 ```cpp
-std::byte* allocate(std::size_t size, std::size_t alignment = 8);
+std::byte* allocate(std::size_t size,
+                    std::size_t alignment = kDefaultAlignment);
 ```
 
 Reserves `size` bytes of user payload with the requested alignment and returns
@@ -348,7 +349,7 @@ a pointer to that payload (past the hidden header).
 | Parameter | Description |
 |-----------|-------------|
 | `size` | Number of bytes the caller will use. Must be `≤ kMaxAllocationBytes` (default 1 GiB). |
-| `alignment` | Required alignment of the returned pointer. Default `8`. Must be a power of two in `[kMinAlignment, kMaxAlignment]` (`4`…`64`). |
+| `alignment` | Required alignment of the returned pointer. Default `kDefaultAlignment` (`__STDCPP_DEFAULT_NEW_ALIGNMENT__`, typically **16** — same guarantee as `::operator new`). Must be a power of two in `[kMinAlignment, kMaxAlignment]` (`4`…`64`). |
 
 | | |
 |--|--|
@@ -357,7 +358,7 @@ a pointer to that payload (past the hidden header).
 | **Thread safety** | Safe for concurrent callers on the same `Pool`. |
 
 ```cpp
-std::byte* p = pool.allocate(100);        // align 8 → typically 8-byte header
+std::byte* p = pool.allocate(100);        // default align → typically 16-byte header
 std::byte* q = pool.allocate(64, 64);     // alignment-class-64 size class
 ```
 

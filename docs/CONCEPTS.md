@@ -248,13 +248,13 @@ footprint = user_size + header_size
 
 not `user_size` alone.
 
-**Example (default alignment 8 → 8-byte header):**
+**Example (default alignment → typically 16-byte header):**
 
 | User asks for | Footprint | Lands in |
 |---------------|-----------|----------|
-| 100 bytes | 108 | **128B** class (108 > 96) |
-| 128 bytes | 136 | **192B** class |
-| 16 bytes | 24 | **32B** class |
+| 100 bytes | 116 | **128B** class (116 > 96) |
+| 128 bytes | 144 | **192B** class |
+| 16 bytes | 32 | **32B** class |
 
 If you compare “100 vs 128” without the header, you mis-predict the class and
 mis-estimate waste. Always reason in footprints when studying behavior or
