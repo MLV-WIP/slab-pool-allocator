@@ -14,7 +14,7 @@ A memory **pool** (disposable / isolatable allocation domain) backed by **slabs*
 ```
 spallocator/          # header-only allocator library
 mlvlib/               # git submodule — general utils (SpinLock, LifetimeObserver, helpers)
-docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md, terminology-glossary.md
+docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md, terminology-glossary.md, design/
 test/                 # Google Test suite (tester.cpp)
 demos/                # example programs
 bench/                # on-demand allocator comparison (`make bench`)
@@ -216,6 +216,7 @@ header. Details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#memory-layout
 | **[docs/API.md](docs/API.md)** | Public API reference: contracts, thread-safety, short usage snippets (including helpers) |
 | **[docs/CONCEPTS.md](docs/CONCEPTS.md)** | Conceptual / learning-oriented guide (pools, slabs, lifetime patterns, teaching path) |
 | **[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** | Architecture, design trade-offs, and production readiness |
+| **[docs/design/slot-end-tag.md](docs/design/slot-end-tag.md)** | Planned size-class end tag + Block map (Phase 0 spec; not shipped) |
 | **[docs/terminology-glossary.md](docs/terminology-glossary.md)** | Locked Pool / Slab / Block / Slot vocabulary (Phase 1+) |
 | **[SpinLock Analysis](mlvlib/docs/deepdive/SpinLock_Analysis.md)** | SpinLock correctness and performance deep dive (linked from IMPLEMENTATION) |
 
