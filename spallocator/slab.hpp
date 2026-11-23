@@ -789,6 +789,9 @@ namespace spallocator
             keep_min = 1;
         }
 
+        // Empty-only reclaim is the epoch for planned Layout A free-vs-trim safety
+        // (freemap.none() before destroyBlockAt). Staged unpublish will erase the
+        // Pool Block map entry before delete[]. See docs/design/slot-end-tag.md.
         std::scoped_lock<SpinLock> guard(slab_lock);
 
         std::size_t reclaimed = 0;
@@ -821,6 +824,10 @@ namespace spallocator
     template<std::size_t ElemSize, std::size_t Alignment>
     void Slab<ElemSize, Alignment>::destroyBlockAt(std::size_t index)
     {
+        // Planned staged unpublish (Layout A): under slab lock mark DYING / detach,
+        // then map-exclusive erase in Pool *before* delete[] of this VA. Callers
+        // (reclaimEmptyBlocks) already require freemap.none(). See
+        // docs/design/slot-end-tag.md.
         std::byte* doomed = block_bases[index];
         base_address_map.erase(doomed);
 
@@ -855,6 +862,10 @@ namespace spallocator
                             max_blocks, block_bytes));
         }
 
+        // Planned staged publish (Layout A): append as UNPUBLISHED under slab lock,
+        // unlock, Pool map-exclusive insert, then re-lock and mark PUBLISHED before
+        // the Block is eligible for allocateItem. Today the Block is allocatable
+        // immediately (push_set). See docs/design/slot-end-tag.md.
         std::byte* new_block = new(std::align_val_t{Alignment}) std::byte[block_bytes];
         block_bases.push_back(new_block);
         base_address_map[new_block] = block_bases.size() - 1;
