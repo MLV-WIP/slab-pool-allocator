@@ -442,12 +442,6 @@ namespace spallocator
 
         try
         {
-            // Today: front-header peek → resolveSlab → deallocateItem.
-            // Planned (Layout A): block_owner_ shared lookup → unlock → end-tag/CRC
-            // → deallocateItem; else strict proxy front-header probe. Never hold the
-            // map lock across slab work. See docs/design/slot-end-tag.md and
-            // IMPLEMENTATION.md "Planned: Block map & trailer locking".
-            //
             // Metadata always lives in the 8 bytes immediately before the user
             // pointer. A prior free poisons the header; temporarily unpoison so
             // double-free / corrupt-header checks can read it without ASan abort.

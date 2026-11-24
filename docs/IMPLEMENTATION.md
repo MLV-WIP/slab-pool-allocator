@@ -9,7 +9,6 @@ engineers integrating or extending the allocator.
 | [CONCEPTS.md](CONCEPTS.md) | Learning / conceptual narrative (pool ≠ slab) |
 | [terminology-glossary.md](terminology-glossary.md) | Locked Pool → Slab → Block → Slot vocabulary |
 | This file | How the pieces are built and why |
-| [design/slot-end-tag.md](design/slot-end-tag.md) | **Planned** size-class trailer + Block map (Phase 0 spec; not shipped) |
 | [README](../README.md) | Build, test, demos |
 | [SpinLock Analysis](../mlvlib/docs/deepdive/SpinLock_Analysis.md) | Lock correctness deep dive (mlvlib) |
 
@@ -39,7 +38,6 @@ distinct while reading below. See [terminology-glossary.md](terminology-glossary
 - [Pool lifetime (ControlBlock & PoolHandle)](#pool-lifetime-controlblock--poolhandle)
 - [LifetimeObserver (design)](#lifetimeobserver-design)
 - [Thread safety & lock ordering](#thread-safety--lock-ordering)
-- [Planned: Block map & trailer locking](#planned-block-map--trailer-locking)
 - [SpinLock (design summary)](#spinlock-design-summary)
 - [Performance](#performance)
 - [Debugging & sanitizers](#debugging--sanitizers)
@@ -101,13 +99,6 @@ Background: [CONCEPTS.md](CONCEPTS.md#what-is-a-pool-and-why-use-one).
 ---
 
 ## Memory layout
-
-> **Planned change (not shipped):** size-class allocations will move to an
-> **8-byte end tag** with `user_ptr == slot_base`, plus a Pool **Block ownership
-> map** on free. `SlabProxy` keeps a front header with
-> `header_size = max(16, alignment)`. Spec:
-> [design/slot-end-tag.md](design/slot-end-tag.md). Until cutover, the front-header
-> protocol below remains authoritative.
 
 Every `Pool::allocate(N, alignment)` reserves a **header** in front of the user
 payload. The pointer returned to the caller is past that header; free reads
@@ -193,8 +184,6 @@ class waste are additional — always reason in footprints when estimating.
 
 Storing size and header width with the pointer matches `delete`, avoids
 size-mismatch bugs, and supports variable alignment without pointer tagging.
-(Pointer top-byte tagging was considered for a future layout and **rejected**;
-see [design/slot-end-tag.md](design/slot-end-tag.md#rejected-alternative-pointer-top-byte-tagging).)
 
 | Alternative | Why not (here) |
 |-------------|----------------|
@@ -855,70 +844,6 @@ canvas.
 
 ---
 
-## Planned: Block map & trailer locking
-
-**Status:** design freeze for the upcoming cutover — **not implemented yet**.
-Full layout, CRC bit packing, and dispatch:
-[design/slot-end-tag.md](design/slot-end-tag.md). Brief call-site comments in
-`pool.hpp` / `slab.hpp` point here.
-
-After cutover, concurrency gains a Pool-level **`block_owner_`** map
-(`std::map` keyed by Block base) guarded by **`std::shared_mutex`** (shared
-lookup on free; exclusive insert/erase on grow/trim). Allocate still does
-**not** use the map (`resolveSlab` only). Per-slab `SpinLock` continues to
-guard freemaps / Block vectors.
-
-### Invariants
-
-1. No live user pointer into a Block until it is **map-published** and
-   **slab-published** (eligible for `allocateItem`).
-2. Map erase only when the Block has **zero live slots** (same empty rule as
-   today’s `reclaimEmptyBlocks`), and **before** `delete[]` of that VA.
-3. Free hot path order: **map shared lock → copy `BlockEntry` → unlock →
-   validate end-tag / CRC → `deallocateItem` (slab lock)**. Never hold the map
-   lock across slab work; never take the map lock while already holding a slab
-   lock on that path.
-4. **Freemap occupancy is the epoch** that keeps a Block alive across the
-   map→slab gap for a *live* free racing trim. Generation + CRC harden stale /
-   wild pointers and VA reuse.
-
-### Staged publish (grow)
-
-```text
-[slab lock]   new[] + append; mark UNPUBLISHED (not in alloc scan)
-[unlock]
-[map exclusive]  insert {base → BlockEntry{slab, ElemSize, block_bytes, gen}}
-[unlock]
-[slab lock]   mark PUBLISHED (allocatable)
-[unlock]
-```
-
-### Staged unpublish (trim / reclaim)
-
-```text
-[slab lock]   freemap.none() (+ keep_min); mark DYING; detach from slab structures
-[unlock]
-[map exclusive]  erase(base)
-[unlock]
-delete[] VA
-```
-
-### Free vs trim (why live frees are safe)
-
-If T1’s pointer is still live, the freemap bit is set, so T2’s reclaim must not
-select that Block. After map unlock, T1 takes the slab lock and frees normally.
-If the pointer is stale, map miss / generation / CRC / “already free” fail
-closed; map erase before `delete[]` avoids tag reads into freed VA for the
-common stale path.
-
-### Locality measurement (bench-only)
-
-A planned `--scenario=chase` working-set pointer-chase harness (sysfs-auto WS
-defaults) will A/B trailer locality vs today’s front header — see the design
-note. It does not change Pool/Slab locking.
-
----
-
 ## SpinLock (design summary)
 
 `SpinLock` is provided by **mlvlib** (`mlvlib::SpinLock` in
@@ -1116,7 +1041,7 @@ Filters (for focused timing or profiling):
 
 | Flag | Values | Notes |
 |------|--------|-------|
-| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all`. `bulk` is alloc-then-free-all (grows many slab buffers). **Planned:** `chase` WS pointer-chase ([design/slot-end-tag.md](design/slot-end-tag.md#locality-ab-chase--working-set-bench-phase-0b)) |
+| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all`. `bulk` is alloc-then-free-all (grows many slab buffers) |
 | `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `pool_pmr`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk`. `pool_pmr` shows PMR virtual tax vs raw `pool` |
 | `--pool-stats` | (flag) | Opt-in `[PoolStats]` / slab retained dumps after scenarios |
 | `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
@@ -1222,21 +1147,15 @@ Roy / C++ Memory Management alignment pass on `PR-CMM-alignment`:
 
 ### Near-term / opportunistic
 
-- **Slot-end tag + Block side table** — Phase 0 spec frozen in
-  [design/slot-end-tag.md](design/slot-end-tag.md); implement registry → hard-break
-  cutover (major). Prefers `spallocator/impl/` header layout PR first.  
-- **Chase / WS-sweep bench** (`--scenario=chase`) — parallel OK; bench-only locality A/B  
 - Per-class breakdown on top of `PoolStats` (counters/HWMs already shipped)  
 - Intrusive freelist — **deferred** (P4 re-baseline; revive if scan dominates)  
-- Denser free address lookup — **deferred** (P4 re-baseline; revive if map hot at large `m`); may overlap later with collapsing per-Slab `base_address_map` into the pool Block map  
+- Denser free address lookup — **deferred** (P4 re-baseline; revive if map hot at large `m`)  
 - `ISlab` de-virt — **deferred** (P4 re-baseline)  
 - Thread-local caches; NUMA-aware buffers  
-- Lock-free / RCU Block map — **deferred** (v1 cutover uses `shared_mutex`)  
+- Lock-free fast paths / fewer per-op lock acquisitions if TAS tax remains primary  
 - Configurable SpinLock backoff parameters  
 - **C++26 language contracts** (`pre` / `post` / `contract_assert` on allocate/deallocate) — **deferred**: `-std=c++26` may already be selected while contract syntax is still unsupported on current clang; keep prose + runtime checks until a clean probe compiles under default `./configure`  
 - Destroying delete — **documented non-goal** for the generic pool; possible future type-local facade only  
-- Payload canaries / front redzones — **deferred** (optional overrun/underrun; off by default)  
-- Arena-as-first-class header — **follow-on** after trailer + `impl/` layout  
 
 ### Research / design backlog
 
