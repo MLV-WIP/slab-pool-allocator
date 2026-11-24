@@ -44,8 +44,10 @@
 
 #include <memory_resource>
 
-#include "spallocator/helper.hpp"
-#include "spallocator/slab.hpp"
+#include "spallocator/impl/helper.hpp"
+#include "spallocator/impl/islab.hpp"
+#include "spallocator/impl/slab.hpp"
+#include "spallocator/impl/slab_proxy.hpp"
 #include "spallocator/pool.hpp"
 #include "spallocator/spallocator.hpp"
 #include "spallocator/pool_pmr.hpp"

@@ -32,7 +32,7 @@
 
 #include "spallocator/pool.hpp"
 #include "spallocator/pool_pmr.hpp"
-#include "spallocator/slab.hpp"
+#include "spallocator/impl/slab.hpp"
 
 namespace {
 

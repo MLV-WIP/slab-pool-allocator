@@ -40,7 +40,9 @@
 #include <memory>
 #include <stdexcept>
 
-#include "slab.hpp"
+#include "impl/islab.hpp"
+#include "impl/slab.hpp"
+#include "impl/slab_proxy.hpp"
 #include "pool_lifetime.hpp"
 
 #if defined(__SANITIZE_ADDRESS__)
