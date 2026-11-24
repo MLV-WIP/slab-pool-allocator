@@ -151,13 +151,9 @@ behind the user pointer — do not scan neighboring memory to invent ownership):
 2. Magic equals `kAllocMagic`  
 3. Footprint in a plausible range (`header_size ≤ alloc_size ≤ kMaxAllocationBytes + max align`)  
 4. Recovered slot base is aligned to the alignment class implied by `header_size`  
-5. When `header_size ≥ 16`, optional routing hints (`block_base` + generation) are
-   passed into `deallocateItem` for an exact-base freemap path; stale or forged
-   hints fail closed  
 
-Then clear magic (and hints), re-resolve the backend, and free. Slab / proxy reject
-unknown bases and interior pointers as a second line of defense. Align-8
-(`header_size == 8`) has no hint pad and uses the address-search free path.
+Then clear magic, re-resolve the backend, and free. Slab / proxy reject
+unknown bases and interior pointers as a second line of defense.
 
 Failures:
 

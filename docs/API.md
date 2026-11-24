@@ -521,10 +521,8 @@ Polymorphic interface shared by size-class Slabs and the large-allocation proxy.
 ```cpp
 class ISlab {
 public:
-    virtual AllocateItemResult allocateItem(std::size_t size) = 0;
-    virtual void deallocateItem(std::byte* item,
-                                std::byte* block_base = nullptr,
-                                std::uint16_t block_generation = 0) = 0;
+    virtual std::byte* allocateItem(std::size_t size) = 0;
+    virtual void deallocateItem(std::byte* item) = 0;
     virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
     virtual std::size_t getAllocatedMemory() const;
     virtual ~ISlab() = default;
@@ -533,8 +531,8 @@ public:
 
 | Method | Description |
 |--------|-------------|
-| `allocateItem(size)` | Allocate an **Item**. Returns `AllocateItemResult` (`ptr`, optional `block_base` / `block_generation` for `Slab`). `ptr` is a **slot base** for `Slab` — *not* the Pool user pointer. The Pool writes its header at the base (including routing hints when `header_size ≥ 16`) and returns `base + header_size`. |
-| `deallocateItem(item, block_base=nullptr, block_generation=0)` | Free an **Item** (a **slot base** for `Slab`). When `block_base` is set (Pool free with header hints), uses an exact-base lookup and checks `block_generation`; otherwise searches by address. Rejects unknown, interior, stale-hint, or already-free addresses (`std::invalid_argument`). |
+| `allocateItem(size)` | Allocate an **Item** (backend allocation). For `Slab`, returns a **slot base** (exact Slot start inside a Block) — *not* the Pool user pointer. The Pool writes its header at the base and returns `base + header_size`. |
+| `deallocateItem(item)` | Free an **Item** previously returned by `allocateItem` (a **slot base** for `Slab`, not a user pointer). Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
 | `reclaimEmptyBlocks(keep_min)` | Drop fully empty **Blocks**; keep at least `keep_min` (default 1). Default base implementation is a no-op; `Slab` overrides. Returns how many Blocks were deleted. |
 | `getAllocatedMemory()` | Bytes retained by this Slab’s **Blocks** (default `0`). |
 
