@@ -835,7 +835,7 @@ and the directory is immutable for the pool lifetime.
 - Avoid nesting unrelated slab locks across classes unless a future API requires
   it (today’s hot path never does)  
 
-Exact sequences live in `pool.hpp` / `pool_lifetime.hpp` / `slab.hpp` — treat those as source of
+Exact sequences live in `pool.hpp` / `pool_lifetime.hpp` / `impl/slab.hpp` — treat those as source of
 truth if this summary drifts.
 
 ### Client-facing notes
@@ -860,7 +860,7 @@ canvas.
 **Status:** design freeze for the upcoming cutover — **not implemented yet**.
 Full layout, CRC bit packing, and dispatch:
 [design/slot-end-tag.md](design/slot-end-tag.md). Brief call-site comments in
-`pool.hpp` / `slab.hpp` point here.
+`pool.hpp` / `impl/slab.hpp` point here.
 
 After cutover, concurrency gains a Pool-level **`block_owner_`** map
 (`std::map` keyed by Block base) guarded by **`std::shared_mutex`** (shared

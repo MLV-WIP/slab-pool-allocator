@@ -3,8 +3,8 @@
  */
 
 #include <vector>
-#include "spallocator/helper.hpp"
-#include "spallocator/slab.hpp"
+#include "spallocator/impl/helper.hpp"
+#include "spallocator/impl/slab.hpp"
 #include "spallocator/pool.hpp"
 #include "spallocator/spallocator.hpp"
 
