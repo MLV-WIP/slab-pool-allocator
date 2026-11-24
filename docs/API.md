@@ -76,7 +76,7 @@ convenience and defines allocator-only size caps.
   mlvlib::SpinLock / helpers       (submodule; SpinLock used by Pool/Slab)
 ```
 
-**Stack:** Pool → Slab → Block → Slot. **Item** (`allocateItem` / `deallocateItem`) is the backend allocation handle at the slab layer (a **slot base** for `Slab`). For size-class Layout A the Pool’s **user pointer** is the slot base; for `SlabProxy` it is `base + header_size`.
+**Stack:** Pool → Slab → Block → Slot. **Item** (`allocateItem` / `deallocateItem`) is the backend allocation handle at the slab layer (a **slot base** for `Slab`). For size-class the Pool’s **user pointer** is the slot base; for `SlabProxy` it is `base + header_size`.
 
 `Pool` and `Slab` are separate concepts: the Pool is the disposable / isolatable
 allocation domain you construct and pass around; each Slab is a size-class
@@ -531,7 +531,7 @@ public:
 
 | Method | Description |
 |--------|-------------|
-| `allocateItem(size)` | Allocate an **Item** (backend allocation). For `Slab`, returns a **slot base** (exact Slot start inside a Block). Under Layout A the Pool’s size-class user pointer *is* that slot base (end tag at `ElemSize - 8`); proxy still returns `base + header_size`. |
+| `allocateItem(size)` | Allocate an **Item** (backend allocation). For `Slab`, returns a **slot base** (exact Slot start inside a Block). The Pool’s size-class user pointer *is* that slot base (end tag at `ElemSize - 8`); proxy still returns `base + header_size`. |
 | `deallocateItem(item)` | Free an **Item** previously returned by `allocateItem` (a **slot base** for `Slab`, not a user pointer). Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
 | `reclaimEmptyBlocks(keep_min)` | Drop fully empty **Blocks**; keep at least `keep_min` (default 1). Default base implementation is a no-op; `Slab` overrides. Returns how many Blocks were deleted. |
 | `getAllocatedMemory()` | Bytes retained by this Slab’s **Blocks** (default `0`). |

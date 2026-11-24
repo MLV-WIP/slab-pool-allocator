@@ -195,11 +195,12 @@ Intermediate sizes (48, 96, 192, 384, 768) reduce internal fragmentation. Slabs 
 | Deallocation | O(log n) | Address map lookup (n = Blocks in that Slab) |
 | SpinLock lock/unlock | O(1) | No contention case |
 
-**Space Overhead**: Header width is `header_size = max(8, alignment)`. With the
-default alignment (`kDefaultAlignment` / `__STDCPP_DEFAULT_NEW_ALIGNMENT__`,
-typically 16) that is a **16-byte** header — ~12.5% for a 128-byte user request
-before bitset amortization. Explicit `allocate(N, 8)` still uses an 8-byte
-header. Details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#memory-layout).
+**Space Overhead**: Size-class uses a fixed **8-byte** end tag
+(`footprint = N + 8`), independent of request alignment — ~6% for a 128-byte
+user request before freemap amortization. That keeps payload **data-first** on
+the aligned Slot base. Proxy (oversize) uses a front header of
+`max(16, alignment)` so free can recover size without a Block map entry.
+Details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#memory-layout).
 
 ## Requirements
 
@@ -216,15 +217,16 @@ header. Details in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#memory-layout
 | **[docs/API.md](docs/API.md)** | Public API reference: contracts, thread-safety, short usage snippets (including helpers) |
 | **[docs/CONCEPTS.md](docs/CONCEPTS.md)** | Conceptual / learning-oriented guide (pools, slabs, lifetime patterns, teaching path) |
 | **[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** | Architecture, design trade-offs, and production readiness |
-| **[docs/design/slot-end-tag.md](docs/design/slot-end-tag.md)** | Planned size-class end tag + Block map (Phase 0 spec; not shipped) |
-| **[docs/terminology-glossary.md](docs/terminology-glossary.md)** | Locked Pool / Slab / Block / Slot vocabulary (Phase 1+) |
+| **[docs/design/slot-end-tag.md](docs/design/slot-end-tag.md)** | Size-class end tag + Block map (+ proxy front header) |
+| **[docs/design/slot-end-tag-breaking-changes.md](docs/design/slot-end-tag-breaking-changes.md)** | Major-release breaking-change notes for the end-tag layout |
+| **[docs/terminology-glossary.md](docs/terminology-glossary.md)** | Locked Pool / Slab / Block / Slot vocabulary |
 | **[SpinLock Analysis](mlvlib/docs/deepdive/SpinLock_Analysis.md)** | SpinLock correctness and performance deep dive (linked from IMPLEMENTATION) |
 
 The repo-root [`IMPLEMENTATION.md`](IMPLEMENTATION.md) redirects here. Source headers also carry design comments.
 
 ## Testing
 
-The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, smart-pointer exception safety, `PoolAllocator` / STL integration, and `PoolMemoryResource` / `std::pmr`. SpinLock and LifetimeObserver tests live in mlvlib.
+The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, end-tag / proxy-header validation (including interior frees), thread safety, smart-pointer exception safety, `PoolAllocator` / STL integration, and `PoolMemoryResource` / `std::pmr`. SpinLock and LifetimeObserver tests live in mlvlib.
 
 ```bash
 make test

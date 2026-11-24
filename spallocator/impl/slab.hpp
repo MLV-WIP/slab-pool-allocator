@@ -167,8 +167,8 @@ namespace spallocator
         Slab(Slab&&) = delete;
         Slab& operator=(Slab&&) = delete;
 
-        // Staged publish (Layout A): create unpublished under slab lock, unlock
-        // for map insert when registry_ is set, then mark allocatable. See
+        // Staged publish: create unpublished under slab lock, unlock for map
+        // insert when registry_ is set, then mark allocatable. See
         // docs/design/slot-end-tag.md.
         void allocateNewBlock(std::unique_lock<SpinLock>& guard);
 
@@ -193,7 +193,7 @@ namespace spallocator
 
         std::vector<std::byte*> block_bases;
 
-        // Per-Block freemap + Layout A generation (one vector so grow/trim stay paired).
+        // Per-Block freemap + generation (one vector so grow/trim stay paired).
         // Freemap: compile-time slot count, word array. Bit set ⇒ occupied; clear ⇒ free.
         struct BlockMeta
         {
@@ -808,7 +808,7 @@ namespace spallocator
             keep_min = 1;
         }
 
-        // Empty-only reclaim is the epoch for Layout A free-vs-trim safety
+        // Empty-only reclaim is the epoch for free-vs-trim safety
         // (freemap.none() before detach). Staged unpublish: map erase before delete[].
         // See docs/design/slot-end-tag.md.
         std::unique_lock<SpinLock> guard(slab_lock);
