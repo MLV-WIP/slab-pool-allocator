@@ -279,6 +279,14 @@ Production quality and clarity are the same bar. Contributions should:
 - Add or update tests for every behavior change
 - Document design, intention, and tradeoffs
 
+Do **not** push from `main`/`master`, and do not push updates to `refs/heads/main`. Trunk advances via pull request only. This clone should use the repo hook:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-push` aborts if `HEAD` is trunk or if the push destination is trunk (including when a feature branch’s upstream is wrongly `origin/main`).
+
 ## AI Assistance Declaration
 
 README and documentation generated with AI assistance (Claude Code, Grok, Cursor, GitHub Copilot).

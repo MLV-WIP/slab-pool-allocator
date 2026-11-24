@@ -374,7 +374,7 @@ TEST(SlabTest, NextFitSurvivesReclaim)
     EXPECT_EQ(slab.reclaimEmptyBlocks(), 1u);
     EXPECT_EQ(slab.getBlockCount(), 1u);
 
-    auto* p = slab.allocateItem(16);
+    auto p = slab.allocateItem(16);
     ASSERT_NE(p, nullptr);
     slab.deallocateItem(p);
 }
@@ -458,7 +458,7 @@ TEST(SlabTest, ReclaimEmptyBlocksReturnsBuffers)
     EXPECT_EQ(slab.reclaimEmptyBlocks(), 0u);
 
     // Live allocations block reclaim of their slab.
-    auto* live = slab.allocateItem(16);
+    auto live = slab.allocateItem(16);
     items.clear();
     for (std::size_t i = 0; i < kSlotsPerSlab; ++i)
     {
@@ -952,7 +952,7 @@ TEST(SlabTest, ZeroBlockEngineGrowsOnFirstAlloc)
     EXPECT_EQ(slab.getBlockCount(), 0u);
     EXPECT_EQ(slab.getAllocatedMemory(), 0u);
 
-    auto* p = slab.allocateItem(512);
+    auto p = slab.allocateItem(512);
     ASSERT_NE(p, nullptr);
     EXPECT_EQ(slab.getBlockCount(), 1u);
     EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<512>());
@@ -1013,7 +1013,7 @@ TEST(SlabTest, AllocateItems)
     items.reserve(2 * kSlots + 1);
     for (std::size_t i = 0; i < kSlots; ++i)
     {
-        auto* p = slab.allocateItem(120);
+        auto p = slab.allocateItem(120);
         EXPECT_NE(p, nullptr);
         items.push_back(p);
     }
@@ -1087,7 +1087,7 @@ TEST(SlabProxyTest, SizeLimitsThrow)
     // Must be strictly greater than 1_KB; 1_KB itself is not a large allocation.
     EXPECT_THROW(proxy.allocateItem(1_KB), std::invalid_argument);
     EXPECT_NO_THROW({
-        auto* p = proxy.allocateItem(1_KB + 1);
+        auto p = proxy.allocateItem(1_KB + 1);
         proxy.deallocateItem(p);
     });
     EXPECT_THROW(proxy.allocateItem(kMaxAllocationBytes + 1), std::out_of_range);
@@ -1102,9 +1102,9 @@ TEST(SlabTest, Alignment)
     for (int i = 0; i < 10; ++i)
     {
         auto item = slab.allocateItem(60);
-        EXPECT_NE(item, nullptr);
-        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % 16, 0u); // 16-byte alignment
-        items.push_back(item);
+        EXPECT_NE(item.ptr, nullptr);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item.ptr) % 16, 0u); // 16-byte alignment
+        items.push_back(item.ptr);
     }
 
     for (auto it : items)
@@ -1276,6 +1276,66 @@ TEST(PoolTest, DeallocateRejectsMisalignedBase)
 
     EXPECT_FALSE(pool.try_deallocate(fake_user));
     EXPECT_THROW(pool.deallocate(fake_user), std::invalid_argument);
+}
+
+
+// Default align writes block_base + generation hints; free consumes them.
+TEST(PoolTest, HeaderRoutingHintsRoundTrip)
+{
+    Pool pool;
+    auto* p = pool.allocate(16);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(*reinterpret_cast<std::uint8_t*>(p - 5), 16);
+    const auto hint_base = *reinterpret_cast<std::uintptr_t*>(p - 16);
+    const auto hint_gen = *reinterpret_cast<std::uint16_t*>(p - 8);
+    EXPECT_NE(hint_base, 0u);
+    EXPECT_NE(hint_gen, 0);
+    EXPECT_NO_THROW(pool.deallocate(p));
+}
+
+
+TEST(PoolTest, DeallocateRejectsStaleBlockHint)
+{
+    Pool pool;
+    auto* p = pool.allocate(16);
+    ASSERT_NE(p, nullptr);
+
+    const auto good_gen = *reinterpret_cast<std::uint16_t*>(p - 8);
+    *reinterpret_cast<std::uint16_t*>(p - 8) =
+        static_cast<std::uint16_t>(good_gen + 1);
+    EXPECT_FALSE(pool.try_deallocate(p));
+
+    // Failed free restores magic + the (still corrupted) hints we passed in.
+    EXPECT_NE(*reinterpret_cast<std::uint8_t*>(p - 6), 0);
+    EXPECT_EQ(*reinterpret_cast<std::uint16_t*>(p - 8),
+              static_cast<std::uint16_t>(good_gen + 1));
+    *reinterpret_cast<std::uint16_t*>(p - 8) = good_gen;
+    EXPECT_NO_THROW(pool.deallocate(p));
+}
+
+
+TEST(PoolTest, DeallocateRejectsForgedBlockBase)
+{
+    Pool pool;
+    auto* p = pool.allocate(16);
+    ASSERT_NE(p, nullptr);
+
+    const auto good_base = *reinterpret_cast<std::uintptr_t*>(p - 16);
+    *reinterpret_cast<std::uintptr_t*>(p - 16) = good_base ^ std::uintptr_t{0x40};
+    EXPECT_FALSE(pool.try_deallocate(p));
+
+    *reinterpret_cast<std::uintptr_t*>(p - 16) = good_base;
+    EXPECT_NO_THROW(pool.deallocate(p));
+}
+
+
+TEST(PoolTest, Align8FreeWithoutRoutingHints)
+{
+    Pool pool;
+    auto* p = pool.allocate(16, 8);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(*reinterpret_cast<std::uint8_t*>(p - 5), 8);
+    EXPECT_NO_THROW(pool.deallocate(p));
 }
 
 
@@ -1818,19 +1878,63 @@ TEST(PoolTest, MultiThreadTest)
     auto worker = [&pool](std::uint32_t seed) {
         std::mt19937 gen(seed);
         std::uniform_int_distribution<int> dist(0, 1000);
-        std::vector<std::byte*> items;
-        for (int i = 0; i < allocations_per_thread; ++i)
-        {
-            size_t size = 16 + dist(gen);
-            auto item = pool.allocate(size);
-            EXPECT_NE(item, nullptr);
-            items.push_back(item);
-        }
 
-        for (auto it : items)
+        // Interleave alloc/free so threads are not all allocating then all
+        // freeing together. Same totals as before (N of each). Bias toward a
+        // mostly-full live set so contention stays comparable to fill-then-drain.
+        constexpr int N = allocations_per_thread;
+        std::vector<std::byte*> items;
+        items.reserve(static_cast<std::size_t>(N));
+
+        int allocs_done = 0;
+        int frees_done = 0;
+        const std::size_t fill_floor = static_cast<std::size_t>(N) / 2;
+        const std::size_t fill_bias = (static_cast<std::size_t>(N) * 3) / 4;
+        while (allocs_done < N || frees_done < N)
         {
-            pool.deallocate(it);
+            const bool can_alloc = allocs_done < N;
+            const bool can_free = frees_done < N && !items.empty();
+            bool do_alloc = false;
+            if (can_alloc && can_free)
+            {
+                const std::size_t live = items.size();
+                if (live < fill_floor)
+                {
+                    do_alloc = true;
+                }
+                else if (live > fill_bias)
+                {
+                    do_alloc = (gen() & 3u) == 0u;
+                }
+                else
+                {
+                    do_alloc = (gen() & 1u) != 0u;
+                }
+            }
+            else
+            {
+                do_alloc = can_alloc;
+            }
+
+            if (do_alloc)
+            {
+                size_t size = 16 + static_cast<size_t>(dist(gen));
+                auto item = pool.allocate(size);
+                EXPECT_NE(item, nullptr);
+                items.push_back(item);
+                ++allocs_done;
+            }
+            else
+            {
+                std::uniform_int_distribution<std::size_t> pick(0, items.size() - 1);
+                const std::size_t idx = pick(gen);
+                pool.deallocate(items[idx]);
+                items[idx] = items.back();
+                items.pop_back();
+                ++frees_done;
+            }
         }
+        EXPECT_TRUE(items.empty());
     };
 
     std::vector<std::thread> threads;
