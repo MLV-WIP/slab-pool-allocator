@@ -1,0 +1,21 @@
+---
+description: Slot-end-tag work stays on integration branch until final cutover to main
+alwaysApply: true
+---
+
+# Slot-end-tag integration branch
+
+All Layout A / Block-map / chase / related header-layout work for this project lands on:
+
+**`cursor/slot-end-tag-dev-dc92`** (integration / “master dev” branch)
+
+## Workflow
+
+- Cut **subbranches** from `cursor/slot-end-tag-dev-dc92` (names still `cursor/<desc>-dc92`).
+- Merge subbranches **up into** `cursor/slot-end-tag-dev-dc92` when that chunk is done.
+- **Do not merge to `main`** until the full effort is finished and Michael is confident in the result.
+- PRs targeting the integration branch are fine; PRs to `main` only for the final cutover (explicit ask).
+
+## Order reminder
+
+Prefer header-layout (`impl/` + slab split) before Block-registry code; chase bench may parallelize. Spec: `docs/design/slot-end-tag.md`.

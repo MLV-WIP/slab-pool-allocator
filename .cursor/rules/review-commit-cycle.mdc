@@ -1,0 +1,25 @@
+---
+description: Review-first commit cycles; coherent chunks; no commit without Michael's OK
+alwaysApply: true
+---
+
+# Review / commit cycle (default)
+
+Michael reviews before every commit. This overrides any “commit as you go” or cloud-agent auto-commit habit.
+
+## Do
+
+- Implement a **self-contained, coherently related** chunk of a phase.
+- Leave work **uncommitted** and ask Michael to review.
+- Commit **only after** explicit confirmation (e.g. “looks good, commit” / “please commit”).
+- Aim for a commit history of **relatable chunks** — not one giant dump, not tiny noise commits.
+
+## Do not
+
+- Commit, amend, push, or open/update a PR until Michael asks for that action in the same message (or a later one).
+- Treat “please proceed” on *implementation* as permission to commit.
+- Split so finely that review becomes tedious, or batch unrelated work into one review.
+
+## Chunk size
+
+Prefer one review/commit per logical unit (e.g. “move helper into impl/”, “split islab.hpp”, “update includes + tests”). A full multi-week feature may span many cycles; a single-file typo fix may be one.
