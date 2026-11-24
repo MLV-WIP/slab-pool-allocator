@@ -76,7 +76,7 @@ convenience and defines allocator-only size caps.
   mlvlib::SpinLock / helpers       (submodule; SpinLock used by Pool/Slab)
 ```
 
-**Stack:** Pool → Slab → Block → Slot. **Item** (`allocateItem` / `deallocateItem`) is the backend allocation handle at the slab layer (a **slot base** for `Slab`); the Pool’s **user pointer** is `slot_base + header_size`.
+**Stack:** Pool → Slab → Block → Slot. **Item** (`allocateItem` / `deallocateItem`) is the backend allocation handle at the slab layer (a **slot base** for `Slab`). For size-class Layout A the Pool’s **user pointer** is the slot base; for `SlabProxy` it is `base + header_size`.
 
 `Pool` and `Slab` are separate concepts: the Pool is the disposable / isolatable
 allocation domain you construct and pass around; each Slab is a size-class
@@ -108,15 +108,15 @@ class stores bytes.
 
 Operationally it is a thread-safe facade: you request a byte count (and optional
 alignment); the pool chooses a backend (`Slab` size class or `SlabProxy`),
-writes a small hidden header, and returns a pointer to the user payload.
+writes size-class end-tag or proxy front-header metadata, and returns a pointer
+to the user payload.
 
 **Ownership rules**
 
 - Each successful `allocate` returns a pointer you exclusively own until a
   matching free (`deallocate` / `try_deallocate`, or a smart-pointer deleter).
 - Do **not** pass pointers from another pool (or the system heap) to free, free
-  the same pointer twice, or write into the hidden bytes *before* the user
-  pointer.
+  the same pointer twice, or write into the size-class end tag / proxy header.
 - The pool is non-copyable and non-movable (it owns slab registries and locks).
 - Prefer **orderly** teardown: destroy smart pointers / containers first, then
   the pool (normal `~T()` + return slots). **Arena** teardown (destroy pool
@@ -124,8 +124,8 @@ writes a small hidden header, and returns a pointer to the user payload.
   the pool is already dead; typed `shared_ptr` still runs `~T` (prefer orderly
   for non-trivial `T`). See [Lifetime models](#lifetime-models).
 
-Routing uses **footprint** `size + header_size` where
-`header_size = max(8, alignment)`, not the bare user size. Layout details:
+Routing uses **footprint** `N + 8` for size-class (fixed trailer) or
+`N + max(16, alignment)` for proxy, not the bare user size. Layout details:
 [IMPLEMENTATION.md — Memory layout](IMPLEMENTATION.md#memory-layout).
 Why pools exist as a concept: [CONCEPTS.md — Pool](CONCEPTS.md#what-is-a-pool-and-why-use-one).
 
@@ -138,7 +138,7 @@ Why pools exist as a concept: [CONCEPTS.md — Pool](CONCEPTS.md#what-is-a-pool-
 | `kSlabNativeAlignment` | Native alignment class for request align 4/8/16 (`16`) |
 | `kLadder16` / `kLadder32` / `kLadder64` | Slot sizes available on each alignment class |
 | `kLadder*Count` | Number of entries in each ladder |
-| `kAllocMagic` | Byte written into the allocation header; checked (then cleared) on free |
+| `kAllocMagic` | Proxy front-header LIVE magic (user − 6); size-class uses `kTagMagicLive` |
 | `kSlabIndexNpos` | Sentinel from class selection meaning “use large path” |
 
 ```
@@ -531,7 +531,7 @@ public:
 
 | Method | Description |
 |--------|-------------|
-| `allocateItem(size)` | Allocate an **Item** (backend allocation). For `Slab`, returns a **slot base** (exact Slot start inside a Block) — *not* the Pool user pointer. The Pool writes its header at the base and returns `base + header_size`. |
+| `allocateItem(size)` | Allocate an **Item** (backend allocation). For `Slab`, returns a **slot base** (exact Slot start inside a Block). Under Layout A the Pool’s size-class user pointer *is* that slot base (end tag at `ElemSize - 8`); proxy still returns `base + header_size`. |
 | `deallocateItem(item)` | Free an **Item** previously returned by `allocateItem` (a **slot base** for `Slab`, not a user pointer). Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
 | `reclaimEmptyBlocks(keep_min)` | Drop fully empty **Blocks**; keep at least `keep_min` (default 1). Default base implementation is a no-op; `Slab` overrides. Returns how many Blocks were deleted. |
 | `getAllocatedMemory()` | Bytes retained by this Slab’s **Blocks** (default `0`). |

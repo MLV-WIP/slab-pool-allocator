@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -48,6 +49,7 @@
 #include "spallocator/impl/islab.hpp"
 #include "spallocator/impl/slab.hpp"
 #include "spallocator/impl/slab_proxy.hpp"
+#include "spallocator/impl/slot_tag.hpp"
 #include "spallocator/pool.hpp"
 #include "spallocator/spallocator.hpp"
 #include "spallocator/pool_pmr.hpp"
@@ -797,7 +799,7 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
     Pool pool;
     const std::size_t before = pool.getAllocatedMemory();
 
-    // allocate(16) → footprint 32 (default 16-byte header) → 32 B class.
+    // allocate(16) → footprint 24 (8 B trailer) → 32 B class.
     constexpr std::size_t kSlotsPerSlab = selectBlockSize<32>() / 32;
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
@@ -820,8 +822,7 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
 
 TEST(PoolTest, BlockOwnerMapTracksGrowAndTrim)
 {
-    // Why: Phase 1 Layout A registry must stay consistent under grow/trim while
-    // allocate/free still use the front-header protocol.
+    // Why: Layout A Block registry must stay consistent under grow/trim.
     // Default policy warms 8 alignment-class-16 engines (ElemSize ≤ 256).
     constexpr std::size_t kWarmBlocks = 8;
 
@@ -833,7 +834,7 @@ TEST(PoolTest, BlockOwnerMapTracksGrowAndTrim)
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab + 1; ++i)
     {
-        items.push_back(pool.allocate(16)); // footprint 32 → Slab<32,16>
+        items.push_back(pool.allocate(16)); // footprint 24 → Slab<32,16>
     }
     EXPECT_EQ(pool.block_owner_count(), kWarmBlocks + 1);
 
@@ -1016,11 +1017,13 @@ TEST(PoolTest, ColdRetainedMatchesPreallocatePolicy)
     // Touch a cold large alignment-class-16 class and a high-align class; both grow on demand.
     auto* large = pool.allocate(400); // footprint 408 → 512B alignment class 16
     ASSERT_NE(large, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(large) % 16, 0u);
     EXPECT_GT(pool.getAllocatedMemory(), expected);
     pool.deallocate(large);
 
     auto* hi = pool.allocate(16, 32);
     ASSERT_NE(hi, nullptr);
+    // Layout A: user ptr == slot base (32-aligned); no front pad.
     EXPECT_EQ(reinterpret_cast<std::uintptr_t>(hi) % 32, 0u);
     pool.deallocate(hi);
 }
@@ -1233,33 +1236,75 @@ TEST(PoolTest, Selector)
 }
 
 
-TEST(PoolTest, DeallocateValidatesHeader)
+TEST(PoolTest, LayoutAUserPtrIsSlotBase)
+{
+    // Why: size-class user pointers must equal the Slot base (no front header).
+    Pool pool;
+    auto* p = pool.allocate(16);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p) % 16, 0u);
+
+    // LIVE tag at end of Slab<32> slot (footprint 24 → ElemSize 32).
+    std::uint64_t tag = 0;
+    std::memcpy(&tag, p + 32 - kSlotTagBytes, kSlotTagBytes);
+    std::uint8_t magic = 0;
+    std::uint16_t gen = 0;
+    std::uint32_t crc = 0;
+    std::uint8_t format = 0;
+    unpack_slot_tag(tag, magic, gen, crc, format);
+    EXPECT_EQ(magic, kTagMagicLive);
+    EXPECT_EQ(format, kTagFormatV1);
+    EXPECT_TRUE(verify_slot_tag(p, 32, gen));
+
+    pool.deallocate(p);
+}
+
+
+TEST(PoolTest, ProxyFrontHeaderRoundTrip)
+{
+    // Why: oversize path keeps protocol C (front header ≥ 16) and is not in the map.
+    Pool pool;
+    const std::size_t before = pool.block_owner_count();
+    auto* p = pool.allocate(5000); // N+8 > 4096 → proxy
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(pool.block_owner_count(), before);
+    EXPECT_EQ(*reinterpret_cast<std::uint8_t*>(p - 6), kAllocMagic);
+    EXPECT_EQ(*reinterpret_cast<std::uint8_t*>(p - 5), 16);
+    pool.deallocate(p);
+    EXPECT_EQ(pool.block_owner_count(), before);
+}
+
+
+TEST(PoolTest, DeallocateValidatesTag)
 {
     Pool pool;
 
     auto* p = pool.allocate(64);
     ASSERT_NE(p, nullptr);
 
-    // Corrupt magic at user − 6
+    // allocate(32) → footprint 40 → Slab<48,16>; tag at slot + 40.
     auto* live = pool.allocate(32);
     ASSERT_NE(live, nullptr);
-    *(live - 6) = std::byte{0};
+    constexpr std::size_t kElem32 = 48;
+    std::memset(live + kElem32 - kSlotTagBytes, 0, kSlotTagBytes);
     EXPECT_THROW(pool.deallocate(live), std::invalid_argument);
     EXPECT_FALSE(pool.try_deallocate(live));
 
-    // Corrupt header_size at user − 5 (keep magic intact on a fresh block)
+    // Corrupt CRC only (flip high byte of tag word)
     auto* live2 = pool.allocate(32);
     ASSERT_NE(live2, nullptr);
-    *(live2 - 5) = std::byte{7};
+    auto* tag_bytes = live2 + kElem32 - kSlotTagBytes;
+    tag_bytes[4] = static_cast<std::byte>(
+        static_cast<unsigned char>(tag_bytes[4]) ^ 0xffu);
     EXPECT_THROW(pool.deallocate(live2), std::invalid_argument);
     EXPECT_FALSE(pool.try_deallocate(live2));
 
-    // Non-pool pointer
+    // Non-pool pointer (map miss + proxy probe fail)
     std::byte stack_buf[64]{};
     EXPECT_THROW(pool.deallocate(stack_buf + 16), std::invalid_argument);
     EXPECT_FALSE(pool.try_deallocate(stack_buf + 16));
 
-    // Double free at Pool layer (magic cleared on first free)
+    // Double free at Pool layer (LIVE → FREED on first free)
     pool.deallocate(p);
     EXPECT_THROW(pool.deallocate(p), std::invalid_argument);
     EXPECT_FALSE(pool.try_deallocate(p));
