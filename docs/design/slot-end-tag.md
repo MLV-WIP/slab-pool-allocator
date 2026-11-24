@@ -190,14 +190,20 @@ Size-class `ISlab` notifies Pool’s Block registry at the staged points (observ
 
 ## Locality A/B: chase / working-set bench (Phase 0b)
 
-Planned `--scenario=chase` in `bench/bench_allocators.cpp` (bench-only; no Pool hot-path changes):
+**Shipped** (bench-only; no Pool hot-path changes) as `--scenario=chase` in
+`bench/bench_allocators.cpp` (not part of `--scenario=all`):
 
-- Dependent pointer chase (`p = *p`) over rings; sweep working-set sizes.  
-- Default WS list: **sysfs / `lscpu -C` auto** when available, else fixed presets; always overridable via `--ws-bytes=`.  
-- Modes: calibrate (`new[]` buffer control), Pool spatial/random, `::new` spatial/random.  
-- Use before/after trailer cutover especially with `--align=64` (payload at offset 0).
+- Dependent pointer chase (`p = p->next`) over rings; sweep working-set sizes.  
+- Default WS list: **sysfs cache sizes** when readable, else fixed presets; override with `--ws-bytes=`.  
+- Modes: **calibrate** (one `new[]` buffer), **pool** spatial/random, **`::new`** spatial/random.  
+- Flags: `--stride=64`, `--link=spatial|random|all`, `--chase-loads=N`, `--align=16|64`.  
 
-May ship **in parallel** with header-layout / registry work.
+```bash
+make bench BUILD_TYPE=release \
+  BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'
+```
+
+Use before/after trailer cutover (especially `--align=64`, payload at offset 0).
 
 ---
 

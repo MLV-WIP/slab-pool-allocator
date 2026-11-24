@@ -1098,6 +1098,8 @@ make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
 make bench BUILD_TYPE=release BENCH_ARGS='--align=32'   # Pool vs ::new alignment-class-32 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new alignment-class-64 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
+make bench BUILD_TYPE=release \
+  BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'   # WS pointer-chase cliffs
 ```
 
 Compares `::operator new`, `spallocator::Pool`, `spallocator::PoolMemoryResource`
@@ -1116,7 +1118,7 @@ Filters (for focused timing or profiling):
 
 | Flag | Values | Notes |
 |------|--------|-------|
-| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all`. `bulk` is alloc-then-free-all (grows many slab buffers). **Planned:** `chase` WS pointer-chase ([design/slot-end-tag.md](design/slot-end-tag.md#locality-ab-chase--working-set-bench-phase-0b)) |
+| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `chase`, `all` (comma-ok) | Default `all` (**excludes** `chase`). `chase` = WS pointer-chase locality sweep ([design/slot-end-tag.md](design/slot-end-tag.md#locality-ab-chase--working-set-bench-phase-0b)) |
 | `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `pool_pmr`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk`. `pool_pmr` shows PMR virtual tax vs raw `pool` |
 | `--pool-stats` | (flag) | Opt-in `[PoolStats]` / slab retained dumps after scenarios |
 | `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
