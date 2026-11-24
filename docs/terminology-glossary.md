@@ -117,7 +117,7 @@ mlvlib itself has **no** Pool/Slab/Slot/Block storage vocabulary worth renaming 
 | Kind | Location | Examples |
 |------|----------|----------|
 | Methods | `spallocator/impl/slab.hpp` | `allocateNewBlock`, `destroyBlockAt`, `getBlockCount`, `reclaimEmptyBlocks`, `findBlockForSlot` |
-| Members | `impl/slab.hpp` | `block_bases`, `block_freemaps`, `block_available_map`, … |
+| Members | `impl/slab.hpp` | `block_bases`, `block_meta_` (freemap + generation), `block_available_map`, … |
 | Knobs | `impl/slab.hpp` / configure | `kSlabTargetBytes`, `kSlabTargetMultiplier`, `--with-slab-target-*` (these size **Blocks**, not the Slab type) |
 | Messages | `impl/slab.hpp` | growth / reclaim debug lines |
 | Tests | `test/tester.cpp` | Many `getBlockCount` / `reclaimEmptyBlocks` expectations; comments mix “data block” and count-as-slab |

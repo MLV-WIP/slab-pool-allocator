@@ -37,9 +37,12 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
+#include <shared_mutex>
 #include <stdexcept>
 
+#include "impl/block_registry.hpp"
 #include "impl/islab.hpp"
 #include "impl/slab.hpp"
 #include "impl/slab_proxy.hpp"
@@ -252,6 +255,11 @@ namespace spallocator
 
         PoolControlBlock* control() const noexcept { return control_; }
 
+        // Phase 1 Block map diagnostics (Layout A routing table). Count of
+        // registered size-class Blocks; allocate/free still use front headers.
+        std::size_t block_owner_count() const;
+        bool block_owner_contains(std::byte* block_base) const;
+
         Pool();
         ~Pool();
 
@@ -272,6 +280,8 @@ namespace spallocator
         void observe_live_hwm(std::uint64_t live) noexcept;
         void observe_retained_hwm(std::uint64_t retained_bytes) noexcept;
 
+        void install_block_registry();
+
         // Scratch for allocate's header path (not part of the public API).
         struct Allocation
         {
@@ -279,8 +289,27 @@ namespace spallocator
             std::size_t size;
         };
 
+        // Nested observer so Slabs do not need a public Pool* callback surface.
+        class Registry final : public BlockRegistry
+        {
+        public:
+            explicit Registry(Pool& pool) : pool_(pool) {}
+            void on_block_born(std::byte* base, const BlockEntry& entry) override;
+            void on_block_died(std::byte* base) override;
+
+        private:
+            Pool& pool_;
+        };
+
     private: // data members
         PoolControlBlock* control_{nullptr};
+
+        // Layout A Block ownership map (Phase 1). Declared *before* size-class
+        // Slabs so ~Slab can unregister while the map/registry are still alive.
+        // shared lookup later on free; exclusive mutate on grow/trim.
+        mutable std::shared_mutex block_map_lock_;
+        std::map<std::byte*, BlockEntry> block_owner_;
+        Registry block_registry_{*this};
 
         // Eager, immutable registries: every ladder rung is installed in
         // Pool() and never replaced/nulled. Resolve is lock-free on all alignment classes;
@@ -766,6 +795,55 @@ namespace spallocator
         slabs64[13] = makePoolSlab<8192, 64>();
         slabs64[14] = makePoolSlab<12288, 64>();
         slabs64[15] = makePoolSlab<16384, 64>();
+
+        // After all engines exist (including warm-start Blocks), install the
+        // Pool Block registry so grow/trim keep block_owner_ consistent.
+        install_block_registry();
+    }
+
+
+    inline void Pool::install_block_registry()
+    {
+        for (auto& s: slabs16)
+        {
+            s->set_block_registry(&block_registry_);
+        }
+        for (auto& s: slabs32)
+        {
+            s->set_block_registry(&block_registry_);
+        }
+        for (auto& s: slabs64)
+        {
+            s->set_block_registry(&block_registry_);
+        }
+    }
+
+
+    inline void Pool::Registry::on_block_born(std::byte* base, const BlockEntry& entry)
+    {
+        std::unique_lock lock(pool_.block_map_lock_);
+        pool_.block_owner_.insert_or_assign(base, entry);
+    }
+
+
+    inline void Pool::Registry::on_block_died(std::byte* base)
+    {
+        std::unique_lock lock(pool_.block_map_lock_);
+        pool_.block_owner_.erase(base);
+    }
+
+
+    inline std::size_t Pool::block_owner_count() const
+    {
+        std::shared_lock lock(block_map_lock_);
+        return block_owner_.size();
+    }
+
+
+    inline bool Pool::block_owner_contains(std::byte* block_base) const
+    {
+        std::shared_lock lock(block_map_lock_);
+        return block_owner_.find(block_base) != block_owner_.end();
     }
 
 
@@ -773,6 +851,7 @@ namespace spallocator
     {
         // Publish dead before member unique_ptrs tear down slabs so any later
         // control-block observer (handles / deleters) sees !alive.
+        // ~Slab unregisters Blocks from block_owner_ before delete[].
         if (control_)
         {
             control_->mark_dead();

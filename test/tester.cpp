@@ -818,6 +818,35 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
 }
 
 
+TEST(PoolTest, BlockOwnerMapTracksGrowAndTrim)
+{
+    // Why: Phase 1 Layout A registry must stay consistent under grow/trim while
+    // allocate/free still use the front-header protocol.
+    // Default policy warms 8 alignment-class-16 engines (ElemSize ≤ 256).
+    constexpr std::size_t kWarmBlocks = 8;
+
+    Pool pool;
+    EXPECT_EQ(pool.block_owner_count(), kWarmBlocks);
+
+    constexpr std::size_t kSlotsPerSlab = selectBlockSize<32>() / 32;
+    std::vector<std::byte*> items;
+    items.reserve(kSlotsPerSlab + 1);
+    for (std::size_t i = 0; i < kSlotsPerSlab + 1; ++i)
+    {
+        items.push_back(pool.allocate(16)); // footprint 32 → Slab<32,16>
+    }
+    EXPECT_EQ(pool.block_owner_count(), kWarmBlocks + 1);
+
+    for (auto* p : items)
+    {
+        pool.deallocate(p);
+    }
+    EXPECT_EQ(pool.block_owner_count(), kWarmBlocks + 1);
+    EXPECT_GE(pool.trim(), 1u);
+    EXPECT_EQ(pool.block_owner_count(), kWarmBlocks);
+}
+
+
 TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
 {
     // Why: DynBitset must stay tiny vs the old fixed bitset<max_blocks>
