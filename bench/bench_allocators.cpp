@@ -1426,8 +1426,12 @@ void run_default_align_suite(Options const& opt)
 {
     constexpr std::size_t kSize = 16;
     // Cap bulk live-set size (pointer vector + retained slabs). Default packing
-    // is 512 slots/buffer for Slab<16,16>, so counts >> 512 exercise multi-buffer.
-    const int bulk_count = std::min(opt.iters, 500000);
+    // is 512 slots/Block for Slab<16,16> (8 KiB target); Pool default-align 16B
+    // user → 32B class with 256 slots/Block. Require ≥8 Blocks of the denser
+    // (512-slot) packing so free always exercises multi-Block address lookup.
+    constexpr int kMinBulkForEightBlocks = 8 * 512; // 4096
+    const int bulk_count =
+        std::min(std::max(opt.iters, kMinBulkForEightBlocks), 500000);
     const BackendId be = opt.backends;
 
     // --- Warmed LIFO churn (16B) ---
