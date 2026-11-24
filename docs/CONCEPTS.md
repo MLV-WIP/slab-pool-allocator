@@ -31,7 +31,7 @@ to weaken them.
 - [What is a slab, and why use one?](#what-is-a-slab-and-why-use-one)
 - [How this library composes them](#how-this-library-composes-them)
 - [Size classes & fragmentation](#size-classes--fragmentation)
-- [Headers beside the payload](#headers-beside-the-payload)
+- [Metadata beside the payload](#metadata-beside-the-payload)
 - [Slots, bitsets, and growth](#slots-bitsets-and-growth)
 - [Finding a pointer’s owning Block](#finding-a-pointers-owning-block)
 - [Locking & contention](#locking--contention)
@@ -191,12 +191,12 @@ API: [API.md — Slab & SlabProxy](API.md#slab--slabproxy).
     └── SlabProxy                 ← oversized: system new[] / delete[] (no Block/Slot recycle)
 
   Item (allocateItem) = backend allocation at the slab layer (= slot base for Slab).
-  User pointer (Pool::allocate) = slot base + header.
+  User pointer (size-class) = slot base; (proxy) = base + header_size.
 ```
 
 | Concept | Role here |
 |---------|-----------|
-| **`Pool`** | Public facade: choose a backend by footprint + alignment, write the allocation header, own the set of slabs, provide `trim` / accounting, synchronize routing |
+| **`Pool`** | Public facade: choose a backend by footprint + alignment, write end-tag or proxy header metadata, own the set of slabs, provide `trim` / accounting, synchronize routing |
 | **`Slab`** | Per–size-class engine: zero or more **Blocks**, freemap bits, address map, per-slab lock, growth / reclaim |
 | **`SlabProxy`** | Same *interface* as a slab backend, different *strategy* (no Block/Slot recycling) |
 
@@ -234,30 +234,32 @@ Alignment class 64:  64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4
 
 | Term | Meaning | In this design |
 |------|---------|----------------|
-| **Internal fragmentation** | Unused bytes *inside* an allocated slot | Slot size − (user bytes + header). You “over-buy” a cell. |
+| **Internal fragmentation** | Unused bytes *inside* an allocated slot | Slot size − (user bytes + metadata tax). You “over-buy” a cell. |
 | **External fragmentation** | Free memory exists but cannot satisfy the next request | Largely avoided *within* a size class: every free Slot is the right shape for that class. Cross-class unused Blocks are a different RSS concern (`trim`). |
 
 ### Footprint, not bare user size
 
-This library’s `Pool` stores a small **header** in front of your payload (see
-next section) so free does not need a size argument. Class selection uses:
+This library’s `Pool` stores metadata with each allocation so free does not
+need a size argument. Size-class uses a fixed **8-byte end tag**; proxy uses a
+front header. Class selection uses:
 
 ```text
-footprint = user_size + header_size
+size-class footprint = user_size + 8
+proxy footprint      = user_size + max(16, alignment)
 ```
 
 not `user_size` alone.
 
-**Example (default alignment → typically 16-byte header):**
+**Example (size-class, any allowed alignment):**
 
-| User asks for | Footprint | Lands in |
-|---------------|-----------|----------|
-| 100 bytes | 116 | **128B** class (116 > 96) |
-| 128 bytes | 144 | **192B** class |
-| 16 bytes | 32 | **32B** class |
+| User asks for | Footprint | Lands in (align class 16) |
+|---------------|-----------|---------------------------|
+| 100 bytes | 108 | **128B** class (108 > 96) |
+| 128 bytes | 136 | **192B** class |
+| 16 bytes | 24 | **32B** class |
 
-If you compare “100 vs 128” without the header, you mis-predict the class and
-mis-estimate waste. Always reason in footprints when studying behavior or
+If you compare “100 vs 128” without the trailer tax, you mis-predict the class
+and mis-estimate waste. Always reason in footprints when studying behavior or
 writing tests.
 
 ### Alignment classes
@@ -297,41 +299,65 @@ Full empirical notes and knobs:
 
 ---
 
-## Headers beside the payload
+## Metadata beside the payload
 
-### The problem headers solve
+### The problem metadata solves
 
 `delete p` does not take a size. Allocators that require `deallocate(p, size)`
 invite size-mismatch bugs. Storing metadata *with* the allocation — in bytes the
 user never sees — matches the `new`/`delete` mental model: the pointer you hold
 is enough to free.
 
-In this codebase the **pool** owns that header protocol (write on allocate,
-validate on free). The **slab** returns a slot base; the pool advances the
-pointer past the header before giving it to you.
+In this codebase the **pool** owns that protocol (write on allocate, validate on
+free). Size-class and proxy choose **different** placements:
+
+| Path | Metadata | User pointer |
+|------|----------|--------------|
+| Size-class | 8-byte **end tag** at the Slot tail | Slot base (payload first) |
+| Proxy (oversize) | **Front header** before the payload | `base + header_size` |
+
+### Why end tags on size-class?
+
+- **Data-first cache lines:** hot fields at offset 0 sit on the aligned Slot
+  base, not after a front header.  
+- **Fixed 8 B tax** regardless of request alignment (32/64 no longer inflate a
+  front pad).  
+- The freemap’s Slot base **is** the pointer the caller holds.
+
+### Why a front header on proxy?
+
+- Free still needs footprint/magic without a size argument from the caller.  
+- Each proxy allocation is a standalone `new[]` — no Block freemap and no map
+  entry — so the header is how free recovers the base.  
+- Keeps the Pool Block map sized by **Blocks**, not by every large allocation.
 
 ### What “beside the payload” means
 
 ```text
-[ slot base | hidden header |.#### user payload #### ]
-              ▲               ▲
-              │               └── pointer returned to you
-              └── magic, header width, total footprint
+Size-class:
+[ #### user payload #### | 8B end tag ]
+  ▲
+  └── pointer returned to you (== slot base)
+
+Proxy:
+[ front header | #### user payload #### ]
+                 ▲
+                 └── pointer returned to you
 ```
 
-On free, the pool reads fixed offsets *behind* your pointer, validates them,
-recovers the slot base, and asks the owning slab backend to free that base (or
-`delete[]`s via `SlabProxy`).
+On free, size-class paths look up the Block map then validate the end tag;
+proxy paths (map miss) probe the front header. The pool then asks the owning
+slab backend to free the slot/base (or `delete[]`s via `SlabProxy`).
 
 ### What to remember as a user
 
-- Do not write into the bytes before the returned pointer.  
+- Do not write into the size-class end tag or the proxy front header.  
 - Do not free interior pointers (`p + 1`) — free must see a real user pointer
   from `allocate` / a factory.  
-- Header width grows with alignment (`max(8, alignment)`), which is why
-  high-align requests change footprint and sometimes alignment class.  
+- Size-class tax is a fixed 8 B trailer (alignment does not grow it); high-align
+  still selects a matching alignment-class ladder so the slot base is aligned.  
 
-Byte-level layout: [IMPLEMENTATION.md — Memory layout](IMPLEMENTATION.md#memory-layout).
+Byte-level diagrams: [IMPLEMENTATION.md — Memory layout](IMPLEMENTATION.md#memory-layout).
 
 **Teaching angle:** metadata placement is a recurring systems theme — allocator
 headers, network packet headers, and database row headers all trade a few hidden
@@ -752,9 +778,9 @@ line up with - or deliberately differ from - this codebase:
 
 **Alignment note:** Roy's academic chunked example often rounds categories to
 powers of two so contiguous slots stay aligned. This library instead uses
-explicit `Slab<ElemSize, Alignment>` alignment classes and a pool header of
-`max(8, alignment)`, so high-align traffic does not share a layout that cannot
-recover alignment class and slot base on free.
+explicit `Slab<ElemSize, Alignment>` alignment classes with size-class end tags
+(and proxy front headers), so high-align traffic keeps slot bases that satisfy
+the request alignment without sharing a native-16 layout.
 
 **Synchronization note:** allocation APIs must be thread-safe. Roy's samples
 often use `std::mutex` and warn that lock cost on free can erase gains. This

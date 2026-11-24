@@ -822,7 +822,7 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
 
 TEST(PoolTest, BlockOwnerMapTracksGrowAndTrim)
 {
-    // Why: Layout A Block registry must stay consistent under grow/trim.
+    // Why: Block registry must stay consistent under grow/trim.
     // Default policy warms 8 alignment-class-16 engines (ElemSize ≤ 256).
     constexpr std::size_t kWarmBlocks = 8;
 
@@ -1023,7 +1023,7 @@ TEST(PoolTest, ColdRetainedMatchesPreallocatePolicy)
 
     auto* hi = pool.allocate(16, 32);
     ASSERT_NE(hi, nullptr);
-    // Layout A: user ptr == slot base (32-aligned); no front pad.
+    // Size-class: user ptr == slot base (32-aligned); no front pad.
     EXPECT_EQ(reinterpret_cast<std::uintptr_t>(hi) % 32, 0u);
     pool.deallocate(hi);
 }
@@ -1238,7 +1238,7 @@ TEST(PoolTest, Selector)
 
 TEST(PoolTest, LayoutAUserPtrIsSlotBase)
 {
-    // Why: size-class user pointers must equal the Slot base (no front header).
+    // Why: size-class user pointers equal the Slot base (data-first; end tag).
     Pool pool;
     auto* p = pool.allocate(16);
     ASSERT_NE(p, nullptr);
@@ -1262,7 +1262,7 @@ TEST(PoolTest, LayoutAUserPtrIsSlotBase)
 
 TEST(PoolTest, ProxyFrontHeaderRoundTrip)
 {
-    // Why: oversize path keeps protocol C (front header ≥ 16) and is not in the map.
+    // Why: oversize path keeps a front header (≥ 16) and is not in the Block map.
     Pool pool;
     const std::size_t before = pool.block_owner_count();
     auto* p = pool.allocate(5000); // N+8 > 4096 → proxy

@@ -41,8 +41,8 @@ namespace spallocator
 
     class ISlab;
 
-    // Pool Block ownership record (Layout A free routing). Phase 1: maintained
-    // on grow/trim; allocate/free still use the front-header protocol.
+    // Pool Block ownership record for size-class free routing. Maintained on
+    // grow/trim; free looks up by user pointer (exact slot base).
     struct BlockEntry
     {
         ISlab* slab{nullptr};

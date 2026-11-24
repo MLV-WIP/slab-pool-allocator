@@ -42,7 +42,7 @@
 namespace spallocator
 {
 
-    // Size-class Layout A trailer (8 B at slot_base + ElemSize - 8).
+    // Size-class end tag (8 B at slot_base + ElemSize - 8).
     // Distinct from proxy front-header kAllocMagic.
     inline constexpr std::uint8_t kTagMagicLive = 0xA1;
     inline constexpr std::uint8_t kTagMagicFreed = 0xA0;

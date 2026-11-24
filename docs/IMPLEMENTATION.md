@@ -9,7 +9,8 @@ engineers integrating or extending the allocator.
 | [CONCEPTS.md](CONCEPTS.md) | Learning / conceptual narrative (pool ≠ slab) |
 | [terminology-glossary.md](terminology-glossary.md) | Locked Pool → Slab → Block → Slot vocabulary |
 | This file | How the pieces are built and why |
-| [design/slot-end-tag.md](design/slot-end-tag.md) | **Planned** size-class trailer + Block map (Phase 0 spec; not shipped) |
+| [design/slot-end-tag.md](design/slot-end-tag.md) | Size-class end tag + Block ownership map |
+| [design/slot-end-tag-breaking-changes.md](design/slot-end-tag-breaking-changes.md) | Major-release breaking-change draft |
 | [README](../README.md) | Build, test, demos |
 | [SpinLock Analysis](../mlvlib/docs/deepdive/SpinLock_Analysis.md) | Lock correctness deep dive (mlvlib) |
 
@@ -39,7 +40,7 @@ distinct while reading below. See [terminology-glossary.md](terminology-glossary
 - [Pool lifetime (ControlBlock & PoolHandle)](#pool-lifetime-controlblock--poolhandle)
 - [LifetimeObserver (design)](#lifetimeobserver-design)
 - [Thread safety & lock ordering](#thread-safety--lock-ordering)
-- [Planned: Block map & trailer locking](#planned-block-map--trailer-locking)
+- [Block map & end-tag locking](#block-map--end-tag-locking)
 - [SpinLock (design summary)](#spinlock-design-summary)
 - [Performance](#performance)
 - [Debugging & sanitizers](#debugging--sanitizers)
@@ -102,22 +103,94 @@ Background: [CONCEPTS.md](CONCEPTS.md#what-is-a-pool-and-why-use-one).
 
 ## Memory layout
 
-> **Layout A (cutover):** size-class allocations use an **8-byte end tag** with
-> `user_ptr == slot_base` and a Pool **Block ownership map** on free.
-> `SlabProxy` keeps a front header with `header_size = max(16, alignment)`.
-> Spec: [design/slot-end-tag.md](design/slot-end-tag.md).
+Size-class and proxy allocations use **different** metadata placements. Spec and
+locking detail: [design/slot-end-tag.md](design/slot-end-tag.md). Breaking-change
+summary: [design/slot-end-tag-breaking-changes.md](design/slot-end-tag-breaking-changes.md).
 
-### Size-class (Layout A)
+### Size-class: end tag (user pointer == slot base)
 
-Footprint `N + 8` → ladder. User pointer **is** the Slot base. Tag at
-`slot_base + ElemSize - 8` (little-endian `uint64`): magic + generation +
-CRC32C + format. Free: Block-map lookup → validate tag → `deallocateItem(p)`.
+Footprint `N + 8` selects the ladder rung. The pointer returned to the caller
+**is** the Slot base. An 8-byte little-endian tag sits at
+`slot_base + ElemSize - 8`. Free: Block-ownership map → validate tag →
+`deallocateItem(p)`.
 
-### Proxy (protocol C)
+```text
+slot base (== user pointer)                              ElemSize
+│                                                        │
+▼                                                        ▼
+┌────────────────────────────────────────────┬───────────┐
+│ user payload (N B) … optional class pad    │ end tag   │
+│                                            │ (8 B)     │
+└────────────────────────────────────────────┴───────────┘
+                                             ▲
+                                             └─ slot_base + ElemSize − 8
+```
+
+| Bytes in tag (LE `uint64`) | Field | Meaning |
+|----------------------------|-------|---------|
+| 0 | `magic` | LIVE / FREED |
+| 1–2 | `generation` | Must match the Block’s map entry |
+| 3–6 | `crc32c` | Over user_ptr ‖ elem_size ‖ generation ‖ magic |
+| 7 | `format` | `0` for the current format |
+
+### Proxy: front header (oversize / beyond ladder)
 
 `header_size = max(16, alignment)` ∈ `{16,32,64}`. Metadata sits immediately
-before the user pointer (CRC32C in the mandatory 16 B minimum). Not registered
-in the Block map. Free only after a map miss.
+**before** the user pointer. Proxy allocations are **not** in the Block map;
+free reaches this path only after a map miss.
+
+```text
+Layout when header_size = 16 (request align ≤ 16):
+
+  new[] base                                              user pointer
+  │                                                       │
+  ▼                                                       ▼
+┌──────────┬─────────┬─────────┬────────────┬──────────────────────────┐
+│ CRC32C   │ reserved│ magic   │ hdr_size   │ alloc_size │ payload (N) │
+│ (4 B)    │ (6 B)   │ (1 B)   │ (1 B)      │ (4 B)      │             │
+└──────────┴─────────┴─────────┴────────────┴────────────┴─────────────┘
+  ▲                    ▲         ▲            ▲
+  │                    │         │            └─ user_ptr − 4
+  │                    │         └─ user_ptr − 5
+  │                    └─ user_ptr − 6  (kAllocMagic; cleared on free)
+  └─ user_ptr − 16
+
+When header_size is 32 or 64, bytes [user_ptr − header_size, user_ptr − 17]
+are zero pad so the user pointer meets the requested alignment.
+```
+
+| Offset from user ptr | Type | Meaning |
+|----------------------|------|---------|
+| `−4 … −1` | `uint32_t` | Footprint `alloc_size = N + header_size` |
+| `−5` | `uint8_t` | `header_size` itself (`16`, `32`, or `64`) |
+| `−6` | `uint8_t` | `kAllocMagic`; validated then cleared on free |
+| `−12 … −7` | reserved | Zeros |
+| `−16 … −13` | `uint32_t` | CRC32C over user_ptr ‖ alloc_size ‖ header_size ‖ magic |
+| `−header_size … −17` | pad | Present when `header_size > 16` |
+
+### Why an end tag for size-class?
+
+| Reason | Detail |
+|--------|--------|
+| **Data-first cache lines** | Payload starts at the aligned Slot base. Hot fields at offset 0 sit on the natural alignment / cache-line boundary instead of after a front header. |
+| **Constant tax** | Metadata is always **8 B**, independent of request alignment — high-align (32/64) no longer inflates a front pad just to place the user pointer. |
+| **User pointer == freemap unit** | The pointer the caller holds is the Slot base the freemap already tracks; no “recover base by subtracting header_size” step on the size-class path. |
+| **Routing stays off the hot bytes** | Ownership comes from the Pool Block map; the tag is validation (magic / generation / CRC), not a miniature routing table in every Slot. |
+| **Stable high-align story** | Slot bases are already `Alignment`-aligned; returning the base satisfies `allocate(N, 64)` without shifting the payload. |
+
+Pointer top-byte tagging was considered and **rejected** (canonical VA rules,
+sanitizers, raw pointer use) — see
+[design/slot-end-tag.md](design/slot-end-tag.md#rejected-alternative-pointer-top-byte-tagging).
+
+### Why a front header for proxy?
+
+| Reason | Detail |
+|--------|--------|
+| **Free without a size argument** | Same `delete` mental model: the pointer is enough. The header stores footprint and magic so free does not need the caller to pass `N`. |
+| **No Block / Slot freemap** | Each proxy allocation is a standalone `new[]`. There is no fixed `ElemSize` and no Block map entry; the header is how free recovers the allocation base and byte count. |
+| **Keep the Block map small** | The map tracks size-class **Blocks** only (O(log Blocks)). Registering every large allocation would grow the map with live oversize traffic. |
+| **Alignment pad in front** | `header_size = max(16, align)` places the user pointer on the requested boundary while keeping a fixed metadata cluster in the last 16 bytes before the payload. |
+| **Discriminator after map miss** | Strict header validation (width ∈ {16,32,64}, magic, size, CRC) separates live proxy pointers from garbage without consulting size-class structures. |
 
 ### Division of labor
 
@@ -126,7 +199,7 @@ in the Block map. Free only after a map miss.
 | Choose class / allocate raw slot of footprint bytes | Slab or `SlabProxy` |
 | Size-class: write end tag; return slot base | Pool |
 | Proxy: write front header; return `base + header_size` | Pool |
-| On free: map → tag, else proxy header probe | Pool |
+| On free: Block map → tag, else proxy header probe | Pool |
 | Mark slot free / `delete[]` | Slab or `SlabProxy` |
 
 ### Free validation (pool)
@@ -148,29 +221,22 @@ region is **poisoned** after free and **unpoisoned** on reuse.
 
 ### Overhead intuition
 
-| User N | Align | Header | Footprint | Typical class | Header / N |
-|--------|-------|--------|-----------|---------------|------------|
-| 128 | 16 (default) | 16 | 144 | 192B | 12.5% |
-| 100 | 16 (default) | 16 | 116 | 128B | 16% |
-| 16 | 16 (default) | 16 | 32 | 32B | 100% |
-| 128 | 8 | 8 | 136 | 192B | ~6% |
-| 64 | 64 | 64 | 128 | 128B (alignment class 64) | 100% |
+| User N | Align | Metadata | Footprint | Typical class | Tax / N |
+|--------|-------|----------|-----------|---------------|---------|
+| 128 | 16 (default) | 8 (end tag) | 136 | 192B | ~6% |
+| 100 | 16 (default) | 8 | 108 | 128B | 8% |
+| 16 | 16 (default) | 8 | 24 | 32B | 50% |
+| 64 | 64 | 8 | 72 | 128B (alignment class 64) | 12.5% |
+| 5000 | 16 | 16 (proxy header) | 5016 | proxy | ~0.3% |
 
-Tiny objects pay a higher relative header tax; that is expected. Bitset and
-class waste are additional — always reason in footprints when estimating.
-
-### Design rationale
-
-Storing size and header width with the pointer matches `delete`, avoids
-size-mismatch bugs, and supports variable alignment without pointer tagging.
-(Pointer top-byte tagging was considered for a future layout and **rejected**;
-see [design/slot-end-tag.md](design/slot-end-tag.md#rejected-alternative-pointer-top-byte-tagging).)
+Tiny size-class objects still pay a higher relative tax; the tag is fixed at 8 B.
+Bitset and class waste are additional — always reason in footprints when estimating.
 
 | Alternative | Why not (here) |
 |-------------|----------------|
 | Size argument on free | Easy to pass wrong size; diverges from `delete` |
 | Pointer tagging | Steals bits; fights high alignment and sanitizers |
-| Side size table | Extra indirection and lifetime coupling |
+| Side size table per allocation | Extra indirection and lifetime coupling |
 
 ---
 
@@ -183,7 +249,8 @@ Alignment is both a **user contract** (`allocate`’s second argument /
 |------|--------|
 | Default | `alignment = kDefaultAlignment` (`__STDCPP_DEFAULT_NEW_ALIGNMENT__`, typically **16**) |
 | Allowed | Power of two in `[4, 64]`; else `invalid_argument` in **all** builds (including release) |
-| Header width | `header_size = max(8, alignment)` |
+| Size-class tax | Fixed **8 B** trailer (`N + 8`); user ptr == slot base |
+| Proxy header | `header_size = max(16, alignment)` ∈ `{16,32,64}` |
 | Native alignment class | `nativeAlignmentClass`: 4/8/16 → **16**; 32 → 32; 64 → 64 |
 | Storage | `Slab<ElemSize, Alignment>` per alignment ladder |
 | High-align ladders | 32/64 engines installed eagerly; Blocks may map on first use |
@@ -191,19 +258,17 @@ Alignment is both a **user contract** (`allocate`’s second argument /
 | Factories | `static_assert(alignof(T) ≤ 64)` |
 
 Non-power-of-two values in range (for example 12) are rejected even in release:
-header/alignment-class math assumes power-of-two alignment.
+alignment-class math assumes power-of-two alignment.
 
 ### Why compound keys?
 
-High-align requests must not share a native-16 slot layout with a narrower
-header story. If a 64-align object lived in an alignment-class-16 128B slot with only an
-8-byte header, free could not recover a consistent alignment class from `header_size`, and
-slot bases would not guarantee the user’s alignment. Separate
-`Slab<ElemSize, Alignment>` specializations keep:
+High-align requests must not share a native-16 slot layout: slot bases must
+guarantee the user’s alignment, and `ElemSize` must be a multiple of the
+alignment class. Separate `Slab<ElemSize, Alignment>` specializations keep:
 
 - slot stride = `ElemSize` (multiple of `Alignment`)  
 - freemap bit ↔ exact slot base  
-- `header_size` recoverable as 8/16/32/64 and mapped back to an alignment class  
+- Block map + end tag (not a front header) for size-class free routing  
 
 ### Alignment ladders
 
@@ -826,16 +891,14 @@ canvas.
 
 ---
 
-## Block map & trailer locking
-
-**Status:** Layout A cutover is on the integration tree (registry + trailer +
-proxy dispatch). See [design/slot-end-tag.md](design/slot-end-tag.md).
+## Block map & end-tag locking
 
 Concurrency: Pool-level **`block_owner_`** map (`std::map` keyed by Block base)
 guarded by **`std::shared_mutex`** (shared lookup on free; exclusive
 insert/erase on grow/trim via `BlockRegistry`). Allocate resolves via
 `resolveSlab` only (map used after allocate to read generation/ElemSize for the
 tag). Per-slab `SpinLock` continues to guard freemaps / Block vectors.
+See [design/slot-end-tag.md](design/slot-end-tag.md).
 
 ### Invariants
 
@@ -884,7 +947,7 @@ common stale path.
 
 `--scenario=chase` is a working-set pointer-chase harness (sysfs-auto WS
 defaults). It does not change Pool/Slab locking. Post-cutover sample numbers
-and how to re-run: [Benchmarks — Chase](#chase-ws-pointer-chase-post-cutover).
+and how to re-run: [Benchmarks — Chase](#chase--ws-pointer-chase).
 
 ---
 
@@ -1071,12 +1134,12 @@ make bench BUILD_TYPE=release \
   BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'   # WS pointer-chase cliffs
 ```
 
-#### Chase / WS pointer-chase (post-cutover)
+#### Chase / WS pointer-chase
 
-Layout A puts the size-class payload at the Slot base (no front pad), so
-`--align=64` chase is the interesting A/B vs `::new`. Opt-in scenario (not in
-`all`). Absolute ns are host-specific; ratios on one quiet run matter more than
-cross-machine copies.
+Size-class payload starts at the Slot base (no front pad), so `--align=64`
+chase is the interesting comparison vs `::new` for data-first locality. Opt-in
+scenario (not in `all`). Absolute ns are host-specific; ratios on one quiet run
+matter more than cross-machine copies.
 
 **Host sample** (America/Los_Angeles, 2026-11-23): 8× cores, L1d=32K / L2=256K /
 L3=25M (sysfs WS auto), `clang 20.1.2`, `BUILD_TYPE=release`, stride=64,
@@ -1096,9 +1159,9 @@ L3=25M (sysfs WS auto), `clang 20.1.2`, `BUILD_TYPE=release`, stride=64,
 **How to read:** plateaus ≈ L1/L2/L3/DRAM; knees mark capacity. Spatial keeps
 alloc-order rings (Pool Blocks stay contiguous longer); random shuffles links.
 At `--align=64` mid-WS, Pool spatial/random often beat scattered `::new` once
-working sets leave L2 — consistent with trailer layout (payload at offset 0 on
-an aligned Slot). Tiny WS noise and DRAM-random floors are expected to look
-similar across backends.
+working sets leave L2 — consistent with payload at offset 0 on an aligned Slot.
+Tiny WS noise and DRAM-random floors are expected to look similar across
+backends.
 
 Re-run after further layout changes:
 
@@ -1229,10 +1292,12 @@ Roy / C++ Memory Management alignment pass on `PR-CMM-alignment`:
 
 ### Near-term / opportunistic
 
-- **Slot-end tag + Block side table** — Phase 0 spec frozen in
-  [design/slot-end-tag.md](design/slot-end-tag.md); implement registry → hard-break
-  cutover (major). Prefers `spallocator/impl/` header layout PR first.  
-- **Chase / WS-sweep bench** (`--scenario=chase`) — parallel OK; bench-only locality A/B  
+- **Slot-end tag + Block side table** — implemented; major notes draft
+  [design/slot-end-tag-breaking-changes.md](design/slot-end-tag-breaking-changes.md);
+  land on `main` when ready.  
+- **Chase / WS-sweep bench** (`--scenario=chase`) — shipped; sample in
+  [Chase](#chase-ws-pointer-chase)  
+
 - Per-class breakdown on top of `PoolStats` (counters/HWMs already shipped)  
 - Intrusive freelist — **deferred** (P4 re-baseline; revive if scan dominates)  
 - Denser free address lookup — **deferred** (P4 re-baseline; revive if map hot at large `m`); may overlap later with collapsing per-Slab `base_address_map` into the pool Block map  

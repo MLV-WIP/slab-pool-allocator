@@ -71,7 +71,7 @@ namespace spallocator
     // - Request aligns 4/8 map to native alignment class 16 (slot over-align is fine)
     // - Alignment classes 16 / 32 / 64 use Slab<ElemSize, Alignment> size ladders
     // - Beyond that alignment class's max footprint → SlabProxy (always align_val_t{64})
-    // - Size-class: user ptr == slot base; 8 B end tag (Layout A). Proxy: front header.
+    // - Size-class: user ptr == slot base; 8 B end tag. Proxy: front header.
     // - Returned memory is exclusively owned until matching deallocate;
     //   do not free non-pool pointers or mutate the end tag / front header
     inline constexpr std::size_t kMinAlignment = 4;
@@ -259,7 +259,7 @@ namespace spallocator
 
         PoolControlBlock* control() const noexcept { return control_; }
 
-        // Block map diagnostics (Layout A routing table).
+        // Block map diagnostics (size-class free routing table).
         std::size_t block_owner_count() const;
         bool block_owner_contains(std::byte* block_base) const;
 
@@ -311,8 +311,8 @@ namespace spallocator
     private: // data members
         PoolControlBlock* control_{nullptr};
 
-        // Layout A Block ownership map. Declared *before* size-class Slabs so
-        // ~Slab can unregister while the map/registry are still alive.
+        // Block ownership map for size-class free routing. Declared *before*
+        // size-class Slabs so ~Slab can unregister while map/registry live.
         // Shared lookup on free; exclusive mutate on grow/trim.
         mutable std::shared_mutex block_map_lock_;
         std::map<std::byte*, BlockEntry> block_owner_;
@@ -412,7 +412,7 @@ namespace spallocator
 
         const std::size_t alignment_class = nativeAlignmentClass(alignment);
 
-        // Size-class: fixed 8 B trailer (Layout A). Proxy: front header
+        // Size-class: fixed 8 B end tag. Proxy: front header
         // header_size = max(16, alignment) ∈ {16,32,64}.
         const bool use_proxy =
             selectClassIndex(item_size + kSizeClassTrailerTax, alignment_class) ==
@@ -448,7 +448,7 @@ namespace spallocator
 
         if (slab == &large_slab)
         {
-            // Protocol C: front header immediately before user pointer.
+            // Proxy: front header immediately before user pointer.
             std::byte* base = alloc.ptr;
             std::byte* user = base + header_size;
 #if defined(SPALLOCATOR_HAS_ASAN)
@@ -472,7 +472,7 @@ namespace spallocator
             return user;
         }
 
-        // Layout A: user pointer == slot base; tag at ElemSize - 8.
+        // Size-class: user pointer == slot base; tag at ElemSize - 8.
         std::byte* slot = alloc.ptr;
         std::optional<BlockEntry> entry = find_block_owner(slot);
         if (!entry || entry->slab != slab)
@@ -521,7 +521,7 @@ namespace spallocator
 
         try
         {
-            // Layout A free: map shared lookup → unlock → tag/CRC → slab.
+            // Size-class free: map shared lookup → unlock → tag/CRC → slab.
             // Else strict proxy front-header probe. Never hold the map lock
             // across slab work. See docs/design/slot-end-tag.md.
             if (std::optional<BlockEntry> entry = find_block_owner(item))

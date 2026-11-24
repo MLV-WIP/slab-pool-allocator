@@ -1,49 +1,64 @@
-# Design: size-class slot-end tags + Block side table (Layout A)
+# Design: size-class end tags + Block ownership map
 
-**Status:** Layout A cutover implemented on the slot-end-tag integration branch
-(size-class trailer + Block map free + proxy front header ≥ 16 + CRC32C).  
-**Version impact:** cutover is a **major** release (layout / free-protocol break).  
-**Cutover style:** single hard-break branch (no long-lived dual path in production).
+**Status:** implemented (size-class end tag + Block map free + proxy front header
+≥ 16 + CRC32C).  
+**Version impact:** **major** release (layout / free-protocol break).
 
-Related implementation narrative: [IMPLEMENTATION.md](../IMPLEMENTATION.md) (current layout today; planned locking below and in *Planned: Block map & trailer*).  
-Internal planning notes (agent store) informed this freeze; **this file is the in-repo source of truth** going forward.
+Related: [IMPLEMENTATION.md — Memory layout](../IMPLEMENTATION.md#memory-layout)
+(byte diagrams + rationale),
+[slot-end-tag-breaking-changes.md](slot-end-tag-breaking-changes.md).
 
 ---
 
 ## Goals
 
 1. Size-class **user pointer == slot base** (payload starts at the aligned Slot).  
-2. Constant **8-byte trailer tax** (`N+8` footprint), independent of request alignment.  
+2. Constant **8-byte end-tag tax** (`N+8` footprint), independent of request alignment.  
 3. Pool-level **Block ownership map** for free routing (O(log Blocks)), not per-alloc side tables.  
-4. **Proxy** keeps a **front header** (protocol C), not registered in the Block map.  
+4. **Proxy** keeps a **front header**, not registered in the Block map.  
 5. Integrity via **generation + CRC32C** (not pointer top-byte tagging).
 
-## Non-goals (v1 cutover)
+### Why end tags (size-class)?
+
+- **Data-first cache lines** — hot fields at offset 0 sit on the aligned Slot base.  
+- **Fixed 8 B tax** — alignment 32/64 no longer inflates a front pad.  
+- **User pointer == freemap unit** — no subtract-header step on free.  
+- **Routing off the hot path** — Block map owns ownership; tag is validation only.
+
+### Why a front header (proxy)?
+
+- **Free without a size argument** — footprint lives in the header.  
+- **No Block/Slot freemap** — each oversize alloc is standalone `new[]`.  
+- **Keep the Block map small** — map tracks Blocks, not every large allocation.  
+- **Alignment pad in front** — `header_size = max(16, align)` places the user pointer.
+
+Full tables: [IMPLEMENTATION — Memory layout](../IMPLEMENTATION.md#memory-layout).
+
+## Non-goals (this major)
 
 - Pointer tagging / top-byte metadata in the user pointer (**explored and rejected** — non-portable canonical VA rules; sanitizer/hostile to raw pointer use).  
 - Payload canaries / `N` in the tag; front redzones / underrun pads (deferred, off by default).  
 - Merging `SlabProxy` allocations into the Block map.  
-- Collapsing per-Slab `base_address_map` into the pool map (measure after map exists).  
+- Collapsing per-Slab `base_address_map` into the pool map (measure first).  
 - RCU / lock-free Block map (deferred; v1 uses `shared_mutex`).  
-- Arena-as-first-class header; Pool file split beyond what Phase 1 needs.
 
 ---
 
-## Locked decisions
+## Decisions
 
 | Topic | Choice |
 |-------|--------|
-| Size-class metadata | 8B tag at `slot_base + ElemSize - 8` (Layout **A**, validation-only) |
+| Size-class metadata | 8B tag at `slot_base + ElemSize - 8` (validation-only) |
 | User pointer (size-class) | `==` slot base |
 | Footprint | `N + 8` → `resolveSlab` / ladder |
 | Routing on free | `std::map<std::byte*, BlockEntry>` of **Blocks only**; `upper_bound` + predecessor + range check |
-| Tag | Magic + generation + CRC32C + format nibble; **not** used to pick Slab |
-| Generation | In tag **and** `BlockEntry` in v1 (VA reuse after trim) |
-| Proxy | Front header (**C**); **`header_size = max(16, alignment)`** (never 8) |
+| Tag | Magic + generation + CRC32C + format; **not** used to pick Slab |
+| Generation | In tag **and** `BlockEntry` (VA reuse after trim) |
+| Proxy | Front header; **`header_size = max(16, alignment)`** (never 8) |
 | Free dispatch | Block-map hit → size-class path; else strict proxy-header probe; else fail |
 | Map lock | `std::shared_mutex`: shared lookup, exclusive insert/erase |
 | Publish | **Staged** grow/unpublish (see locking) |
-| Observer | Pool installs registry/observer on size-class `ISlab` (API shape revisited at implement) |
+| Observer | Pool installs `BlockRegistry` on size-class `ISlab` |
 
 ### Ladder reminder
 
@@ -52,17 +67,18 @@ Example (alignment class 16): `N=16` → 24 → `Slab<32,16>`.
 
 ---
 
-## Current vs planned behavior
+## Behavior change (vs previous front-header size-class)
 
-| | **Today (shipped)** | **After cutover** |
-|--|---------------------|-------------------|
+| | **Previous** | **Current** |
+|--|-------------------|-------------|
 | Size-class user ptr | `slot_base + header_size` | `slot_base` |
-| Size-class tax | `header_size = max(8, align)` | Fixed **8B trailer** |
+| Size-class tax | `header_size = max(8, align)` | Fixed **8B end tag** |
 | Size-class free | Peek front header → `resolveSlab` | Block map → tag/CRC → `deallocateItem` |
 | Proxy header | `max(8, align)` (8 allowed) | `max(16, align)` only `{16,32,64}` |
 | High align (32/64) | Large front pad so user ptr aligns | No front pad on size-class; slot base is aligned |
 
-Anything that peeked **before** the size-class user pointer is broken by cutover (call out in major release notes).
+Anything that peeked **before** the size-class user pointer is broken (see
+[breaking-changes](slot-end-tag-breaking-changes.md)).
 
 ---
 
@@ -93,10 +109,10 @@ Stored as a little-endian `uint64_t` at `slot_base + ElemSize - 8`:
 
 | Bits | Field | Notes |
 |------|-------|-------|
-| 0..7 | `magic` | LIVE / FREED constants (distinct from today’s `kAllocMagic` or shared — pick at implement; document in cutover) |
+| 0..7 | `magic` | LIVE (`0xA1`) / FREED (`0xA0`); distinct from proxy `kAllocMagic` |
 | 8..23 | `generation` | Must equal `BlockEntry.generation` |
 | 24..55 | `crc32c` | See coverage |
-| 56..63 | `format` | `0` for v1 |
+| 56..63 | `format` | `0` for the current format |
 
 ### CRC32C coverage (size-class)
 
@@ -107,17 +123,21 @@ CRC over this **little-endian byte concatenation** (19 bytes):
 3. `uint16_t` `generation`  
 4. `uint8_t` `magic`  
 
-Computed on allocate; verified on free **after** map copy supplies `elem_size` / `generation` (do not trust tag alone for those fields when checking CRC — use map entry + tag magic/gen for the pack).
+Computed on allocate; verified on free **after** map copy supplies `elem_size` /
+`generation` (do not trust tag alone for those fields when checking CRC — use
+map entry + tag magic/gen for the pack).
 
-Algorithm: **CRC32C** (Castagnoli); use HW intrinsics when available, software fallback otherwise. Not a cryptographic MAC.
+Algorithm: **CRC32C** (Castagnoli); HW intrinsics when available, software
+fallback otherwise. Not a cryptographic MAC.
 
 ---
 
-## Proxy front header (protocol C)
+## Proxy front header
 
 `header_size = max(16, alignment)` ∈ `{16, 32, 64}`.
 
-Metadata cluster remains immediately before the user pointer; CRC occupies four bytes in the mandatory 16B minimum pad:
+Metadata cluster remains immediately before the user pointer; CRC occupies four
+bytes in the mandatory 16B minimum pad:
 
 ```text
 user_ptr - header_size .. user_ptr - 17 : alignment pad (when header_size > 16); zeros
@@ -139,7 +159,7 @@ LE concat:
 
 ---
 
-## Free dispatch (planned)
+## Free dispatch
 
 ```text
 1. Block-map shared lookup → copy BlockEntry → unlock
@@ -152,7 +172,7 @@ LE concat:
 
 ## Locking & staged publish / unpublish
 
-See also [IMPLEMENTATION — Planned Block map locking](../IMPLEMENTATION.md#planned-block-map--trailer-locking).
+See also [IMPLEMENTATION — Block map locking](../IMPLEMENTATION.md#block-map--end-tag-locking).
 
 ### Invariants
 
@@ -185,14 +205,15 @@ delete[] VA
 
 ### Notification
 
-Size-class `ISlab` notifies Pool’s Block registry at the staged points (observer / registry pointer installed at Slab construction). Exact virtual surface revisited at Phase 1 implement time.
+Size-class `ISlab` notifies Pool’s Block registry at the staged points
+(`set_block_registry` / `on_block_born` / `on_block_died`).
 
 ---
 
-## Locality A/B: chase / working-set bench (Phase 0b)
+## Locality: chase / working-set bench
 
-**Shipped** (bench-only; no Pool hot-path changes) as `--scenario=chase` in
-`bench/bench_allocators.cpp` (not part of `--scenario=all`):
+**Shipped** (bench-only) as `--scenario=chase` in `bench/bench_allocators.cpp`
+(not part of `--scenario=all`):
 
 - Dependent pointer chase (`p = p->next`) over rings; sweep working-set sizes.  
 - Default WS list: **sysfs cache sizes** when readable, else fixed presets; override with `--ws-bytes=`.  
@@ -204,20 +225,9 @@ make bench BUILD_TYPE=release \
   BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'
 ```
 
-Post-cutover sample table and reading notes:
-[IMPLEMENTATION.md — Chase](../IMPLEMENTATION.md#chase-ws-pointer-chase-post-cutover)
+Sample table and reading notes:
+[IMPLEMENTATION.md — Chase](../IMPLEMENTATION.md#chase--ws-pointer-chase)
 (especially `--align=64`, payload at offset 0).
-
----
-
-## Suggested implementation order
-
-1. Header layout PR (`spallocator/impl/`, slab split) — **done**  
-2. This spec + IMPLEMENTATION locking (Phase 0) — **done**  
-3. Chase bench baseline (0b) — **done**  
-4. Block registry + staged publish — **done**  
-5. Hard-break cutover: trailer + proxy `header_size≥16` + CRC + dispatch — **done**  
-6. Re-measure chase — sample on integration tree (see IMPLEMENTATION chase section)
 
 ---
 
