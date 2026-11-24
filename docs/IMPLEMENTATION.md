@@ -102,62 +102,37 @@ Background: [CONCEPTS.md](CONCEPTS.md#what-is-a-pool-and-why-use-one).
 
 ## Memory layout
 
-> **Planned change (not shipped):** size-class allocations will move to an
-> **8-byte end tag** with `user_ptr == slot_base`, plus a Pool **Block ownership
-> map** on free. `SlabProxy` keeps a front header with
-> `header_size = max(16, alignment)`. Spec:
-> [design/slot-end-tag.md](design/slot-end-tag.md). Until cutover, the front-header
-> protocol below remains authoritative.
+> **Layout A (cutover):** size-class allocations use an **8-byte end tag** with
+> `user_ptr == slot_base` and a Pool **Block ownership map** on free.
+> `SlabProxy` keeps a front header with `header_size = max(16, alignment)`.
+> Spec: [design/slot-end-tag.md](design/slot-end-tag.md).
 
-Every `Pool::allocate(N, alignment)` reserves a **header** in front of the user
-payload. The pointer returned to the caller is past that header; free reads
-metadata behind it. The **slab** (or `SlabProxy`) only ever sees the **slot
-base**; the pool is responsible for the header protocol.
+### Size-class (Layout A)
 
-```
-Layout when header_size = 8 (request align ≤ 8). Default allocate() uses
-kDefaultAlignment (__STDCPP_DEFAULT_NEW_ALIGNMENT__, typically 16) →
-header_size = 16 (same fields; more pad before magic).
+Footprint `N + 8` → ladder. User pointer **is** the Slot base. Tag at
+`slot_base + ElemSize - 8` (little-endian `uint64`): magic + generation +
+CRC32C + format. Free: Block-map lookup → validate tag → `deallocateItem(p)`.
 
-  slab slot base                                                user pointer
-  │                                                             │
-  ▼                                                             ▼
-┌──────────┬─────────┬────────────────┬────────────────┬──────────────────┐
-│ pad      │ magic   │ header_size    │ alloc_size     │ payload (N B)    │
-│          │ (1 B)   │ (1 byte)       │ (uint32 / 4 B) │                  │
-└──────────┴─────────┴────────────────┴────────────────┴──────────────────┘
-             ▲         ▲                ▲
-             │         │                └─ user_ptr − 4
-             │         └─ user_ptr − 5
-             └─ user_ptr − 6  (kAllocMagic; cleared on free)
-```
+### Proxy (protocol C)
 
-| Offset from user ptr | Type | Meaning |
-|----------------------|------|---------|
-| `−4 … −1` | `uint32_t` | Footprint `alloc_size = N + header_size` (selects backend on free) |
-| `−5` | `uint8_t` | `header_size` itself; must be 8, 16, 32, or 64 |
-| `−6` | `uint8_t` | `kAllocMagic`; validated then cleared on free |
-| `−header_size … −7` | padding | Remaining bytes so the user pointer meets `alignment` |
+`header_size = max(16, alignment)` ∈ `{16,32,64}`. Metadata sits immediately
+before the user pointer (CRC32C in the mandatory 16 B minimum). Not registered
+in the Block map. Free only after a map miss.
 
 ### Division of labor
 
 | Step | Actor |
 |------|--------|
-| Choose class / allocate raw slot of `alloc_size` bytes | Slab or `SlabProxy` |
-| Write magic, `header_size`, `alloc_size`; return `base + header_size` | Pool |
-| On free: validate header, recover `base`, clear magic | Pool |
+| Choose class / allocate raw slot of footprint bytes | Slab or `SlabProxy` |
+| Size-class: write end tag; return slot base | Pool |
+| Proxy: write front header; return `base + header_size` | Pool |
+| On free: map → tag, else proxy header probe | Pool |
 | Mark slot free / `delete[]` | Slab or `SlabProxy` |
-
-The slab never interprets the header. That keeps storage backends simple and
-puts all “pointer looks like a pool allocation” policy in one place.
 
 ### Free validation (pool)
 
-Before trusting the header:
-
-1. `header_size ∈ {8,16,32,64}`  
-2. Magic equals `kAllocMagic`  
-3. Footprint in a plausible range (`header_size ≤ alloc_size ≤ kMaxAllocationBytes + max align`)  
+**Size-class:** map hit, exact slot base, LIVE magic, generation match, CRC32C.  
+**Proxy:** `header_size ∈ {16,32,64}`, `kAllocMagic`, size range, CRC32C.
 
 Failures:
 
@@ -167,14 +142,9 @@ Failures:
 | `Pool::try_deallocate` | Returns `false` (including after failed slab free) |
 | `PoolDeleter` / `PoolAllocator::deallocate` | `noexcept` → **`std::abort()`** on failure |
 
-Clearing magic on a successful free turns a second free of the same user
-pointer into a magic mismatch (double-free detection at the pool layer). Slab
-interior-pointer checks remain a second line of defense.
-
-Under AddressSanitizer the header region is **poisoned** after free and
-**unpoisoned** when the slot is reused. Free briefly unpoisons a fixed peek
-window so double-free / corrupt-header checks can run without ASan aborting
-first, then re-poisons if the peek path fails.
+Clearing the LIVE tag (→ FREED) / proxy magic on a successful free turns a
+second free into a validation failure. Under AddressSanitizer the tag / header
+region is **poisoned** after free and **unpoisoned** on reuse.
 
 ### Overhead intuition
 
@@ -856,19 +826,16 @@ canvas.
 
 ---
 
-## Planned: Block map & trailer locking
+## Block map & trailer locking
 
-**Status:** Phase 1 **Block registry + staged publish/unpublish** is on the
-integration tree (allocate/free still use today’s front-header protocol). Full
-trailer cutover, CRC, and free dispatch remain ahead — see
-[design/slot-end-tag.md](design/slot-end-tag.md).
+**Status:** Layout A cutover is on the integration tree (registry + trailer +
+proxy dispatch). See [design/slot-end-tag.md](design/slot-end-tag.md).
 
 Concurrency: Pool-level **`block_owner_`** map (`std::map` keyed by Block base)
-guarded by **`std::shared_mutex`** (shared lookup later on free; exclusive
-insert/erase on grow/trim via `BlockRegistry`). Allocate still does **not** use
-the map (`resolveSlab` only). Per-slab `SpinLock` continues to guard freemaps /
-Block vectors. Size-class `Slab` installs the registry after Pool construction
-and registers warm-start Blocks.
+guarded by **`std::shared_mutex`** (shared lookup on free; exclusive
+insert/erase on grow/trim via `BlockRegistry`). Allocate resolves via
+`resolveSlab` only (map used after allocate to read generation/ElemSize for the
+tag). Per-slab `SpinLock` continues to guard freemaps / Block vectors.
 
 ### Invariants
 

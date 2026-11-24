@@ -1,6 +1,7 @@
 # Design: size-class slot-end tags + Block side table (Layout A)
 
-**Status:** Phase 0 spec freeze (docs only). Runtime still uses today’s **front-header** protocol for all paths.  
+**Status:** Layout A cutover implemented on the slot-end-tag integration branch
+(size-class trailer + Block map free + proxy front header ≥ 16 + CRC32C).  
 **Version impact:** cutover is a **major** release (layout / free-protocol break).  
 **Cutover style:** single hard-break branch (no long-lived dual path in production).
 

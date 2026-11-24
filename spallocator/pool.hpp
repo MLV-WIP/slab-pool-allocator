@@ -36,9 +36,11 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 
@@ -46,6 +48,7 @@
 #include "impl/islab.hpp"
 #include "impl/slab.hpp"
 #include "impl/slab_proxy.hpp"
+#include "impl/slot_tag.hpp"
 #include "pool_lifetime.hpp"
 
 #if defined(__SANITIZE_ADDRESS__)
@@ -68,8 +71,9 @@ namespace spallocator
     // - Request aligns 4/8 map to native alignment class 16 (slot over-align is fine)
     // - Alignment classes 16 / 32 / 64 use Slab<ElemSize, Alignment> size ladders
     // - Beyond that alignment class's max footprint → SlabProxy (always align_val_t{64})
+    // - Size-class: user ptr == slot base; 8 B end tag (Layout A). Proxy: front header.
     // - Returned memory is exclusively owned until matching deallocate;
-    //   do not free non-pool pointers or mutate the hidden header
+    //   do not free non-pool pointers or mutate the end tag / front header
     inline constexpr std::size_t kMinAlignment = 4;
     inline constexpr std::size_t kSlabNativeAlignment = 16;
     inline constexpr std::size_t kMaxAlignment = 64;
@@ -85,7 +89,7 @@ namespace spallocator
     static_assert((kDefaultAlignment & (kDefaultAlignment - 1)) == 0,
                   "kDefaultAlignment must be a power of two");
     inline constexpr std::size_t kSlabIndexNpos = std::numeric_limits<std::size_t>::max();
-    // Written at user_ptr − 6; validated (then cleared) on deallocate.
+    // Proxy front-header LIVE magic (user_ptr − 6). Size-class uses kTagMagicLive.
     inline constexpr std::uint8_t kAllocMagic = 0xA7;
 
     inline constexpr std::size_t kLadder16[] = {
@@ -255,8 +259,7 @@ namespace spallocator
 
         PoolControlBlock* control() const noexcept { return control_; }
 
-        // Phase 1 Block map diagnostics (Layout A routing table). Count of
-        // registered size-class Blocks; allocate/free still use front headers.
+        // Block map diagnostics (Layout A routing table).
         std::size_t block_owner_count() const;
         bool block_owner_contains(std::byte* block_base) const;
 
@@ -282,7 +285,11 @@ namespace spallocator
 
         void install_block_registry();
 
-        // Scratch for allocate's header path (not part of the public API).
+        // Shared map lookup: upper_bound predecessor + range + exact slot base.
+        // Copies BlockEntry then unlocks. nullopt ⇒ not a size-class Block slot.
+        std::optional<BlockEntry> find_block_owner(std::byte* p) const noexcept;
+
+        // Scratch for allocate (not part of the public API).
         struct Allocation
         {
             std::byte* ptr;
@@ -304,9 +311,9 @@ namespace spallocator
     private: // data members
         PoolControlBlock* control_{nullptr};
 
-        // Layout A Block ownership map (Phase 1). Declared *before* size-class
-        // Slabs so ~Slab can unregister while the map/registry are still alive.
-        // shared lookup later on free; exclusive mutate on grow/trim.
+        // Layout A Block ownership map. Declared *before* size-class Slabs so
+        // ~Slab can unregister while the map/registry are still alive.
+        // Shared lookup on free; exclusive mutate on grow/trim.
         mutable std::shared_mutex block_map_lock_;
         std::map<std::byte*, BlockEntry> block_owner_;
         Registry block_registry_{*this};
@@ -391,14 +398,11 @@ namespace spallocator
 
         if (item_size > kMaxAllocationBytes)
         {
-            // excessively large allocations don't belong in the pool
-            // slabs; use other allocation methods instead
             note_alloc_fail();
             throw std::out_of_range("Allocation size exceeds maximum limit for pool allocator");
         }
 
         // Range and power-of-two checks throw in all builds (including release).
-        // Non-power-of-two values in [4, 64] (e.g. 12) would break header/alignment-class math.
         if (alignment < kMinAlignment || alignment > kMaxAlignment ||
             (alignment & (alignment - 1)) != 0)
         {
@@ -406,19 +410,27 @@ namespace spallocator
             throw std::invalid_argument("Unsupported alignment requested");
         }
 
-        // Store footprint metadata in a header immediately before the user
-        // pointer.
-        // header_size = max(8, alignment). For align 4/8 this stays 8 (alignment class 16);
-        // for 16/32/64 it equals the request align so free can recover the class.
-        // Layout (from user pointer backward): uint32 alloc_size at −4,
-        // uint8 header_size at −5, uint8 magic at −6. Deallocate validates
-        // magic/size then recovers the slot base and re-selects the slab via
-        // (alloc_size, alignment-class-from-header_size).
-        std::size_t header_size = 8 < alignment ? alignment : 8;
-        std::size_t alloc_size = item_size + header_size;
+        const std::size_t alignment_class = nativeAlignmentClass(alignment);
+
+        // Size-class: fixed 8 B trailer (Layout A). Proxy: front header
+        // header_size = max(16, alignment) ∈ {16,32,64}.
+        const bool use_proxy =
+            selectClassIndex(item_size + kSizeClassTrailerTax, alignment_class) ==
+            kSlabIndexNpos;
+
+        std::size_t header_size = 0;
+        std::size_t alloc_size = 0;
+        if (use_proxy)
+        {
+            header_size = alignment < 16 ? 16 : alignment;
+            alloc_size = item_size + header_size;
+        }
+        else
+        {
+            alloc_size = item_size + kSizeClassTrailerTax;
+        }
         alloc.size = alloc_size;
 
-        const std::size_t alignment_class = nativeAlignmentClass(alignment);
         ISlab* slab = resolveSlab(alloc_size, alignment_class);
         debug_println("Allocated {} bytes, alignment_class={}, slab={}",
                       alloc_size, alignment_class,
@@ -434,23 +446,59 @@ namespace spallocator
             throw;
         }
 
+        if (slab == &large_slab)
+        {
+            // Protocol C: front header immediately before user pointer.
+            std::byte* base = alloc.ptr;
+            std::byte* user = base + header_size;
 #if defined(SPALLOCATOR_HAS_ASAN)
-        // Slot may have been header-poisoned on a prior free.
-        ASAN_UNPOISON_MEMORY_REGION(alloc.ptr, header_size);
+            ASAN_UNPOISON_MEMORY_REGION(base, header_size);
 #endif
+            std::memset(base, 0, header_size);
 
-        uint32_t* size_ptr = reinterpret_cast<uint32_t*>(alloc.ptr + header_size - 4);
-        *size_ptr = uint32_t(alloc_size & 0xffffffff);
+            const auto alloc_size_u32 = static_cast<std::uint32_t>(alloc_size);
+            std::memcpy(user - 4, &alloc_size_u32, 4);
 
-        uint8_t* header_size_ptr = reinterpret_cast<uint8_t*>(alloc.ptr + header_size - 5);
-        *header_size_ptr = uint8_t(header_size & 0xff);
+            *reinterpret_cast<std::uint8_t*>(user - 5) =
+                static_cast<std::uint8_t>(header_size);
+            *reinterpret_cast<std::uint8_t*>(user - 6) = kAllocMagic;
 
-        uint8_t* magic_ptr = reinterpret_cast<uint8_t*>(alloc.ptr + header_size - 6);
-        *magic_ptr = kAllocMagic;
+            const std::uint32_t crc = proxy_header_crc(
+                user, alloc_size_u32, static_cast<std::uint8_t>(header_size), kAllocMagic);
+            std::memcpy(user - 16, &crc, 4);
+
+            control_->note_alloc();
+            note_alloc_ok();
+            return user;
+        }
+
+        // Layout A: user pointer == slot base; tag at ElemSize - 8.
+        std::byte* slot = alloc.ptr;
+        std::optional<BlockEntry> entry = find_block_owner(slot);
+        if (!entry || entry->slab != slab)
+        {
+            // Best-effort rollback so the Slot is not leaked; ignore secondary
+            // failures — the logic_error below is the primary signal.
+            try
+            {
+                slab->deallocateItem(slot);
+            }
+            catch (...)
+            {
+            }
+            note_alloc_fail();
+            throw std::logic_error("Pool::allocate: Block map missing newly allocated slot");
+        }
+
+#if defined(SPALLOCATOR_HAS_ASAN)
+        // Prior free poisoned the tag word; unpoison the whole Slot for reuse.
+        ASAN_UNPOISON_MEMORY_REGION(slot, entry->elem_size);
+#endif
+        write_slot_tag(slot, entry->elem_size, entry->generation);
 
         control_->note_alloc();
         note_alloc_ok();
-        return alloc.ptr + header_size;
+        return slot;
     }
 
 
@@ -459,7 +507,7 @@ namespace spallocator
         if (!try_deallocate(item))
         {
             throw std::invalid_argument(
-                "Pool::deallocate failed (invalid pointer, corrupt header, or double free)");
+                "Pool::deallocate failed (invalid pointer, corrupt tag/header, or double free)");
         }
     }
 
@@ -473,28 +521,58 @@ namespace spallocator
 
         try
         {
-            // Today: front-header peek → resolveSlab → deallocateItem.
-            // Planned (Layout A): block_owner_ shared lookup → unlock → end-tag/CRC
-            // → deallocateItem; else strict proxy front-header probe. Never hold the
-            // map lock across slab work. See docs/design/slot-end-tag.md and
-            // IMPLEMENTATION.md "Planned: Block map & trailer locking".
-            //
-            // Metadata always lives in the 8 bytes immediately before the user
-            // pointer. A prior free poisons the header; temporarily unpoison so
-            // double-free / corrupt-header checks can read it without ASan abort.
-            [[maybe_unused]] constexpr std::size_t kHeaderPeek = 8;
+            // Layout A free: map shared lookup → unlock → tag/CRC → slab.
+            // Else strict proxy front-header probe. Never hold the map lock
+            // across slab work. See docs/design/slot-end-tag.md.
+            if (std::optional<BlockEntry> entry = find_block_owner(item))
+            {
+#if defined(SPALLOCATOR_HAS_ASAN)
+                ASAN_UNPOISON_MEMORY_REGION(
+                    item + entry->elem_size - kSlotTagBytes, kSlotTagBytes);
+#endif
+                if (!verify_slot_tag(item, entry->elem_size, entry->generation))
+                {
+                    debug_println(
+                        "Invalid size-class tag at ptr={} (corrupt, freed, or gen mismatch)",
+                        static_cast<void*>(item));
+#if defined(SPALLOCATOR_HAS_ASAN)
+                    ASAN_POISON_MEMORY_REGION(
+                        item + entry->elem_size - kSlotTagBytes, kSlotTagBytes);
+#endif
+                    note_free_fail();
+                    return false;
+                }
+
+                clear_slot_tag(item, entry->elem_size);
+#if defined(SPALLOCATOR_HAS_ASAN)
+                ASAN_POISON_MEMORY_REGION(
+                    item + entry->elem_size - kSlotTagBytes, kSlotTagBytes);
+#endif
+
+                debug_println("Deallocating size-class slot at ptr={}, elem_size={}",
+                              static_cast<void*>(item), entry->elem_size);
+                entry->slab->deallocateItem(item);
+                Pool* doomed = control_->note_free();
+                note_free_ok();
+                if (doomed)
+                {
+                    delete doomed;
+                }
+                return true;
+            }
+
+            // Proxy path: front header at user − header_size (min 16).
+            [[maybe_unused]] constexpr std::size_t kHeaderPeek = 16;
 #if defined(SPALLOCATOR_HAS_ASAN)
             const bool header_was_poisoned =
                 __asan_address_is_poisoned(item - 5) != 0;
             ASAN_UNPOISON_MEMORY_REGION(item - kHeaderPeek, kHeaderPeek);
 #endif
 
-            // Validate header before trusting it to choose a slab (P9).
-            uint8_t header_size = *reinterpret_cast<uint8_t*>(item - 5);
-            if (header_size != 8 && header_size != 16 &&
-                header_size != 32 && header_size != 64)
+            const std::uint8_t header_size = *reinterpret_cast<std::uint8_t*>(item - 5);
+            if (header_size != 16 && header_size != 32 && header_size != 64)
             {
-                debug_println("Invalid allocation header_size {} at ptr={}",
+                debug_println("Invalid proxy header_size {} at ptr={}",
                               header_size, static_cast<void*>(item));
 #if defined(SPALLOCATOR_HAS_ASAN)
                 if (header_was_poisoned)
@@ -506,11 +584,11 @@ namespace spallocator
                 return false;
             }
 
-            uint8_t magic = *reinterpret_cast<uint8_t*>(item - 6);
+            const std::uint8_t magic = *reinterpret_cast<std::uint8_t*>(item - 6);
             if (magic != kAllocMagic)
             {
                 debug_println(
-                    "Invalid allocation magic {:#x} at ptr={} "
+                    "Invalid proxy magic {:#x} at ptr={} "
                     "(not a live pool pointer, or double free)",
                     magic, static_cast<void*>(item));
 #if defined(SPALLOCATOR_HAS_ASAN)
@@ -523,13 +601,14 @@ namespace spallocator
                 return false;
             }
 
-            uint32_t alloc_size_u32 = *reinterpret_cast<uint32_t*>(item - 4);
-            std::size_t alloc_size = alloc_size_u32;
+            std::uint32_t alloc_size_u32 = 0;
+            std::memcpy(&alloc_size_u32, item - 4, 4);
+            const std::size_t alloc_size = alloc_size_u32;
             if (alloc_size < header_size ||
                 alloc_size > kMaxAllocationBytes + kMaxAlignment)
             {
                 debug_println(
-                    "Invalid allocation size {} in header at ptr={} (header_size={})",
+                    "Invalid proxy alloc_size {} at ptr={} (header_size={})",
                     alloc_size, static_cast<void*>(item), header_size);
 #if defined(SPALLOCATOR_HAS_ASAN)
                 if (header_was_poisoned)
@@ -541,27 +620,32 @@ namespace spallocator
                 return false;
             }
 
+            std::uint32_t stored_crc = 0;
+            std::memcpy(&stored_crc, item - 16, 4);
+            const std::uint32_t expect_crc =
+                proxy_header_crc(item, alloc_size_u32, header_size, kAllocMagic);
+            if (stored_crc != expect_crc)
+            {
+                debug_println("Invalid proxy CRC at ptr={}", static_cast<void*>(item));
+#if defined(SPALLOCATOR_HAS_ASAN)
+                if (header_was_poisoned)
+                {
+                    ASAN_POISON_MEMORY_REGION(item - header_size, header_size);
+                }
+#endif
+                note_free_fail();
+                return false;
+            }
+
             std::byte* original_ptr = item - header_size;
-
-            // header_size 8 or 16 → alignment class 16; 32 → 32; 64 → 64.
-            const std::size_t alignment_class = (header_size <= kSlabNativeAlignment)
-                ? kSlabNativeAlignment
-                : static_cast<std::size_t>(header_size);
-
-            // Invalidate header before returning the slot (detects Pool double-free).
-            *reinterpret_cast<uint8_t*>(item - 6) = 0;
-
+            *reinterpret_cast<std::uint8_t*>(item - 6) = 0;
 #if defined(SPALLOCATOR_HAS_ASAN)
             ASAN_POISON_MEMORY_REGION(original_ptr, header_size);
 #endif
 
-            ISlab* slab = resolveSlab(alloc_size, alignment_class);
-            debug_println("Deallocating {} bytes at ptr={}, alignment_class={}, slab={}",
-                          alloc_size, static_cast<void*>(original_ptr), alignment_class,
-                          (slab == &large_slab) ? "large_slab" : "size_class");
-            slab->deallocateItem(original_ptr);
-            // May return `this` for heap-owned idle pools — delete only after
-            // this method is done touching members.
+            debug_println("Deallocating proxy {} bytes at ptr={}",
+                          alloc_size, static_cast<void*>(original_ptr));
+            large_slab.deallocateItem(original_ptr);
             Pool* doomed = control_->note_free();
             note_free_ok();
             if (doomed)
@@ -572,7 +656,6 @@ namespace spallocator
         }
         catch (...)
         {
-            // Slab layer may throw; noexcept clients must not see that.
             debug_println(
                 "Pool::try_deallocate: slab deallocate failed for ptr={}",
                 static_cast<void*>(item));
@@ -844,6 +927,33 @@ namespace spallocator
     {
         std::shared_lock lock(block_map_lock_);
         return block_owner_.find(block_base) != block_owner_.end();
+    }
+
+
+    inline std::optional<BlockEntry> Pool::find_block_owner(std::byte* p) const noexcept
+    {
+        std::shared_lock lock(block_map_lock_);
+
+        auto it = block_owner_.upper_bound(p);
+        if (it == block_owner_.begin())
+        {
+            return std::nullopt;
+        }
+        --it;
+
+        std::byte* base = it->first;
+        const BlockEntry& entry = it->second;
+        if (p < base || entry.elem_size == 0 || entry.block_bytes == 0)
+        {
+            return std::nullopt;
+        }
+
+        const auto offset = static_cast<std::size_t>(p - base);
+        if (offset >= entry.block_bytes || (offset % entry.elem_size) != 0)
+        {
+            return std::nullopt;
+        }
+        return entry;
     }
 
 
