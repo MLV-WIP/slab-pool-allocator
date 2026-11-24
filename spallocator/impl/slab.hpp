@@ -30,8 +30,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef SLAB_HPP_
-#define SLAB_HPP_
+#ifndef SPALLOCATOR_IMPL_SLAB_HPP_
+#define SPALLOCATOR_IMPL_SLAB_HPP_
 
 #include <array>
 #include <bit>
@@ -43,20 +43,21 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
 
-#include "helper.hpp"
+#include "impl/helper.hpp"
+#include "impl/islab.hpp"
 #include "mlvlib/spinlock.hpp"
 
 
 namespace spallocator
 {
     using mlvlib::SpinLock;
-
 
     // Compile-time slab buffer packing knobs (override via -D / ./configure).
 #ifndef SPALLOCATOR_SLAB_TARGET_BYTES
@@ -91,30 +92,6 @@ namespace spallocator
             from_target > kSlabTargetMultiplier ? from_target : kSlabTargetMultiplier;
         return slots * ElemSize;
     }
-
-
-    class ISlab
-    {
-    public: // methods
-        virtual std::byte* allocateItem(std::size_t size) = 0;
-        virtual void deallocateItem(std::byte* item) = 0;
-
-        // Release fully empty Blocks back to the OS. Default: no-op
-        // (SlabProxy). Returns the number of Blocks deleted.
-        virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
-        virtual std::size_t getAllocatedMemory() const { return 0; }
-
-        virtual ~ISlab() = default;
-
-    protected: // methods
-        ISlab() = default;
-
-    private: // methods
-        ISlab(const ISlab&) = delete;
-        ISlab& operator=(const ISlab&) = delete;
-        ISlab(ISlab&&) = delete;
-        ISlab& operator=(ISlab&&) = delete;
-    };
 
 
     // Runtime-sized bit vector over uint64_t words. Used for per-Slab
@@ -224,31 +201,6 @@ namespace spallocator
     };
 
 
-    //
-    // SlabProxy does not manage its own memory; it delegates to
-    // standard memory allocation methods for large memory
-    // allocations that aren't suitable for small-memory slab
-    // optimizations
-    //
-    class SlabProxy: public ISlab
-    {
-    public: // methods
-        std::byte* allocateItem(std::size_t size) override;
-        void deallocateItem(std::byte* item) override;
-
-        SlabProxy() = default;
-        ~SlabProxy() override = default;
-
-    private: // methods
-        SlabProxy(const SlabProxy&) = delete;
-        SlabProxy& operator=(const SlabProxy&) = delete;
-        SlabProxy(SlabProxy&&) = delete;
-        SlabProxy& operator=(SlabProxy&&) = delete;
-
-    private: // data members
-    };
-
-
     // Per-buffer slot freemap: fixed uint64_t words instead of std::bitset.
     // Convention: set ⇒ occupied, clear ⇒ free. Direct word access avoids bitset
     // shift + to_ullong on the find-next-clear hot path.
@@ -276,16 +228,6 @@ namespace spallocator
     private:
         std::array<std::uint64_t, kWordCount> words_{};
     };
-
-
-    // ---------------------------------------------------------------------------
-    // ISlab
-    // ---------------------------------------------------------------------------
-
-    inline std::size_t ISlab::reclaimEmptyBlocks(std::size_t /*keep_min*/)
-    {
-        return 0;
-    }
 
 
     // ---------------------------------------------------------------------------
@@ -864,47 +806,7 @@ namespace spallocator
     }
 
 
-    // ---------------------------------------------------------------------------
-    // SlabProxy
-    // ---------------------------------------------------------------------------
 
-    // Oversize / beyond-alignment-class-max path. Always uses 64-byte aligned new/delete
-    // so any Pool request alignment ≤ 64 is satisfied.
-    inline constexpr std::size_t kProxyAlignment = 64;
+} // namespace spallocator
 
-    inline std::byte* SlabProxy::allocateItem(std::size_t elem_size)
-    {
-        // Active in all build types (not runtime_assert): mis-sized large
-        // allocations must fail loudly rather than allocate or be rejected
-        // only under DEBUG_BUILD. Lower bound guards misuse; real overflow
-        // footprints exceed the alignment-class ladder max (see kLadder*).
-        if (elem_size <= 1_KB)
-        {
-            throw std::invalid_argument(
-                std::format("SlabProxy should only be used for large allocations, got {}", elem_size));
-        }
-        if (elem_size > kMaxAllocationBytes)
-        {
-            throw std::out_of_range(
-                std::format("Requested size {} exceeds maximum allowed size for SlabProxy", elem_size));
-        }
-
-        std::byte* item = new(std::align_val_t{kProxyAlignment}) std::byte[elem_size];
-        debug_println("Allocated {} bytes via SlabProxy (align={}), ptr={}",
-                      elem_size, kProxyAlignment, static_cast<void*>(item));
-        return item;
-    }
-
-
-    inline void SlabProxy::deallocateItem(std::byte* item)
-    {
-        debug_println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));
-
-        ::operator delete[](item, std::align_val_t{kProxyAlignment});
-    }
-
-
-}; // namespace spallocator
-
-
-#endif // SLAB_HPP_
+#endif // SPALLOCATOR_IMPL_SLAB_HPP_

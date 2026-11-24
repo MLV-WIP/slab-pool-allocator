@@ -144,11 +144,16 @@ puts all “pointer looks like a pool allocation” policy in one place.
 
 ### Free validation (pool)
 
-Before trusting the header:
+Before trusting the header (fail closed; read only the fixed bytes immediately
+behind the user pointer — do not scan neighboring memory to invent ownership):
 
 1. `header_size ∈ {8,16,32,64}`  
 2. Magic equals `kAllocMagic`  
 3. Footprint in a plausible range (`header_size ≤ alloc_size ≤ kMaxAllocationBytes + max align`)  
+4. Recovered slot base is aligned to the alignment class implied by `header_size`  
+
+Then clear magic, re-resolve the backend, and free. Slab / proxy reject
+unknown bases and interior pointers as a second line of defense.
 
 Failures:
 
@@ -824,7 +829,7 @@ and the directory is immutable for the pool lifetime.
 - Avoid nesting unrelated slab locks across classes unless a future API requires
   it (today’s hot path never does)  
 
-Exact sequences live in `pool.hpp` / `pool_lifetime.hpp` / `slab.hpp` — treat those as source of
+Exact sequences live in `pool.hpp` / `pool_lifetime.hpp` / `impl/slab.hpp` — treat those as source of
 truth if this summary drifts.
 
 ### Client-facing notes
@@ -1023,6 +1028,8 @@ make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
 make bench BUILD_TYPE=release BENCH_ARGS='--align=32'   # Pool vs ::new alignment-class-32 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new alignment-class-64 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
+make bench BUILD_TYPE=release \
+  BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'   # WS pointer-chase cliffs
 ```
 
 Compares `::operator new`, `spallocator::Pool`, `spallocator::PoolMemoryResource`
@@ -1037,11 +1044,24 @@ per-thread `std::minstd_rand` seeded from a fixed key plus worker index
 after scenarios (off by default). Absolute ns are host/toolchain-specific;
 re-run after compiler or stdlib upgrades and compare ratios on the same machine.
 
+**Pointer-chase locality sweep (`--scenario=chase`)** — bench-only, not part of
+`--scenario=all`. Dependent loads (`p = p->next`) over rings while sweeping
+working-set sizes. Default WS list comes from sysfs cache sizes when readable,
+else fixed presets; override with `--ws-bytes=`. Modes: **calibrate** (one
+contiguous `new[]` buffer), **pool** spatial/random, **`::new`** spatial/random.
+Useful flags: `--stride=64`, `--link=spatial|random|all`, `--chase-loads=N`,
+`--align=16|64`. Read ns/load plateaus as L1/L2/L3/DRAM cliffs; knees mark
+capacity.
+
 Filters (for focused timing or profiling):
 
 | Flag | Values | Notes |
 |------|--------|-------|
-| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all`. `bulk` is alloc-then-free-all (grows many slab buffers) |
+| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `chase`, `all` (comma-ok) | Default `all` (**excludes** `chase`). `chase` = WS pointer-chase locality sweep |
+| `--ws-bytes=` | e.g. `4K,32K,256K,2M,32M` | Chase WS list (default: sysfs / presets) |
+| `--stride=` | bytes (default **64**) | Chase node stride; multiple of pointer size |
+| `--link=` | `spatial`, `random`, `all` | Chase ring link mode (default `all`) |
+| `--chase-loads=` | N | Dependent loads per cell (default scales with `--iters`) |
 | `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `pool_pmr`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk`. `pool_pmr` shows PMR virtual tax vs raw `pool` |
 | `--pool-stats` | (flag) | Opt-in `[PoolStats]` / slab retained dumps after scenarios |
 | `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
@@ -1074,6 +1094,19 @@ make profile BENCH_ARGS='--scenario=lifo --backend=pool --align=32 --iters=20000
 Pin one scenario and one backend so samples concentrate on the path under study.
 Compare Slab-only vs Pool to separate engine cost from Pool routing/header work.
 Do not treat sanitizer or coverage builds as profile baselines.
+
+### Header-path perf habits
+
+Practices for measuring and evolving the current front-header alloc/free path:
+
+| Habit | Practice |
+|-------|----------|
+| Fair ratios | `make bench` / `make profile` only — both force `ENABLE_COVERAGE=no`. Prefer `BUILD_TYPE=release` for ns/op. |
+| Split alloc vs free | Profile `lifo` (paired) and `bulk` (alloc-then-free-all) separately; compare `--backend=slab16` vs `pool` to isolate header write/validate from freemap. Use `make profile` with one scenario + one backend. |
+| Locality | `--scenario=chase` (opt-in) for payload working-set cliffs; not a substitute for LIFO latency. |
+| Lock scope | Free holds **no** pool-wide lock across slab work — only the per-`Slab` `SpinLock` inside `deallocateItem`. Keep it that way unless a profile forces a different design. |
+| Fail closed | Validate header geometry (size / magic / footprint / base alignment) **before** freemap flips; peek only the fixed bytes behind the user pointer. |
+| Integrity tax | Headers today use magic + sizes (no CRC). Add optional CRC / `-march=native` only if a build gate and profiles show the cost is worth it. |
 
 If `perf record` fails with “Access to performance monitoring…”, the profile
 binary was still built under `obj/profile/`. Relax

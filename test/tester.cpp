@@ -44,8 +44,10 @@
 
 #include <memory_resource>
 
-#include "spallocator/helper.hpp"
-#include "spallocator/slab.hpp"
+#include "spallocator/impl/helper.hpp"
+#include "spallocator/impl/islab.hpp"
+#include "spallocator/impl/slab.hpp"
+#include "spallocator/impl/slab_proxy.hpp"
 #include "spallocator/pool.hpp"
 #include "spallocator/spallocator.hpp"
 #include "spallocator/pool_pmr.hpp"
@@ -1250,6 +1252,30 @@ TEST(PoolTest, DeallocateRejectsInteriorPointer)
 
     // Exact user pointer still frees cleanly after rejected interiors.
     EXPECT_NO_THROW(pool.deallocate(p));
+}
+
+
+// Forged header with plausible magic/size but a base that is not
+// alignment-class-aligned must fail closed before freemap work.
+TEST(PoolTest, DeallocateRejectsMisalignedBase)
+{
+    Pool pool;
+    alignas(16) std::byte buf[64]{};
+    // Fake user at buf+24 → recovered base buf+8 is only 8-aligned, not
+    // 16-aligned for header_size 16.
+    std::byte* fake_user = buf + 24;
+
+    auto* real = pool.allocate(16);
+    ASSERT_NE(real, nullptr);
+    const auto magic = *reinterpret_cast<std::uint8_t*>(real - 6);
+    pool.deallocate(real);
+
+    *reinterpret_cast<std::uint32_t*>(fake_user - 4) = 32; // alloc_size
+    *reinterpret_cast<std::uint8_t*>(fake_user - 5) = 16;  // header_size
+    *reinterpret_cast<std::uint8_t*>(fake_user - 6) = magic;
+
+    EXPECT_FALSE(pool.try_deallocate(fake_user));
+    EXPECT_THROW(pool.deallocate(fake_user), std::invalid_argument);
 }
 
 

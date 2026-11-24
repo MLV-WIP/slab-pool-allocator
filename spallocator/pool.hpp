@@ -40,7 +40,9 @@
 #include <memory>
 #include <stdexcept>
 
-#include "slab.hpp"
+#include "impl/islab.hpp"
+#include "impl/slab.hpp"
+#include "impl/slab_proxy.hpp"
 #include "pool_lifetime.hpp"
 
 #if defined(__SANITIZE_ADDRESS__)
@@ -510,6 +512,27 @@ namespace spallocator
             const std::size_t alignment_class = (header_size <= kSlabNativeAlignment)
                 ? kSlabNativeAlignment
                 : static_cast<std::size_t>(header_size);
+
+            // Fail closed on geometry before freemap / proxy delete: slot bases
+            // are always alignment_class-aligned. Metadata lives only in the
+            // fixed bytes behind the user pointer — do not widen the peek or
+            // scan other addresses to invent ownership.
+            if ((reinterpret_cast<std::uintptr_t>(original_ptr) % alignment_class) !=
+                0)
+            {
+                debug_println(
+                    "Invalid allocation base alignment at ptr={} "
+                    "(header_size={}, alignment_class={})",
+                    static_cast<void*>(item), header_size, alignment_class);
+#if defined(SPALLOCATOR_HAS_ASAN)
+                if (header_was_poisoned)
+                {
+                    ASAN_POISON_MEMORY_REGION(item - header_size, header_size);
+                }
+#endif
+                note_free_fail();
+                return false;
+            }
 
             // Invalidate header before returning the slot (detects Pool double-free).
             *reinterpret_cast<uint8_t*>(item - 6) = 0;

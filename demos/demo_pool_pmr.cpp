@@ -6,7 +6,7 @@
 #include <memory_resource>
 #include <vector>
 
-#include "spallocator/helper.hpp"
+#include "spallocator/impl/helper.hpp"
 #include "spallocator/pool.hpp"
 #include "spallocator/spallocator.hpp"
 #include "spallocator/pool_pmr.hpp"

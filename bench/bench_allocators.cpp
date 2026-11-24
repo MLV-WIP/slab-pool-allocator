@@ -10,6 +10,10 @@
  * Usage:
  *   bench_allocators [--align=8|16|32|64] [--iters=N] [--threads=N]
  *                   [--scenario=...] [--backend=...] [--help]
+ *
+ * Locality chase (opt-in; not part of --scenario=all):
+ *   --scenario=chase [--ws-bytes=...] [--stride=64] [--link=spatial|random|all]
+ *   [--backend=new,pool] [--align=16|64]
  */
 
 #include <algorithm>
@@ -18,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory_resource>
@@ -32,7 +37,7 @@
 
 #include "spallocator/pool.hpp"
 #include "spallocator/pool_pmr.hpp"
-#include "spallocator/slab.hpp"
+#include "spallocator/impl/slab.hpp"
 
 namespace {
 
@@ -162,8 +167,31 @@ enum class Scenario : unsigned
     Multi = 1u << 1,
     Bulk = 1u << 2,
     Threaded = 1u << 3,
+    Chase = 1u << 4, // opt-in locality WS sweep; not included in All
     All = Lifo | Multi | Bulk | Threaded,
 };
+
+enum class ChaseLink : unsigned
+{
+    None = 0,
+    Spatial = 1u << 0, // backward ring in alloc / buffer order (defeats simple prefetch)
+    Random = 1u << 1,
+    All = Spatial | Random,
+};
+
+inline ChaseLink operator|(ChaseLink a, ChaseLink b)
+{
+    return static_cast<ChaseLink>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
+}
+inline ChaseLink& operator|=(ChaseLink& a, ChaseLink b)
+{
+    a = a | b;
+    return a;
+}
+inline bool has(ChaseLink mask, ChaseLink bit)
+{
+    return (static_cast<unsigned>(mask) & static_cast<unsigned>(bit)) != 0;
+}
 
 enum class BackendId : unsigned
 {
@@ -238,6 +266,10 @@ bool parse_scenario_list(std::string_view csv, Scenario& out, std::string& err)
         else if (tok == "threaded")
         {
             out |= Scenario::Threaded;
+        }
+        else if (tok == "chase")
+        {
+            out |= Scenario::Chase;
         }
         else
         {
@@ -351,6 +383,10 @@ char const* scenario_label(Scenario s)
     {
         append("threaded");
     }
+    if (has(s, Scenario::Chase))
+    {
+        append("chase");
+    }
     return buf.c_str();
 }
 
@@ -407,7 +443,130 @@ struct Options
     BackendId backends = BackendId::All;
     bool pool_stats = false; // opt-in [PoolStats] / slab retained dumps
     bool help = false;
+
+    // Chase (locality) — used when Scenario::Chase is selected.
+    std::vector<std::size_t> ws_bytes; // empty ⇒ auto from sysfs / presets
+    std::size_t stride = 64;
+    ChaseLink chase_link = ChaseLink::All;
+    std::uint64_t chase_loads = 0; // 0 ⇒ derive from iters (scaled)
 };
+
+// Parse 4K / 32KB / 2M / raw decimal into bytes.
+bool parse_size_token(std::string_view tok, std::size_t& out, std::string& err)
+{
+    if (tok.empty())
+    {
+        err = "empty size token";
+        return false;
+    }
+    char* end = nullptr;
+    std::string s(tok);
+    unsigned long long v = std::strtoull(s.c_str(), &end, 10);
+    if (end == s.c_str())
+    {
+        err = "invalid size: " + s;
+        return false;
+    }
+    std::string_view suf = end;
+    unsigned long long mul = 1;
+    if (suf.empty() || suf == "B" || suf == "b")
+    {
+        mul = 1;
+    }
+    else if (suf == "K" || suf == "k" || suf == "KB" || suf == "kb" || suf == "KiB")
+    {
+        mul = 1024ull;
+    }
+    else if (suf == "M" || suf == "m" || suf == "MB" || suf == "mb" || suf == "MiB")
+    {
+        mul = 1024ull * 1024ull;
+    }
+    else if (suf == "G" || suf == "g" || suf == "GB" || suf == "gb" || suf == "GiB")
+    {
+        mul = 1024ull * 1024ull * 1024ull;
+    }
+    else
+    {
+        err = "unknown size suffix in: " + s;
+        return false;
+    }
+    out = static_cast<std::size_t>(v * mul);
+    if (out == 0)
+    {
+        err = "size must be > 0: " + s;
+        return false;
+    }
+    return true;
+}
+
+bool parse_ws_bytes_list(std::string_view csv, std::vector<std::size_t>& out, std::string& err)
+{
+    out.clear();
+    std::size_t start = 0;
+    while (start <= csv.size())
+    {
+        std::size_t comma = csv.find(',', start);
+        std::string_view tok =
+            csv.substr(start, comma == std::string_view::npos ? csv.size() - start : comma - start);
+        std::size_t bytes = 0;
+        if (!parse_size_token(tok, bytes, err))
+        {
+            return false;
+        }
+        out.push_back(bytes);
+        if (comma == std::string_view::npos)
+        {
+            break;
+        }
+        start = comma + 1;
+    }
+    if (out.empty())
+    {
+        err = "--ws-bytes selected nothing";
+        return false;
+    }
+    return true;
+}
+
+bool parse_chase_link_list(std::string_view csv, ChaseLink& out, std::string& err)
+{
+    out = ChaseLink::None;
+    std::size_t start = 0;
+    while (start <= csv.size())
+    {
+        std::size_t comma = csv.find(',', start);
+        std::string_view tok =
+            csv.substr(start, comma == std::string_view::npos ? csv.size() - start : comma - start);
+        if (tok == "all")
+        {
+            out = ChaseLink::All;
+        }
+        else if (tok == "spatial")
+        {
+            out |= ChaseLink::Spatial;
+        }
+        else if (tok == "random")
+        {
+            out |= ChaseLink::Random;
+        }
+        else
+        {
+            err = "unknown --link value: " + std::string(tok);
+            return false;
+        }
+        if (comma == std::string_view::npos)
+        {
+            break;
+        }
+        start = comma + 1;
+    }
+    if (out == ChaseLink::None)
+    {
+        err = "--link selected nothing";
+        return false;
+    }
+    return true;
+}
 
 Options parse_args(int argc, char** argv)
 {
@@ -477,6 +636,33 @@ Options parse_args(int argc, char** argv)
         {
             opt.pool_stats = true;
         }
+        else if (a.rfind("--ws-bytes=", 0) == 0)
+        {
+            std::string err;
+            if (!parse_ws_bytes_list(a.substr(11), opt.ws_bytes, err))
+            {
+                std::cerr << err << "\n";
+                opt.help = true;
+            }
+        }
+        else if (a.rfind("--stride=", 0) == 0)
+        {
+            opt.stride = static_cast<std::size_t>(std::strtoull(a.data() + 9, nullptr, 10));
+        }
+        else if (a.rfind("--link=", 0) == 0)
+        {
+            std::string err;
+            if (!parse_chase_link_list(a.substr(7), opt.chase_link, err))
+            {
+                std::cerr << err << "\n";
+                opt.help = true;
+            }
+        }
+        else if (a.rfind("--chase-loads=", 0) == 0)
+        {
+            opt.chase_loads =
+                static_cast<std::uint64_t>(std::strtoull(a.data() + 14, nullptr, 10));
+        }
         else
         {
             std::cerr << "unknown argument: " << a << "\n";
@@ -503,6 +689,12 @@ Options parse_args(int argc, char** argv)
                   << ") or 32|64 (Pool vs ::new spot-check)\n";
         opt.help = true;
     }
+    if (opt.stride < sizeof(void*) || (opt.stride % sizeof(void*)) != 0)
+    {
+        std::cerr << "--stride must be a multiple of pointer size and >= "
+                  << sizeof(void*) << "\n";
+        opt.help = true;
+    }
     return opt;
 }
 
@@ -519,10 +711,16 @@ void print_help()
         "  --batch=N           Per-thread live batch for threaded scenario (default 1024)\n"
         "  --size-mix=MIX      uniform | class (default class). Class = equal weight per\n"
         "                      reachable alignment-class-16 size class (exact-fit user size).\n"
-        "  --scenario=LIST     lifo,multi,bulk,threaded,all (comma-separated; default all)\n"
+        "  --scenario=LIST     lifo,multi,bulk,threaded,chase,all (comma-separated; default all).\n"
+        "                      'chase' is opt-in (not included in all).\n"
         "  --backend=LIST      new,pool,pmr_unsync,pmr_sync,slab16,pool_pmr,all\n"
-        "                      (comma-separated; default all)\n"
+        "                      (comma-separated; default all). Chase uses new+pool (+calibrate).\n"
         "  --pool-stats        Print PoolStats / slab retained dumps after scenarios\n"
+        "  --ws-bytes=LIST     Chase working sets (e.g. 4K,32K,256K,2M,32M). Default: sysfs\n"
+        "                      cache sizes when readable, else fixed presets.\n"
+        "  --stride=N          Chase node stride in bytes (default 64; >= ptr size)\n"
+        "  --link=LIST         Chase link: spatial,random,all (default all)\n"
+        "  --chase-loads=N     Dependent loads per chase cell (default scales with --iters)\n"
         "  --help              Show this help\n"
         "\n"
         "Filters skip inapplicable combinations with a note (e.g. slab16 outside\n"
@@ -530,12 +728,15 @@ void print_help()
         "Bulk alloc-then-free-all grows many slab buffers (multi-buffer free uses the map).\n"
         "Threaded: shared allocator + start barrier (contention); peak live ≈ threads×batch\n"
         "so multi-buffer growth needs a large batch (default 1024) and --size-mix=class (default).\n"
+        "Chase: build pointer rings then time p=*p only (memory hierarchy, not alloc/free).\n"
         "When ::new is omitted, tables print ns/op only (no vs ::new ratio).\n"
         "\n"
         "Per-thread std::minstd_rand (seed key + worker index).\n"
         "Recommended: make bench BUILD_TYPE=release\n"
         "Profiling:   make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'\n"
-        "Threaded:    make bench BUILD_TYPE=release BENCH_ARGS='--scenario=threaded --threads=4'\n";
+        "Threaded:    make bench BUILD_TYPE=release BENCH_ARGS='--scenario=threaded --threads=4'\n"
+        "Chase:       make bench BUILD_TYPE=release "
+        "BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'\n";
 }
 
 void print_banner(Options const& opt)
@@ -548,6 +749,29 @@ void print_banner(Options const& opt)
     std::cout << "  size-mix:  " << size_mix_label(opt.size_mix) << "\n";
     std::cout << "  scenario:  " << scenario_label(opt.scenarios) << "\n";
     std::cout << "  backend:   " << backend_label(opt.backends) << "\n";
+    if (has(opt.scenarios, Scenario::Chase))
+    {
+        std::cout << "  chase:     stride=" << opt.stride << " link=";
+        if (opt.chase_link == ChaseLink::All)
+        {
+            std::cout << "all";
+        }
+        else if (has(opt.chase_link, ChaseLink::Spatial) &&
+                 has(opt.chase_link, ChaseLink::Random))
+        {
+            std::cout << "spatial,random";
+        }
+        else if (has(opt.chase_link, ChaseLink::Spatial))
+        {
+            std::cout << "spatial";
+        }
+        else
+        {
+            std::cout << "random";
+        }
+        std::cout << " ws="
+                  << (opt.ws_bytes.empty() ? "auto" : "cli") << "\n";
+    }
 #if defined(__clang__)
     std::cout << "  compiler:  clang " << __clang_major__ << "." << __clang_minor__
               << "." << __clang_patchlevel__ << "\n";
@@ -907,6 +1131,295 @@ Row row_from(Backend& /*b*/, Timing t, bool is_new_baseline = false)
 void note_skip(std::string_view why)
 {
     std::cout << "  skip: " << why << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Chase / working-set pointer latency (lmbench lat_mem_rd-style)
+// ---------------------------------------------------------------------------
+
+struct ChaseHdr
+{
+    ChaseHdr* next;
+};
+
+std::size_t read_sysfs_cache_bytes(int level)
+{
+    // Prefer Data/Unified caches for the given level on cpu0.
+    for (int index = 0; index < 8; ++index)
+    {
+        const std::string base =
+            "/sys/devices/system/cpu/cpu0/cache/index" + std::to_string(index) + "/";
+        std::ifstream lvl(base + "level");
+        std::ifstream typ(base + "type");
+        std::ifstream sz(base + "size");
+        if (!lvl || !typ || !sz)
+        {
+            continue;
+        }
+        int L = 0;
+        std::string type;
+        std::string size_tok;
+        lvl >> L;
+        typ >> type;
+        sz >> size_tok;
+        if (L != level)
+        {
+            continue;
+        }
+        if (type != "Data" && type != "Unified")
+        {
+            continue;
+        }
+        std::size_t bytes = 0;
+        std::string err;
+        if (parse_size_token(size_tok, bytes, err))
+        {
+            return bytes;
+        }
+    }
+    return 0;
+}
+
+std::vector<std::size_t> default_chase_ws_bytes()
+{
+    const std::size_t l1 = read_sysfs_cache_bytes(1);
+    const std::size_t l2 = read_sysfs_cache_bytes(2);
+    const std::size_t l3 = read_sysfs_cache_bytes(3);
+
+    std::vector<std::size_t> ws;
+    auto add = [&](std::size_t b) {
+        if (b == 0)
+        {
+            return;
+        }
+        if (std::find(ws.begin(), ws.end(), b) == ws.end())
+        {
+            ws.push_back(b);
+        }
+    };
+
+    if (l1 || l2 || l3)
+    {
+        // Points near L1 / L2 / L3 and past LLC (knees + plateaus).
+        if (l1)
+        {
+            add(l1 / 2);
+            add(l1);
+        }
+        if (l2)
+        {
+            add(l2 / 2);
+            add(l2);
+        }
+        if (l3)
+        {
+            add(l3 / 2);
+            add(l3);
+            add(l3 * 2);
+            add(l3 * 4);
+        }
+        std::sort(ws.begin(), ws.end());
+        return ws;
+    }
+
+    // Fixed presets when sysfs is unavailable.
+    return {4ull << 10, 32ull << 10, 256ull << 10, 2ull << 20, 32ull << 20};
+}
+
+void link_chase_backward(std::vector<ChaseHdr*>& nodes)
+{
+    const std::size_t n = nodes.size();
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        nodes[i]->next = nodes[(i + n - 1) % n];
+    }
+}
+
+void link_chase_random(std::vector<ChaseHdr*>& nodes, std::minstd_rand& rng)
+{
+    const std::size_t n = nodes.size();
+    std::vector<std::size_t> order(n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        order[i] = i;
+    }
+    for (std::size_t i = n; i > 1; --i)
+    {
+        std::uniform_int_distribution<std::size_t> dist(0, i - 1);
+        std::swap(order[i - 1], order[dist(rng)]);
+    }
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        nodes[order[i]]->next = nodes[order[(i + 1) % n]];
+    }
+}
+
+double time_chase_ns_per_load(ChaseHdr* start, std::uint64_t loads)
+{
+    ChaseHdr* p = start;
+    // Warm a few steps so first timed loads are not cold-start dominated.
+    for (int i = 0; i < 64; ++i)
+    {
+        p = p->next;
+    }
+    const auto t0 = clock_type::now();
+    for (std::uint64_t i = 0; i < loads; ++i)
+    {
+        p = p->next;
+    }
+    const auto t1 = clock_type::now();
+    sink_ptr(p);
+    const double ns =
+        std::chrono::duration<double, std::nano>(t1 - t0).count();
+    return ns / static_cast<double>(loads);
+}
+
+void print_chase_row(char const* backend, char const* link, std::size_t align,
+                     std::size_t ws, std::size_t nodes, double ns_per_load)
+{
+    std::cout << std::left << std::setw(12) << backend << std::setw(10) << link
+              << std::right << std::setw(8) << align << std::setw(12) << ws
+              << std::setw(10) << nodes << std::fixed << std::setprecision(2)
+              << std::setw(12) << ns_per_load << "\n";
+}
+
+void run_chase_suite(Options const& opt)
+{
+    const std::size_t stride = opt.stride;
+    const std::vector<std::size_t> ws_list =
+        opt.ws_bytes.empty() ? default_chase_ws_bytes() : opt.ws_bytes;
+
+    std::uint64_t loads = opt.chase_loads;
+    if (loads == 0)
+    {
+        // Scale with --iters; floor high enough for timer resolution.
+        loads = static_cast<std::uint64_t>(std::max(opt.iters, 1)) * 100ull;
+        if (loads < 5'000'000ull)
+        {
+            loads = 5'000'000ull;
+        }
+#if !defined(NDEBUG)
+        loads = std::min(loads, 500'000ull);
+#endif
+    }
+
+    const bool do_new = has(opt.backends, BackendId::New) || opt.backends == BackendId::All;
+    const bool do_pool = has(opt.backends, BackendId::Pool) || opt.backends == BackendId::All;
+
+    std::cout << "Pointer-chase working-set sweep (dependent loads; graph built before timing)\n";
+    std::cout << "  stride=" << stride << " chase_loads=" << loads
+              << " align=" << opt.alignment << "\n";
+    std::cout << "  ws-bytes:";
+    for (std::size_t w : ws_list)
+    {
+        std::cout << " " << w;
+    }
+    if (opt.ws_bytes.empty())
+    {
+        const std::size_t l1 = read_sysfs_cache_bytes(1);
+        const std::size_t l2 = read_sysfs_cache_bytes(2);
+        const std::size_t l3 = read_sysfs_cache_bytes(3);
+        if (l1 || l2 || l3)
+        {
+            std::cout << "  (sysfs L1=" << l1 << " L2=" << l2 << " L3=" << l3 << ")";
+        }
+        else
+        {
+            std::cout << "  (preset fallback; sysfs unavailable)";
+        }
+    }
+    std::cout << "\n\n";
+
+    std::cout << std::left << std::setw(12) << "backend" << std::setw(10) << "link"
+              << std::right << std::setw(8) << "align" << std::setw(12) << "ws_bytes"
+              << std::setw(10) << "nodes" << std::setw(12) << "ns/load"
+              << "\n";
+
+    auto run_links = [&](char const* backend_name, std::vector<ChaseHdr*>& nodes,
+                         std::minstd_rand& rng) {
+        if (nodes.size() < 2)
+        {
+            return;
+        }
+        if (has(opt.chase_link, ChaseLink::Spatial))
+        {
+            link_chase_backward(nodes);
+            const double ns = time_chase_ns_per_load(nodes[0], loads);
+            print_chase_row(backend_name, "spatial", opt.alignment,
+                            nodes.size() * stride, nodes.size(), ns);
+        }
+        if (has(opt.chase_link, ChaseLink::Random))
+        {
+            link_chase_random(nodes, rng);
+            const double ns = time_chase_ns_per_load(nodes[0], loads);
+            print_chase_row(backend_name, "random", opt.alignment,
+                            nodes.size() * stride, nodes.size(), ns);
+        }
+    };
+
+    for (std::size_t ws : ws_list)
+    {
+        const std::size_t n = std::max<std::size_t>(2, ws / stride);
+        const std::size_t bytes = n * stride;
+        auto rng = make_bench_rng(static_cast<unsigned>(ws & 0xffffffffu));
+
+        {
+            std::vector<std::byte> buf(bytes);
+            std::vector<ChaseHdr*> nodes;
+            nodes.reserve(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                auto* hdr = reinterpret_cast<ChaseHdr*>(buf.data() + i * stride);
+                nodes.push_back(hdr);
+            }
+            run_links("calibrate", nodes, rng);
+        }
+
+        if (do_new)
+        {
+            std::vector<std::byte*> owned;
+            owned.reserve(n);
+            std::vector<ChaseHdr*> nodes;
+            nodes.reserve(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                auto* p = static_cast<std::byte*>(
+                    ::operator new(stride, std::align_val_t{opt.alignment}));
+                owned.push_back(p);
+                nodes.push_back(reinterpret_cast<ChaseHdr*>(p));
+            }
+            run_links("new", nodes, rng);
+            for (std::byte* p : owned)
+            {
+                ::operator delete(p, std::align_val_t{opt.alignment});
+            }
+        }
+
+        if (do_pool)
+        {
+            spallocator::Pool pool;
+            std::vector<std::byte*> owned;
+            owned.reserve(n);
+            std::vector<ChaseHdr*> nodes;
+            nodes.reserve(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                std::byte* p = pool.allocate(stride, opt.alignment);
+                owned.push_back(p);
+                nodes.push_back(reinterpret_cast<ChaseHdr*>(p));
+            }
+            run_links("pool", nodes, rng);
+            for (std::byte* p : owned)
+            {
+                pool.deallocate(p);
+            }
+        }
+    }
+    std::cout << "\n";
+    std::cout << "How to read: ns/load plateaus ≈ L1/L2/L3/DRAM; knees mark capacity.\n"
+              << "spatial keeps alloc/buffer order (backward ring); random destroys locality.\n"
+              << "calibrate = one contiguous new[] (host control). "
+              << "See docs/IMPLEMENTATION.md (Comparative baselines / chase).\n\n";
 }
 
 void run_default_align_suite(Options const& opt)
@@ -1313,13 +1826,25 @@ int main(int argc, char** argv)
     }
     std::cout << "Absolute ns are host/toolchain-specific; re-check after upgrades.\n\n";
 
-    if (opt.alignment == 32 || opt.alignment == 64)
+    if (has(opt.scenarios, Scenario::Chase))
     {
-        run_high_align_spot(opt);
+        run_chase_suite(opt);
     }
-    else
+
+    const Scenario rest = static_cast<Scenario>(
+        static_cast<unsigned>(opt.scenarios) & ~static_cast<unsigned>(Scenario::Chase));
+    if (rest != Scenario::None)
     {
-        run_default_align_suite(opt);
+        Options suite = opt;
+        suite.scenarios = rest;
+        if (suite.alignment == 32 || suite.alignment == 64)
+        {
+            run_high_align_spot(suite);
+        }
+        else
+        {
+            run_default_align_suite(suite);
+        }
     }
     return 0;
 }

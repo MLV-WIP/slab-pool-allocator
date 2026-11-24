@@ -193,8 +193,8 @@ BENCH_SRC := $(BENCHDIR)/bench_allocators.cpp
 BENCH_TARGET := bench_allocators
 BENCH_DEPFILE := $(OBJDIR)/$(BENCH_TARGET).d
 
-# Header dependencies
-HEADERS := $(wildcard $(INCLUDEDIR)/*.hpp)
+# Header dependencies (public + impl/)
+HEADERS := $(wildcard $(INCLUDEDIR)/*.hpp) $(wildcard $(INCLUDEDIR)/impl/*.hpp)
 
 # Targets built by `make all`. Bench is on-demand only (`make bench`) so
 # routine builds / CI are not slowed by timing harness compiles.
@@ -350,7 +350,9 @@ profile: $(OBJDIR)/$(BENCH_TARGET)
 install:
 	$(ECHO) "  INSTALL headers to $(PREFIX)/include/spallocator"
 	$(Q)install -d $(PREFIX)/include/spallocator
+	$(Q)install -d $(PREFIX)/include/spallocator/impl
 	$(Q)install -m 644 $(INCLUDEDIR)/*.hpp $(PREFIX)/include/spallocator/
+	$(Q)install -m 644 $(INCLUDEDIR)/impl/*.hpp $(PREFIX)/include/spallocator/impl/
 	$(ECHO) "  INSTALL docs/LICENSE to $(PREFIX)/share/doc/spallocator"
 	$(Q)install -d $(PREFIX)/share/doc/spallocator
 	$(Q)install -m 644 LICENSE README.md $(PREFIX)/share/doc/spallocator/

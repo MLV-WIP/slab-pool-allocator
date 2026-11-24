@@ -12,7 +12,7 @@ the [root README](../README.md).
 Unless noted, types are in namespace `spallocator`. General locking and
 liveness utilities live in the [mlvlib](https://github.com/MLV-WIP/mlvlib)
 submodule (`mlvlib::SpinLock`, `mlvlib::LifetimeObserver`, helpers). This
-package’s `helper.hpp` re-exports those helpers into `spallocator` for
+package’s `impl/helper.hpp` re-exports those helpers into `spallocator` for
 convenience and defines allocator-only size caps.
 
 ---
@@ -54,10 +54,12 @@ convenience and defines allocator-only size caps.
 |--------|------------------|
 | `spallocator/pool.hpp` | `Pool`, ladders (includes `pool_lifetime.hpp`) |
 | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolLifetimeToken`, `PoolControlBlock` |
-| `spallocator/slab.hpp` | `ISlab`, `Slab`, `SlabProxy`, `DynBitset` |
+| `spallocator/impl/islab.hpp` | `ISlab` |
+| `spallocator/impl/slab.hpp` | `Slab`, `SlotFreemap`, `DynBitset` |
+| `spallocator/impl/slab_proxy.hpp` | `SlabProxy` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
 | `spallocator/pool_pmr.hpp` | `PoolMemoryResource` (`std::pmr::memory_resource`; additive — not pulled by `spallocator.hpp`) |
-| `spallocator/helper.hpp` | Pool size caps; re-exports mlvlib helpers into `spallocator` |
+| `spallocator/impl/helper.hpp` | Pool size caps; re-exports mlvlib helpers into `spallocator` |
 | `mlvlib/spinlock.hpp` | `mlvlib::SpinLock` (submodule; used by Pool/Slab) |
 | `mlvlib/lifetimeobserver.hpp` | `mlvlib::LifetimeObserver` (submodule; optional) |
 
@@ -88,7 +90,7 @@ Typical includes for pool allocation plus factories:
 #include "spallocator/spallocator.hpp"
 ```
 
-Add `spallocator/helper.hpp` as needed. For SpinLock / LifetimeObserver
+Add `spallocator/impl/helper.hpp` as needed. For SpinLock / LifetimeObserver
 directly, include the mlvlib headers (see [mlvlib API](../mlvlib/docs/API.md)).
 
 ---
@@ -498,7 +500,7 @@ class a footprint would hit. (`selectSlab` was removed.)
 
 ## Slab & SlabProxy
 
-**Header:** `spallocator/slab.hpp`
+**Headers:** `spallocator/impl/islab.hpp`, `spallocator/impl/slab.hpp`, `spallocator/impl/slab_proxy.hpp`
 
 A **Slab** is a size-class engine: **Blocks** carved into equal **Slots**, with
 bitmaps (and related maps) tracking free vs in-use. That is a storage strategy,
@@ -576,7 +578,7 @@ still attaches its usual allocation header and returns the **user pointer**.
 
 Growable bitset used internally for “does this Block still have free Slots?”
 metadata. Not part of the stable application-facing API; listed so readers of
-`slab.hpp` know what it is. Prefer `Pool` / `Slab` accessors for diagnostics.
+`impl/slab.hpp` know what it is. Prefer `Pool` / `Slab` accessors for diagnostics.
 
 ---
 
@@ -803,7 +805,7 @@ Bench token: `--backend=pool_pmr` on `make bench`.
 
 ## Helpers & mlvlib
 
-**Allocator helper header:** `spallocator/helper.hpp`
+**Allocator helper header:** `spallocator/impl/helper.hpp`
 
 - Re-exports `mlvlib` helpers into `spallocator` (`print` / `println`,
   `debug_print*`, `runtime_assert`, `_KB` / `_MB` / `_GB` literals).
@@ -817,7 +819,7 @@ and local docs under `mlvlib/docs/` after `git submodule update --init`.
 |---------|--------|-------|
 | `mlvlib::SpinLock` | `mlvlib/spinlock.hpp` | Used by Pool/Slab; deep dive in `mlvlib/docs/deepdive/SpinLock_Analysis.md` |
 | `mlvlib::LifetimeObserver` | `mlvlib/lifetimeobserver.hpp` | Optional; not required by the allocator |
-| Helpers | `mlvlib/helper.hpp` | Canonical home; re-exported via `spallocator/helper.hpp` |
+| Helpers | `mlvlib/helper.hpp` | Canonical home; re-exported via `spallocator/impl/helper.hpp` |
 
 Build requires `-Imlvlib` (Makefile sets this) so `#include "mlvlib/..."` resolves
 against the submodule root.

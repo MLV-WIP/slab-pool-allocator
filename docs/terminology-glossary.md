@@ -93,7 +93,7 @@ Surveyed in slab-pool-allocator; mlvlib called out only where it touches the sam
 | **PoolLifetimeToken** | `pool_lifetime.hpp`, factories | “Block” ≠ storage Block | Document as lifetime pin; consider later rename to `PoolLifetimeToken` / `PoolPin` |
 | **PoolControlBlock** | lifetime | Same “block” root; but matches industry “control block” | Keep name; always say **control block** in prose |
 | **arena** | teardown mode vs bump-arena concept | “Arena mode” = destroy Pool first / bulk reclaim; not a bump allocator | Keep **arena teardown** / **arena path**; never “arena” alone for the Pool type |
-| **ISlab** | `slab.hpp` | Backend interface (`Slab` / `SlabProxy`) | Renamed from `AbstractSlab` (Phase 4). |
+| **ISlab** | `impl/islab.hpp` | Backend interface (`Slab` / `SlabProxy`) | Renamed from `AbstractSlab` (Phase 4); split from `slab.hpp`. |
 | **retained_mapped_bytes** | `PoolStats` | Mapped **Block** bytes across size-class Slabs (not live client use; not SlabProxy) | Renamed from `retained_slab_bytes` (Phase 4). |
 | **selectClassIndex** | Free function | Returns a **class index**, not a Slab* | `selectSlab` removed (Phase 4). |
 | **Finding a pointer’s slab** (CONCEPTS heading) | docs | Often means “which **Block** owns this address?” | Retitle to “Finding a pointer’s block” (or “owning block”) |
@@ -115,10 +115,10 @@ mlvlib itself has **no** Pool/Slab/Slot/Block storage vocabulary worth renaming 
 
 | Kind | Location | Examples |
 |------|----------|----------|
-| Methods | `spallocator/slab.hpp` | `allocateNewSlab`, `destroySlabAt`, `getBlockCount`, `reclaimEmptyBlocks`, `findBlockForSlot` |
-| Members | `slab.hpp` | `slab_data`, `slab_map`, `slab_available_map`, `slab_alloc_size`, `max_slabs`, `alloc_cursor_slab_` |
-| Knobs | `slab.hpp` / configure | `kSlabTargetBytes`, `kSlabTargetMultiplier`, `--with-slab-target-*` (these size **Blocks**, not the Slab type) |
-| Messages | `slab.hpp` | “New slab … allocated”, “remaining slabs=”, “no corresponding slab found” |
+| Methods | `spallocator/impl/slab.hpp` | `allocateNewBlock`, `destroyBlockAt`, `getBlockCount`, `reclaimEmptyBlocks`, `findBlockForSlot` |
+| Members | `impl/slab.hpp` | `block_bases`, `block_freemaps`, `block_available_map`, … |
+| Knobs | `impl/slab.hpp` / configure | `kSlabTargetBytes`, `kSlabTargetMultiplier`, `--with-slab-target-*` (these size **Blocks**, not the Slab type) |
+| Messages | `impl/slab.hpp` | growth / reclaim debug lines |
 | Tests | `test/tester.cpp` | Many `getBlockCount` / `reclaimEmptyBlocks` expectations; comments mix “data block” and count-as-slab |
 | Docs | API / IMPLEMENTATION / CONCEPTS | “slab buffers”, `reclaimEmptyBlocks`, “Finding a pointer’s slab”, trim “per size class” buffer language |
 

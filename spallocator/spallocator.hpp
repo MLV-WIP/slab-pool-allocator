@@ -41,8 +41,6 @@
 #include <algorithm>
 #include <stdexcept>
 
-#include "helper.hpp"
-#include "slab.hpp"
 #include "pool.hpp"
 
 
