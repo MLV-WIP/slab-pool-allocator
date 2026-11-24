@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Abort pushes that update trunk (main/master) or that run while HEAD is trunk.
+# Trunk advances only via pull request. See docs / agent rules: never push from main.
+set -euo pipefail
+
+remote="${1:-}"
+url="${2:-}"
+
+is_trunk_branch() {
+  case "$1" in
+    main|master) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_trunk_ref() {
+  case "$1" in
+    refs/heads/main|refs/heads/master) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+current="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+if [[ -n "$current" ]] && is_trunk_branch "$current"; then
+  cat >&2 <<EOF
+pre-push: refused — HEAD is '${current}'.
+Pushes must not run from main/master. Switch to a feature branch, reexamine
+\`git branch -vv\` / upstream tracking, then push that branch. Land on trunk via PR only.
+EOF
+  exit 1
+fi
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ -z "${local_ref:-}" ]] && continue
+  if is_trunk_ref "$remote_ref"; then
+    cat >&2 <<EOF
+pre-push: refused — destination is '${remote_ref}' (remote=${remote:-?} url=${url:-?}).
+Do not push directly to main/master (including when a feature branch's upstream
+is wrongly set to origin/main). Push with an explicit feature ref, e.g.:
+  git push -u origin HEAD:cursor/<name>-dc92
+Then open a PR into main.
+EOF
+    exit 1
+  fi
+done
+
+exit 0
