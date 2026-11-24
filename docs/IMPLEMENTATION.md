@@ -824,7 +824,7 @@ and the directory is immutable for the pool lifetime.
 - Avoid nesting unrelated slab locks across classes unless a future API requires
   it (today’s hot path never does)  
 
-Exact sequences live in `pool.hpp` / `pool_lifetime.hpp` / `slab.hpp` — treat those as source of
+Exact sequences live in `pool.hpp` / `pool_lifetime.hpp` / `impl/slab.hpp` — treat those as source of
 truth if this summary drifts.
 
 ### Client-facing notes

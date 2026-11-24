@@ -163,13 +163,13 @@ int main() {
 |-----------|------|-------------|
 | **Pool** | `spallocator/pool.hpp` | Allocation domain: route by footprint/alignment, header protocol, `trim`, dispose as a unit |
 | **Pool lifetime** | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolLifetimeToken`, `PoolControlBlock` (also via `pool.hpp`) |
-| **Slab** | `spallocator/slab.hpp` | Fixed-size slot recycler for one size class (bitmaps, growth, reclaim) |
-| **SlabProxy** | `spallocator/slab.hpp` | Large / overflow path via system `new[]` / `delete[]` |
+| **Slab** | `spallocator/impl/slab.hpp` | Fixed-size slot recycler for one size class (bitmaps, growth, reclaim) |
+| **SlabProxy** | `spallocator/impl/slab_proxy.hpp` | Large / overflow path via system `new[]` / `delete[]` |
 | **Smart Pointers** | `spallocator/spallocator.hpp` | `make_pool_unique`, `make_pool_shared` for RAII over a pool domain |
 | **PoolAllocator** | `spallocator/spallocator.hpp` | Standard C++ allocator for STL container integration |
 | **PoolMemoryResource** | `spallocator/pool_pmr.hpp` | Optional `std::pmr::memory_resource` adapter (additive header) |
 | **PoolHandle** | `spallocator/pool_lifetime.hpp` | Heap domain handle; `create()` retires when idle |
-| **Helper** | `spallocator/helper.hpp` | Pool size caps; re-exports general helpers from mlvlib |
+| **Helper** | `spallocator/impl/helper.hpp` | Pool size caps; re-exports general helpers from mlvlib (impl/) |
 | **SpinLock** | `mlvlib/spinlock.hpp` (submodule) | Short-section lock used by Pool/Slab (`mlvlib::SpinLock`) |
 | **LifetimeObserver** | `mlvlib/lifetimeobserver.hpp` (submodule) | Standalone liveness helper (optional; not required by Pool) |
 
