@@ -55,7 +55,7 @@ namespace spallocator
     {
     public: // methods
         AllocateItemResult allocateItem(std::size_t size) override;
-        void deallocateItem(std::byte* item) override;
+        void deallocateItem(std::byte* item, std::byte* block_base = nullptr) override;
 
         SlabProxy() = default;
         ~SlabProxy() override = default;
@@ -101,7 +101,7 @@ namespace spallocator
     }
 
 
-    inline void SlabProxy::deallocateItem(std::byte* item)
+    inline void SlabProxy::deallocateItem(std::byte* item, std::byte* /*block_base*/)
     {
         debug_println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));
 

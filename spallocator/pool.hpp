@@ -556,7 +556,7 @@ namespace spallocator
 
                 debug_println("Deallocating size-class slot at ptr={}, elem_size={}",
                               static_cast<void*>(item), entry->elem_size);
-                entry->slab->deallocateItem(item);
+                entry->slab->deallocateItem(item, entry->block_base);
                 Pool* doomed = control_->note_free();
                 note_free_ok();
                 if (doomed)

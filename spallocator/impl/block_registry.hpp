@@ -46,6 +46,9 @@ namespace spallocator
     struct BlockEntry
     {
         ISlab* slab{nullptr};
+        // Same address as the Block-map key; copied out on free so the Slab can
+        // skip pointer-range search (S3: known-base deallocate).
+        std::byte* block_base{nullptr};
         std::size_t elem_size{0};
         std::size_t block_bytes{0};
         std::uint16_t generation{0};

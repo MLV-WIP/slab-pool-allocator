@@ -913,9 +913,9 @@ See [design/slot-end-tag.md](design/slot-end-tag.md).
 2. Map erase only when the Block has **zero live slots** (same empty rule as
    today’s `reclaimEmptyBlocks`), and **before** `delete[]` of that VA.
 3. Free hot path order: **map shared lock → copy `BlockEntry` → unlock →
-   validate end-tag / CRC → `deallocateItem` (slab lock)**. Never hold the map
-   lock across slab work; never take the map lock while already holding a slab
-   lock on that path.
+   validate end-tag / CRC → `deallocateItem(item, entry.block_base)` (slab lock;
+   known-base exact lookup)**. Never hold the map lock across slab work; never
+   take the map lock while already holding a slab lock on that path.
 4. **Freemap occupancy is the epoch** that keeps a Block alive across the
    map→slab gap for a *live* free racing trim. Generation + CRC harden stale /
    wild pointers and VA reuse.
@@ -925,7 +925,7 @@ See [design/slot-end-tag.md](design/slot-end-tag.md).
 ```text
 [slab lock]   new[] + append; mark UNPUBLISHED (not in alloc scan)
 [unlock]
-[map exclusive]  insert {base → BlockEntry{slab, ElemSize, block_bytes, gen}}
+[map exclusive]  insert {base → BlockEntry{slab, block_base, ElemSize, block_bytes, gen}}
 [unlock]
 [slab lock]   mark PUBLISHED (allocatable)
 [unlock]

@@ -524,7 +524,7 @@ using AllocateItemResult = std::tuple<std::byte*, std::size_t, std::uint16_t>;
 class ISlab {
 public:
     virtual AllocateItemResult allocateItem(std::size_t size) = 0;
-    virtual void deallocateItem(std::byte* item) = 0;
+    virtual void deallocateItem(std::byte* item, std::byte* block_base = nullptr) = 0;
     virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
     virtual std::size_t getAllocatedMemory() const;
     virtual ~ISlab() = default;
@@ -534,7 +534,7 @@ public:
 | Method | Description |
 |--------|-------------|
 | `allocateItem(size)` | Allocate an **Item** (backend allocation). Returns `{ptr, elem_size, generation}` — for `Slab`, `ptr` is the **slot base**, `elem_size` is `ElemSize`, and `generation` is the Block’s generation (so Pool can write the end tag without a map lookup). For `SlabProxy`, `{base, 0, 0}` (Pool uses a front header; user pointer is `base + header_size`). |
-| `deallocateItem(item)` | Free an **Item** previously returned by `allocateItem` (a **slot base** for `Slab`, not a user pointer). Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
+| `deallocateItem(item, block_base = nullptr)` | Free an **Item** previously returned by `allocateItem` (a **slot base** for `Slab`, not a user pointer). Optional `block_base` (Pool free path) skips the Slab address-map range search. Rejects unknown, interior, or already-free addresses (`std::invalid_argument`). |
 | `reclaimEmptyBlocks(keep_min)` | Drop fully empty **Blocks**; keep at least `keep_min` (default 1). Default base implementation is a no-op; `Slab` overrides. Returns how many Blocks were deleted. |
 | `getAllocatedMemory()` | Bytes retained by this Slab’s **Blocks** (default `0`). |
 
