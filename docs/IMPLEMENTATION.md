@@ -882,9 +882,9 @@ common stale path.
 
 ### Locality measurement (bench-only)
 
-A planned `--scenario=chase` working-set pointer-chase harness (sysfs-auto WS
-defaults) will A/B trailer locality vs today’s front header — see the design
-note. It does not change Pool/Slab locking.
+`--scenario=chase` is a working-set pointer-chase harness (sysfs-auto WS
+defaults). It does not change Pool/Slab locking. Post-cutover sample numbers
+and how to re-run: [Benchmarks — Chase](#chase-ws-pointer-chase-post-cutover).
 
 ---
 
@@ -1069,6 +1069,42 @@ make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new alignmen
 make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
 make bench BUILD_TYPE=release \
   BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'   # WS pointer-chase cliffs
+```
+
+#### Chase / WS pointer-chase (post-cutover)
+
+Layout A puts the size-class payload at the Slot base (no front pad), so
+`--align=64` chase is the interesting A/B vs `::new`. Opt-in scenario (not in
+`all`). Absolute ns are host-specific; ratios on one quiet run matter more than
+cross-machine copies.
+
+**Host sample** (America/Los_Angeles, 2026-11-23): 8× cores, L1d=32K / L2=256K /
+L3=25M (sysfs WS auto), `clang 20.1.2`, `BUILD_TYPE=release`, stride=64,
+`chase_loads=30e6`. Excerpt (`ns/load`):
+
+| align | WS | pool spatial | new spatial | pool random | new random |
+|------:|---:|-------------:|------------:|------------:|-----------:|
+| 64 | 16K | 3.46 | 1.31 | 3.47 | 2.73 |
+| 64 | 256K | 5.53 | 5.27 | 11.08 | 14.21 |
+| 64 | ~12.5M | **9.61** | 13.57 | **32.14** | 86.32 |
+| 64 | 25M | 22.21 | 20.87 | 97.99 | 106.61 |
+| 64 | 100M | 23.12 | 22.48 | 120.17 | 120.20 |
+| 16 | 32K | **1.40** | 5.42 | **1.60** | 3.35 |
+| 16 | ~12.5M | 5.37 | 3.79 | 34.13 | 29.92 |
+| 16 | 100M | 12.73 | 8.80 | 119.60 | 117.98 |
+
+**How to read:** plateaus ≈ L1/L2/L3/DRAM; knees mark capacity. Spatial keeps
+alloc-order rings (Pool Blocks stay contiguous longer); random shuffles links.
+At `--align=64` mid-WS, Pool spatial/random often beat scattered `::new` once
+working sets leave L2 — consistent with trailer layout (payload at offset 0 on
+an aligned Slot). Tiny WS noise and DRAM-random floors are expected to look
+similar across backends.
+
+Re-run after further layout changes:
+
+```bash
+make bench BUILD_TYPE=release \
+  BENCH_ARGS='--scenario=chase --backend=new,pool --align=64 --link=all'
 ```
 
 Compares `::operator new`, `spallocator::Pool`, `spallocator::PoolMemoryResource`
