@@ -34,35 +34,15 @@
 #define SPALLOCATOR_IMPL_ISLAB_HPP_
 
 #include <cstddef>
-#include <cstdint>
 
 namespace spallocator
 {
 
-    // Result of allocateItem. For Slab, block_base/generation identify the
-    // owning Block so Pool can stash routing hints in the front header.
-    // SlabProxy leaves block_base null and generation 0.
-    struct AllocateItemResult
-    {
-        std::byte* ptr = nullptr;
-        std::byte* block_base = nullptr;
-        std::uint16_t block_generation = 0;
-
-        // Convenience for call sites that only need the slot / allocation base.
-        operator std::byte*() const noexcept { return ptr; }
-    };
-
     class ISlab
     {
     public: // methods
-        virtual AllocateItemResult allocateItem(std::size_t size) = 0;
-
-        // Optional block_base + generation: when block_base is non-null (Pool
-        // free with header hints), Slab verifies generation and uses an
-        // exact-base lookup instead of an address-range search.
-        virtual void deallocateItem(std::byte* item,
-                                    std::byte* block_base = nullptr,
-                                    std::uint16_t block_generation = 0) = 0;
+        virtual std::byte* allocateItem(std::size_t size) = 0;
+        virtual void deallocateItem(std::byte* item) = 0;
 
         // Release fully empty Blocks back to the OS. Default: no-op
         // (SlabProxy). Returns the number of Blocks deleted.

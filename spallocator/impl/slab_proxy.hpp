@@ -34,7 +34,6 @@
 #define SPALLOCATOR_IMPL_SLAB_PROXY_HPP_
 
 #include <cstddef>
-#include <cstdint>
 #include <format>
 #include <new>
 #include <stdexcept>
@@ -54,10 +53,8 @@ namespace spallocator
     class SlabProxy: public ISlab
     {
     public: // methods
-        AllocateItemResult allocateItem(std::size_t size) override;
-        void deallocateItem(std::byte* item,
-                            std::byte* block_base = nullptr,
-                            std::uint16_t block_generation = 0) override;
+        std::byte* allocateItem(std::size_t size) override;
+        void deallocateItem(std::byte* item) override;
 
         SlabProxy() = default;
         ~SlabProxy() override = default;
@@ -79,7 +76,7 @@ namespace spallocator
     // so any Pool request alignment ≤ 64 is satisfied.
     inline constexpr std::size_t kProxyAlignment = 64;
 
-    inline AllocateItemResult SlabProxy::allocateItem(std::size_t elem_size)
+    inline std::byte* SlabProxy::allocateItem(std::size_t elem_size)
     {
         // Active in all build types (not runtime_assert): mis-sized large
         // allocations must fail loudly rather than allocate or be rejected
@@ -99,13 +96,11 @@ namespace spallocator
         std::byte* item = new(std::align_val_t{kProxyAlignment}) std::byte[elem_size];
         debug_println("Allocated {} bytes via SlabProxy (align={}), ptr={}",
                       elem_size, kProxyAlignment, static_cast<void*>(item));
-        return AllocateItemResult{item, nullptr, 0};
+        return item;
     }
 
 
-    inline void SlabProxy::deallocateItem(std::byte* item,
-                                          std::byte* /*block_base*/,
-                                          std::uint16_t /*block_generation*/)
+    inline void SlabProxy::deallocateItem(std::byte* item)
     {
         debug_println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));
 
