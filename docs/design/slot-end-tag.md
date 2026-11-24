@@ -204,18 +204,20 @@ make bench BUILD_TYPE=release \
   BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'
 ```
 
-Use before/after trailer cutover (especially `--align=64`, payload at offset 0).
+Post-cutover sample table and reading notes:
+[IMPLEMENTATION.md — Chase](../IMPLEMENTATION.md#chase-ws-pointer-chase-post-cutover)
+(especially `--align=64`, payload at offset 0).
 
 ---
 
 ## Suggested implementation order
 
-1. Header layout PR (`spallocator/impl/`, slab split) — before Block registry code  
-2. This spec + IMPLEMENTATION locking (Phase 0 — **this document**)  
-3. Chase bench baseline (0b, parallel OK)  
-4. Block registry + staged publish (header path still live)  
-5. Hard-break cutover: trailer + proxy `header_size≥16` + CRC + dispatch  
-6. Re-measure chase  
+1. Header layout PR (`spallocator/impl/`, slab split) — **done**  
+2. This spec + IMPLEMENTATION locking (Phase 0) — **done**  
+3. Chase bench baseline (0b) — **done**  
+4. Block registry + staged publish — **done**  
+5. Hard-break cutover: trailer + proxy `header_size≥16` + CRC + dispatch — **done**  
+6. Re-measure chase — sample on integration tree (see IMPLEMENTATION chase section)
 
 ---
 
