@@ -284,8 +284,14 @@ namespace spallocator
         void observe_retained_hwm(std::uint64_t retained_bytes) noexcept;
 
         void install_block_registry();
+        void install_pool_context();
+
+        // M4-B Map-0: span-probe + hardened BlockHeader identity (no map lock).
+        // nullopt ⇒ not a published size-class slot for this Pool.
+        std::optional<BlockEntry> probe_block_header(std::byte* p) const noexcept;
 
         // Shared map lookup: upper_bound predecessor + range + exact slot base.
+        // Map-T / diagnostics only — release free uses probe_block_header.
         // Copies BlockEntry then unlocks. nullopt ⇒ not a size-class Block slot.
         std::optional<BlockEntry> find_block_owner(std::byte* p) const noexcept;
 
@@ -311,12 +317,13 @@ namespace spallocator
     private: // data members
         PoolControlBlock* control_{nullptr};
 
-        // Block ownership map for size-class free routing. Declared *before*
-        // size-class Slabs so ~Slab can unregister while map/registry live.
-        // Shared lookup on free; exclusive mutate on grow/trim.
+        // Block ownership map (Map-T): grow/trim / diagnostics. Free uses
+        // M4-B header probe (Map-0). Declared *before* size-class Slabs so
+        // ~Slab can unregister while map/registry live.
         mutable std::shared_mutex block_map_lock_;
         std::map<std::byte*, BlockEntry> block_owner_;
         Registry block_registry_{*this};
+        std::uint64_t pool_cookie_{0};
 
         // Eager, immutable registries: every ladder rung is installed in
         // Pool() and never replaced/nulled. Resolve is lock-free on all alignment classes;
@@ -526,10 +533,10 @@ namespace spallocator
 
         try
         {
-            // Size-class free: map shared lookup → unlock → tag/CRC → slab.
-            // Else strict proxy front-header probe. Never hold the map lock
-            // across slab work. See docs/design/slot-end-tag.md.
-            if (std::optional<BlockEntry> entry = find_block_owner(item))
+            // Size-class free (M4-B Map-0): span probe + hardened header →
+            // end-tag verify → slab. No shared_mutex on the hit path.
+            // Else strict proxy front-header probe.
+            if (std::optional<BlockEntry> entry = probe_block_header(item))
             {
 #if defined(SPALLOCATOR_HAS_ASAN)
                 ASAN_UNPOISON_MEMORY_REGION(
@@ -886,9 +893,35 @@ namespace spallocator
         slabs64[14] = makePoolSlab<12288, 64>();
         slabs64[15] = makePoolSlab<16384, 64>();
 
-        // After all engines exist (including warm-start Blocks), install the
-        // Pool Block registry so grow/trim keep block_owner_ consistent.
+        // Cookie + pool back-pointers for M4-B headers (before registry so
+        // any late grow sees a complete identity).
+        install_pool_context();
+        // Map-T: grow/trim keep block_owner_ for diagnostics / tests.
         install_block_registry();
+    }
+
+
+    inline void Pool::install_pool_context()
+    {
+        static std::atomic<std::uint64_t> cookie_seq{
+            0xC00C1E5C00C1E5CFull ^ 0x9E3779B97F4A7C15ull};
+        pool_cookie_ = cookie_seq.fetch_add(0x9E3779B97F4A7C15ull,
+                                            std::memory_order_relaxed) ^
+                       static_cast<std::uint64_t>(
+                           reinterpret_cast<std::uintptr_t>(this));
+
+        for (auto& s: slabs16)
+        {
+            s->set_pool_context(this, pool_cookie_);
+        }
+        for (auto& s: slabs32)
+        {
+            s->set_pool_context(this, pool_cookie_);
+        }
+        for (auto& s: slabs64)
+        {
+            s->set_pool_context(this, pool_cookie_);
+        }
     }
 
 
@@ -937,6 +970,62 @@ namespace spallocator
     }
 
 
+    inline std::optional<BlockEntry> Pool::probe_block_header(std::byte* p) const noexcept
+    {
+        const auto addr = reinterpret_cast<std::uintptr_t>(p);
+
+        for (std::size_t i = 0; i < kBlockSpanCandidateCount; ++i)
+        {
+            const std::size_t span = kBlockSpanCandidates[i];
+            const auto base_addr = addr & ~(static_cast<std::uintptr_t>(span) - 1u);
+            std::byte* const base = reinterpret_cast<std::byte*>(base_addr);
+            // Large lookbacks can leave the caller's mapping (stack junk,
+            // etc.). Small spans stay within ~64 KiB of p and are safe to
+            // peek without a syscall on the hot path.
+            constexpr std::size_t kSafeProbeSpan = 65536u;
+            if (span > kSafeProbeSpan && !block_header_pages_mapped(base))
+            {
+                continue;
+            }
+            const BlockHeader& hdr = *block_header_at(base);
+
+            // Fail closed: nonsense / coincidental layouts never become "hit".
+            if (!block_header_identity_ok(hdr, span, pool_cookie_))
+            {
+                continue;
+            }
+            if (hdr.pool != this || hdr.slab == nullptr)
+            {
+                continue;
+            }
+            // Geometry: exact slot start inside the published slot region.
+            std::byte* const slots = block_slots_start(base);
+            if (p < slots)
+            {
+                continue;
+            }
+            const std::size_t slot_bytes =
+                static_cast<std::size_t>(hdr.span) - kBlockHeaderBytes;
+            const std::size_t slot_count = slot_bytes / hdr.elem_size;
+            const auto off = static_cast<std::size_t>(p - slots);
+            const std::size_t index = off / hdr.elem_size;
+            if (index >= slot_count || p != slots + index * hdr.elem_size)
+            {
+                continue;
+            }
+
+            BlockEntry entry;
+            entry.slab = hdr.slab;
+            entry.block_base = base;
+            entry.elem_size = hdr.elem_size;
+            entry.block_bytes = hdr.span;
+            entry.generation = hdr.generation;
+            return entry;
+        }
+        return std::nullopt;
+    }
+
+
     inline std::optional<BlockEntry> Pool::find_block_owner(std::byte* p) const noexcept
     {
         std::shared_lock lock(block_map_lock_);
@@ -955,8 +1044,21 @@ namespace spallocator
             return std::nullopt;
         }
 
-        const auto offset = static_cast<std::size_t>(p - base);
-        if (offset >= entry.block_bytes || (offset % entry.elem_size) != 0)
+        // Slots begin after the head BlockHeader; reject header / pad hits.
+        std::byte* const slots = block_slots_start(base);
+        if (p < slots)
+        {
+            return std::nullopt;
+        }
+        const auto offset = static_cast<std::size_t>(p - slots);
+        const std::size_t slot_bytes =
+            entry.block_bytes > kBlockHeaderBytes
+                ? entry.block_bytes - kBlockHeaderBytes
+                : 0;
+        const std::size_t slot_count =
+            entry.elem_size != 0 ? slot_bytes / entry.elem_size : 0;
+        const std::size_t index = offset / entry.elem_size;
+        if (index >= slot_count || p != slots + index * entry.elem_size)
         {
             return std::nullopt;
         }

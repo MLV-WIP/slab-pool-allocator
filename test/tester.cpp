@@ -45,6 +45,7 @@
 
 #include <memory_resource>
 
+#include "spallocator/impl/block_header.hpp"
 #include "spallocator/impl/helper.hpp"
 #include "spallocator/impl/islab.hpp"
 #include "spallocator/impl/slab.hpp"
@@ -281,7 +282,7 @@ TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
     // valid across kSlabTargetBytes / multiplier configure knobs (old tests
     // hard-coded 200/50 for a 256-slot 4 KiB buffer).
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = selectBlockSize<16>() / 16;
+    constexpr std::size_t kSlots = selectBlockSlots<16>();
     static_assert(kSlots >= 16);
     constexpr std::size_t kCursor = kSlots / 2;
     constexpr std::size_t kEarlier = kCursor / 4;
@@ -324,7 +325,7 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
     // Fill the whole buffer, park the cursor near the end, free a low slot,
     // then prove the next alloc returns that low slot without adding a buffer.
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = selectBlockSize<16>() / 16;
+    constexpr std::size_t kSlots = selectBlockSlots<16>();
     static_assert(kSlots >= 16);
     constexpr std::size_t kHigh = kSlots - 6;
     constexpr std::size_t kLow = 10;
@@ -369,7 +370,7 @@ TEST(SlabTest, NextFitSurvivesReclaim)
     // next-fit cursor must be reset. After growing to two buffers, freeing all,
     // and reclaiming one, alloc/free on the survivor must still work.
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = selectBlockSize<16>() / 16;
+    constexpr std::size_t kSlots = selectBlockSlots<16>();
     std::vector<std::byte*> items;
     items.reserve(kSlots + 1);
     for (std::size_t i = 0; i < kSlots + 1; ++i)
@@ -402,7 +403,7 @@ TEST(SlabTest, AllocFreeChurnMicrobench)
     // Warm a full buffer then LIFO churn; slot count follows selectBlockSize
     // so the warm-up still saturates exactly one buffer under any packing knobs.
     Slab<16, 16> slab;
-    constexpr std::size_t kSlots = selectBlockSize<16>() / 16;
+    constexpr std::size_t kSlots = selectBlockSlots<16>();
 #if defined(NDEBUG)
     constexpr int kIters = 500000;
 #else
@@ -450,7 +451,7 @@ TEST(SlabTest, ReclaimEmptyBlocksReturnsBuffers)
     // must drop extras while keeping ≥ keep_min. Capacity is selectBlockSize
     // based so “fill one buffer + 1” still forces a second buffer after packing.
     Slab<16, 16> slab(/*preallocate_first_block=*/true);
-    constexpr std::size_t kSlotsPerSlab = selectBlockSize<16>() / 16;
+    constexpr std::size_t kSlotsPerSlab = selectBlockSlots<16>();
     EXPECT_EQ(slab.getBlockCount(), 1u);
     const std::size_t baseline = slab.getAllocatedMemory();
 
@@ -821,7 +822,7 @@ TEST(PoolTest, TrimReclaimsEmptySizeClassSlabs)
     const std::size_t before = pool.getAllocatedMemory();
 
     // allocate(16) → footprint 24 (8 B trailer) → 32 B class.
-    constexpr std::size_t kSlotsPerSlab = selectBlockSize<32>() / 32;
+    constexpr std::size_t kSlotsPerSlab = selectBlockSlots<32>();
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab + 1; ++i)
@@ -850,7 +851,7 @@ TEST(PoolTest, BlockOwnerMapTracksGrowAndTrim)
     Pool pool;
     EXPECT_EQ(pool.block_owner_count(), kWarmBlocks);
 
-    constexpr std::size_t kSlotsPerSlab = selectBlockSize<32>() / 32;
+    constexpr std::size_t kSlotsPerSlab = selectBlockSlots<32>();
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab + 1; ++i)
@@ -882,7 +883,7 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
     EXPECT_LT(slab.getAvailabilityMapBytes(), kLegacyFixedBytes);
     EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
 
-    constexpr std::size_t kSlotsPerSlab = selectBlockSize<16>() / 16;
+    constexpr std::size_t kSlotsPerSlab = selectBlockSlots<16>();
     std::vector<std::byte*> items;
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab; ++i)
@@ -935,67 +936,69 @@ TEST(SlabTest, SelectBlockSizeExactPackAndFloors)
     EXPECT_EQ(selectBlockSize<1_KB>(), kSlabTargetMultiplier * 1_KB);
     EXPECT_EQ(selectBlockSize<4096>(), kSlabTargetMultiplier * 4096u);
 
-    // Slab<> must publish the same size the freemap/bitset was compiled with.
+    // Slab<> publishes pow2 span (M4-B); slot count fits header + payload pack.
     Slab<48, 16> s48;
     Slab<384, 16> s384;
-    EXPECT_EQ(s48.getAllocSize(), selectBlockSize<48>());
-    EXPECT_EQ(s384.getAllocSize(), selectBlockSize<384>());
-    EXPECT_EQ(s48.getAllocSize() / 48u, kSlabTargetBytes / 48u);
-    EXPECT_GE(s384.getAllocSize() / 384u, kSlabTargetMultiplier);
+    EXPECT_EQ(s48.getAllocSize(), selectBlockSpan<48>());
+    EXPECT_EQ(s384.getAllocSize(), selectBlockSpan<384>());
+    EXPECT_EQ(selectBlockSlots<48>(), (selectBlockSpan<48>() - kBlockHeaderBytes) / 48u);
+    EXPECT_GE(selectBlockSlots<48>(), kSlabTargetBytes / 48u);
+    EXPECT_GE(selectBlockSlots<384>(), kSlabTargetMultiplier);
+    EXPECT_EQ((s48.getAllocSize() & (s48.getAllocSize() - 1u)), 0u);
 }
 
 
 TEST(SlabTest, CreateSlabs)
 {
-    // Smoke: getAllocSize/getAllocatedMemory match selectBlockSize for a
-    // cross-section of classes, including multiplier-floored large sizes and
-    // an odd ElemSize that is not a KiB multiple (KB-multiple assert removed).
-    // Pass preallocate_first_block=true so cold engines report one data block.
+    // Smoke: getAllocSize/getAllocatedMemory match selectBlockSpan (M4-B pow2
+    // Block with head header). Pass preallocate_first_block=true so cold
+    // engines report one data block.
     {
         Slab<64> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 64u);
-        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<64>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<64>());
-        EXPECT_EQ(slab.getAllocSize() % 64u, 0u);
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSpan<64>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSpan<64>());
+        EXPECT_EQ((slab.getAllocSize() & (slab.getAllocSize() - 1u)), 0u);
     }
 
     {
         Slab<128> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 128u);
-        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<128>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<128>());
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSpan<128>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSpan<128>());
     }
 
     {
         Slab<1_KB> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 1_KB);
-        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<1_KB>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<1_KB>());
-        EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 1_KB);
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSpan<1_KB>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSpan<1_KB>());
+        EXPECT_GE(selectBlockSlots<1_KB>(), kSlabTargetMultiplier);
     }
 
     {
         Slab<2_KB> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 2_KB);
-        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<2_KB>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<2_KB>());
-        EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 2_KB);
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSpan<2_KB>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSpan<2_KB>());
+        EXPECT_GE(selectBlockSlots<2_KB>(), kSlabTargetMultiplier);
     }
 
     {
         Slab<16_KB> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 16_KB);
-        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<16_KB>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<16_KB>());
-        EXPECT_EQ(slab.getAllocSize(), kSlabTargetMultiplier * 16_KB);
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSpan<16_KB>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSpan<16_KB>());
+        EXPECT_GE(selectBlockSlots<16_KB>(), kSlabTargetMultiplier);
     }
 
     {
         Slab<12336> slab(/*preallocate_first_block=*/true);
         EXPECT_EQ(slab.getElemSize(), 12336u);
-        EXPECT_EQ(slab.getAllocSize(), selectBlockSize<12336>());
-        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<12336>());
-        EXPECT_EQ(slab.getAllocSize() % 12336u, 0u);
+        EXPECT_EQ(slab.getAllocSize(), selectBlockSpan<12336>());
+        EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSpan<12336>());
+        EXPECT_EQ((slab.getAllocSize() & (slab.getAllocSize() - 1u)), 0u);
+        EXPECT_GE(selectBlockSlots<12336>(), kSlabTargetMultiplier);
     }
 
 }
@@ -1012,7 +1015,7 @@ TEST(SlabTest, ZeroBlockEngineGrowsOnFirstAlloc)
     auto [p, elem_size, generation] = slab.allocateItem(512);
     ASSERT_NE(p, nullptr);
     EXPECT_EQ(slab.getBlockCount(), 1u);
-    EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<512>());
+    EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSpan<512>());
 
     slab.deallocateItem(p);
     EXPECT_EQ(slab.getBlockCount(), 1u); // monotonic until reclaim
@@ -1034,9 +1037,9 @@ TEST(PoolTest, ColdRetainedMatchesPreallocatePolicy)
     EXPECT_EQ(kPreallocateMaxAlignment, 16u);
 
     constexpr std::size_t expected =
-        selectBlockSize<16>() + selectBlockSize<32>() + selectBlockSize<48>() +
-        selectBlockSize<64>() + selectBlockSize<96>() + selectBlockSize<128>() +
-        selectBlockSize<192>() + selectBlockSize<256>();
+        selectBlockSpan<16>() + selectBlockSpan<32>() + selectBlockSpan<48>() +
+        selectBlockSpan<64>() + selectBlockSpan<96>() + selectBlockSpan<128>() +
+        selectBlockSpan<192>() + selectBlockSpan<256>();
 
     Pool pool;
     EXPECT_EQ(pool.getAllocatedMemory(), expected);
@@ -1060,11 +1063,11 @@ TEST(SlabTest, AllocateItems)
 {
     // Why: growth must happen only after a buffer is full, and retained empty
     // buffers stay mapped until trim/reclaim (monotonic). Drive fills from
-    // selectBlockSize so expectations track packing knobs.
+    // selectBlockSlots / selectBlockSpan so expectations track M4-B packing.
     Slab<128> slab(/*preallocate_first_block=*/true);
 
-    constexpr std::size_t kBuf = selectBlockSize<128>();
-    constexpr std::size_t kSlots = kBuf / 128;
+    constexpr std::size_t kBuf = selectBlockSpan<128>();
+    constexpr std::size_t kSlots = selectBlockSlots<128>();
     EXPECT_EQ(slab.getAllocatedMemory(), kBuf);
     EXPECT_EQ(slab.getBlockCount(), 1u);
 
@@ -1373,6 +1376,47 @@ TEST(PoolTest, DeallocateRejectsInteriorPointer)
 
     // Exact user pointer still frees cleanly after rejected interiors.
     EXPECT_NO_THROW(pool.deallocate(p));
+}
+
+
+TEST(PoolTest, DeallocateRejectsNonsenseBlockHeader)
+{
+    // Why: coincidental dual magic / garbage BlockHeader fields must fail
+    // closed (try_deallocate false), never route into a slab freemap.
+    Pool pool;
+
+    alignas(16384) std::byte forged[16384]{};
+    BlockHeader* hdr = block_header_at(forged);
+    hdr->magic0 = kBlockHeaderMagic0;
+    hdr->magic1 = kBlockHeaderMagic1;
+    hdr->span = 16384;
+    hdr->elem_size = 32;
+    hdr->generation = 1;
+    hdr->align_class = 16;
+    hdr->flags = kBlockFlagPublished;
+    hdr->pool = &pool;
+    hdr->slab = reinterpret_cast<ISlab*>(forged); // not a real slab
+    hdr->pool_cookie = 0xDEADBEEFCAFEu;          // wrong cookie
+    hdr->reserved0 = 0;
+
+    std::byte* fake_slot = block_slots_start(forged);
+    EXPECT_FALSE(pool.try_deallocate(fake_slot));
+    EXPECT_THROW(pool.deallocate(fake_slot), std::invalid_argument);
+
+    // Live allocation: corrupt align_class → reject; restore works.
+    auto* live = pool.allocate(16); // footprint 24 → Slab<32,16>
+    ASSERT_NE(live, nullptr);
+    constexpr std::size_t kSpan = selectBlockSpan<32>();
+    const auto addr = reinterpret_cast<std::uintptr_t>(live);
+    std::byte* base =
+        reinterpret_cast<std::byte*>(addr & ~(static_cast<std::uintptr_t>(kSpan) - 1u));
+    BlockHeader* live_hdr = block_header_at(base);
+    ASSERT_EQ(live_hdr->magic0, kBlockHeaderMagic0);
+    const auto saved_align = live_hdr->align_class;
+    live_hdr->align_class = 3; // nonsense
+    EXPECT_FALSE(pool.try_deallocate(live));
+    live_hdr->align_class = saved_align;
+    EXPECT_NO_THROW(pool.deallocate(live));
 }
 
 

@@ -42,6 +42,8 @@
 namespace spallocator
 {
 
+    class Pool;
+
     // ptr, ElemSize (0 for SlabProxy), Block generation (0 for SlabProxy).
     using AllocateItemResult = std::tuple<std::byte*, std::size_t, std::uint16_t>;
 
@@ -65,6 +67,9 @@ namespace spallocator
         // Pool installs its Block registry after constructing size-class engines.
         // Default no-op (SlabProxy). Slab registers any already-published Blocks.
         virtual void set_block_registry(BlockRegistry* /*registry*/) {}
+
+        // Pool identity for M4-B Block headers (cookie + back-pointer).
+        virtual void set_pool_context(Pool* /*pool*/, std::uint64_t /*cookie*/) {}
 
         virtual ~ISlab() = default;
 

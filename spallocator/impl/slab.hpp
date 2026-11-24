@@ -38,10 +38,10 @@
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <format>
 #include <iostream>
 #include <limits>
-#include <cstdint>
 #include <map>
 #include <mutex>
 #include <new>
@@ -53,6 +53,7 @@
 
 #include "impl/block_registry.hpp"
 #include "impl/helper.hpp"
+#include "impl/block_header.hpp"
 #include "impl/islab.hpp"
 #include "mlvlib/spinlock.hpp"
 
@@ -84,15 +85,36 @@ namespace spallocator
     static_assert(kSlabTargetMultiplier * 16384ull >= kSlabTargetBytes,
         "kSlabTargetMultiplier too small for largest ElemSize under target");
 
-    // Exact-pack Block: slots = max(multiplier, target/ElemSize), zero tail.
-    // (SPALLOCATOR_SLAB_TARGET_* knobs size Blocks; names kept for config stability.)
+    // Exact-pack payload (slot region only): slots = max(multiplier, target/ElemSize).
+    // (SPALLOCATOR_SLAB_TARGET_* knobs; names kept for config stability.)
     template<std::size_t ElemSize>
-    constexpr std::size_t selectBlockSize()
+    constexpr std::size_t selectBlockPayloadBytes()
     {
         constexpr std::size_t from_target = kSlabTargetBytes / ElemSize;
         constexpr std::size_t slots =
             from_target > kSlabTargetMultiplier ? from_target : kSlabTargetMultiplier;
         return slots * ElemSize;
+    }
+
+    // M4-B: power-of-two span covering head BlockHeader + payload.
+    template<std::size_t ElemSize>
+    constexpr std::size_t selectBlockSpan()
+    {
+        return next_pow2_size(kBlockHeaderBytes + selectBlockPayloadBytes<ElemSize>());
+    }
+
+    // Legacy name: payload bytes before span rounding (tests / docs).
+    template<std::size_t ElemSize>
+    constexpr std::size_t selectBlockSize()
+    {
+        return selectBlockPayloadBytes<ElemSize>();
+    }
+
+    // Live slot count after head header + pow2 span rounding.
+    template<std::size_t ElemSize>
+    constexpr std::size_t selectBlockSlots()
+    {
+        return (selectBlockSpan<ElemSize>() - kBlockHeaderBytes) / ElemSize;
     }
 
 
@@ -141,8 +163,8 @@ namespace spallocator
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
         constexpr std::size_t getAlignment() const { return Alignment; }
-        constexpr std::size_t getAllocSize() const { return block_bytes; }
-        std::size_t getAllocatedMemory() const override { return block_bases.size() * block_bytes; }
+        constexpr std::size_t getAllocSize() const { return block_span; }
+        std::size_t getAllocatedMemory() const override { return block_bases.size() * block_span; }
         std::size_t getAvailabilityMapBytes() const { return block_available_map.bytes(); }
         std::size_t getBlockCount() const { return block_bases.size(); }
 
@@ -160,6 +182,7 @@ namespace spallocator
         ~Slab() override;
 
         void set_block_registry(BlockRegistry* registry) override;
+        void set_pool_context(Pool* pool, std::uint64_t cookie) override;
 
     private: // methods
         Slab(const Slab&) = delete;
@@ -175,7 +198,12 @@ namespace spallocator
         // Detach Block at index (swap-with-last); returns VA for delete[] after
         // map erase. Caller holds slab lock.
         std::byte* detachBlockAt(std::size_t index);
-    
+
+        // Write / refresh the head BlockHeader (caller holds slab_lock).
+        void writeBlockHeader(std::byte* block_base,
+                              std::uint16_t generation,
+                              bool published) noexcept;
+
     private: // data members
         static_assert(Alignment == 16 || Alignment == 32 || Alignment == 64,
             "Slab Alignment must be 16, 32, or 64");
@@ -183,13 +211,18 @@ namespace spallocator
             "ElemSize must be a multiple of Alignment");
         static_assert(ElemSize >= Alignment,
             "ElemSize must be at least Alignment");
+        static_assert(kBlockHeaderBytes % Alignment == 0,
+            "BlockHeader size must be a multiple of Slab Alignment");
 
-        static constexpr std::size_t block_bytes{selectBlockSize<ElemSize>()};
-        static constexpr std::size_t slots_per_block{block_bytes / ElemSize};
-        static_assert(block_bytes == slots_per_block * ElemSize,
-            "Block must be an exact multiple of ElemSize (zero tail)");
+        static constexpr std::size_t block_span{selectBlockSpan<ElemSize>()};
+        static constexpr std::size_t slots_per_block{
+            (block_span - kBlockHeaderBytes) / ElemSize};
+        static_assert(slots_per_block * ElemSize + kBlockHeaderBytes <= block_span,
+            "Slots + header must fit in Block span");
         static_assert(slots_per_block >= kSlabTargetMultiplier,
             "Block must hold at least kSlabTargetMultiplier slots");
+        static_assert((block_span & (block_span - 1)) == 0,
+            "Block span must be a power of two (M4-B mask)");
 
         std::vector<std::byte*> block_bases;
 
@@ -202,7 +235,7 @@ namespace spallocator
         };
         std::vector<BlockMeta> block_meta_;
 
-        static constexpr std::size_t max_blocks{kMaxClassBytes / block_bytes};
+        static constexpr std::size_t max_blocks{kMaxClassBytes / block_span};
         static_assert(max_blocks >= 1,
             "kMaxClassBytes must allow at least one Block of this ElemSize");
         DynBitset block_available_map;
@@ -215,9 +248,16 @@ namespace spallocator
         std::size_t alloc_cursor_slot_{0};
 
         BlockRegistry* registry_{nullptr};
+        Pool* pool_{nullptr};
+        std::uint64_t pool_cookie_{0};
         std::uint16_t next_generation_{1};
 
         SpinLock slab_lock;
+
+        static std::byte* slot_at(std::byte* block_base, std::size_t slot_index) noexcept
+        {
+            return block_slots_start(block_base) + slot_index * ElemSize;
+        }
     };
 
 
@@ -606,7 +646,7 @@ namespace spallocator
                         debug_println("Item allocated ({}/{}), block_meta.freemap<{},{}>: {}",
                                       block_index, item_index, ElemSize, Alignment,
                                       printHex(block_slots));
-                        return {block_bases[block_index] + item_index * ElemSize,
+                        return {slot_at(block_bases[block_index], item_index),
                                 ElemSize,
                                 block_meta_[block_index].generation};
                     }
@@ -633,20 +673,24 @@ namespace spallocator
     template<std::size_t ElemSize, std::size_t Alignment>
     std::optional<std::size_t> Slab<ElemSize, Alignment>::findBlockForSlot(std::byte* slot_base) const
     {
+        // Slot region is [slots_start, slots_start + slots_per_block * ElemSize).
+        auto in_slot_region = [](std::byte* block_start, std::byte* p) noexcept {
+            std::byte* const slots = block_slots_start(block_start);
+            std::byte* const slots_end = slots + slots_per_block * ElemSize;
+            return p >= slots && p < slots_end;
+        };
+
         // Single-Block fast path: skip the address map (common steady state).
         if (block_bases.size() == 1)
         {
             std::byte* const block_start = block_bases[0];
-            std::byte* const block_end = block_start + block_bytes;
-            if (slot_base >= block_start && slot_base < block_end)
+            if (in_slot_region(block_start, slot_base))
             {
                 return 0;
             }
             debug_println(
-                "Slot base {} is not within sole block range {} - {}; treating as unknown pointer",
-                static_cast<void*>(slot_base),
-                static_cast<void*>(block_start),
-                static_cast<void*>(block_end));
+                "Slot base {} is not within sole block slot region; treating as unknown pointer",
+                static_cast<void*>(slot_base));
             return std::nullopt;
         }
 
@@ -655,20 +699,17 @@ namespace spallocator
         {
             --it;
             auto block_start = it->first;
-            auto block_end = block_start + block_bytes;
             // Predecessor start is only a candidate. Invalid pointers (or
             // addresses in gaps between Blocks) can upper_bound into this path
-            // without falling inside [block_start, block_end).
-            if (slot_base >= block_start && slot_base < block_end)
+            // without falling inside the slot region.
+            if (in_slot_region(block_start, slot_base))
             {
                 return it->second;
             }
 
             debug_println(
-                "Slot base {} is not within candidate block range {} - {}; treating as unknown pointer",
-                static_cast<void*>(slot_base),
-                static_cast<void*>(block_start),
-                static_cast<void*>(block_end));
+                "Slot base {} is not within candidate block slot region; treating as unknown pointer",
+                static_cast<void*>(slot_base));
         }
         return std::nullopt;
     }
@@ -715,20 +756,21 @@ namespace spallocator
         }
 
         auto& block_slots = block_meta_[block_index].freemap;
+        std::byte* const slots_start = block_slots_start(block_start);
 
         // Require an exact slot base. Integer division alone would map an
         // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
         // the freemap — or free a live neighbor.
-        const auto offset = item - block_start;
+        const auto offset = item - slots_start;
         if (offset < 0)
         {
             throw std::invalid_argument(
-                "Invalid item pointer; address is before block start");
+                "Invalid item pointer; address is before slot region");
         }
         const std::size_t byte_offset = static_cast<std::size_t>(offset);
         const std::size_t item_index = byte_offset / ElemSize;
         if (item_index >= block_slots.size() ||
-            item != block_start + item_index * ElemSize)
+            item != slots_start + item_index * ElemSize)
         {
             throw std::invalid_argument(
                 "Invalid item pointer; not aligned to a slot boundary");
@@ -768,12 +810,51 @@ namespace spallocator
         // Unregister before releasing VA (same order as staged unpublish).
         for (auto ptr : block_bases)
         {
+            if (BlockHeader* hdr = block_header_at(ptr))
+            {
+                hdr->flags = 0; // unpublished before delete[]
+            }
             if (registry_)
             {
                 registry_->on_block_died(ptr);
             }
-            ::operator delete[](ptr, std::align_val_t{Alignment});
+            ::operator delete[](ptr, std::align_val_t{block_span});
         }
+    }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment>
+    void Slab<ElemSize, Alignment>::set_pool_context(Pool* pool, std::uint64_t cookie)
+    {
+        std::scoped_lock<SpinLock> guard(slab_lock);
+        pool_ = pool;
+        pool_cookie_ = cookie;
+        for (std::size_t i = 0; i < block_bases.size(); ++i)
+        {
+            writeBlockHeader(block_bases[i], block_meta_[i].generation,
+                             /*published=*/block_available_map.test(i));
+        }
+    }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment>
+    void Slab<ElemSize, Alignment>::writeBlockHeader(std::byte* block_base,
+                                                    std::uint16_t generation,
+                                                    bool published) noexcept
+    {
+        BlockHeader* hdr = block_header_at(block_base);
+        // Clear first so reserved/pad cannot carry stale nonsense.
+        std::memset(hdr, 0, sizeof(BlockHeader));
+        hdr->magic0 = kBlockHeaderMagic0;
+        hdr->span = static_cast<std::uint32_t>(block_span);
+        hdr->elem_size = static_cast<std::uint32_t>(ElemSize);
+        hdr->generation = generation;
+        hdr->align_class = static_cast<std::uint8_t>(Alignment);
+        hdr->pool = pool_;
+        hdr->slab = this;
+        hdr->pool_cookie = pool_cookie_;
+        hdr->magic1 = kBlockHeaderMagic1;
+        hdr->flags = published ? kBlockFlagPublished : std::uint8_t{0};
     }
 
 
@@ -814,7 +895,7 @@ namespace spallocator
             entry.slab = this;
             entry.block_base = p.base;
             entry.elem_size = ElemSize;
-            entry.block_bytes = block_bytes;
+            entry.block_bytes = block_span;
             entry.generation = p.generation;
             registry->on_block_born(p.base, entry);
         }
@@ -863,7 +944,7 @@ namespace spallocator
             {
                 registry_->on_block_died(doomed);
             }
-            ::operator delete[](doomed, std::align_val_t{Alignment});
+            ::operator delete[](doomed, std::align_val_t{block_span});
             guard.lock();
             ++reclaimed;
             // New occupant at index (swap-with-last) must be examined next.
@@ -881,6 +962,8 @@ namespace spallocator
     {
         // Caller holds slab_lock; freemap for index is empty.
         std::byte* doomed = block_bases[index];
+        // Fail closed for concurrent free: clear PUBLISHED before unlink/delete.
+        block_header_at(doomed)->flags = 0;
         base_address_map.erase(doomed);
 
         const std::size_t last = block_bases.size() - 1;
@@ -909,18 +992,24 @@ namespace spallocator
         {
             throw std::out_of_range(
                 std::format("Cannot allocate more than {} blocks of size {} bytes",
-                            max_blocks, block_bytes));
+                            max_blocks, block_span));
         }
 
         // Staged publish: append UNPUBLISHED (available bit clear), map-register
-        // if a registry is installed, then mark PUBLISHED. See
-        // docs/design/slot-end-tag.md.
-        std::byte* new_block = new(std::align_val_t{Alignment}) std::byte[block_bytes];
+        // if a registry is installed, then mark PUBLISHED. Span-aligned so
+        // Pool free can align_down(p, span). See docs/design/slot-end-tag.md.
+        static_assert(block_span >= Alignment,
+                      "Block span must satisfy Slab Alignment");
+        std::byte* new_block =
+            new (std::align_val_t{block_span}) std::byte[block_span];
         const std::uint16_t gen = next_generation_++;
         if (next_generation_ == 0)
         {
             next_generation_ = 1; // skip 0
         }
+
+        // Header present but unpublished until freemap publish below.
+        writeBlockHeader(new_block, gen, /*published=*/false);
 
         block_bases.push_back(new_block);
         const std::size_t new_index = block_bases.size() - 1;
@@ -937,15 +1026,17 @@ namespace spallocator
             entry.slab = this;
             entry.block_base = new_block;
             entry.elem_size = ElemSize;
-            entry.block_bytes = block_bytes;
+            entry.block_bytes = block_span;
             entry.generation = gen;
             guard.unlock();
             registry_->on_block_born(new_block, entry);
             guard.lock();
         }
 
-        // Publish: allocatable. new_index remains valid: other threads cannot
-        // detach this unpublished Block (reclaim skips available-clear).
+        // Publish: allocatable + header flag. new_index remains valid: other
+        // threads cannot detach this unpublished Block (reclaim skips
+        // available-clear).
+        block_header_at(new_block)->flags = kBlockFlagPublished;
         block_available_map.set(new_index);
     }
 
