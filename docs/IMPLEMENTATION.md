@@ -165,8 +165,13 @@ are zero pad so the user pointer meets the requested alignment.
 | `−5` | `uint8_t` | `header_size` itself (`16`, `32`, or `64`) |
 | `−6` | `uint8_t` | `kAllocMagic`; validated then cleared on free |
 | `−12 … −7` | reserved | Zeros |
-| `−16 … −13` | `uint32_t` | CRC32C over user_ptr ‖ alloc_size ‖ header_size ‖ magic |
+| `−16 … −13` | `uint32_t` | CRC32C when `SPALLOCATOR_ENABLE_CRC32C=1`; else zeros |
 | `−header_size … −17` | pad | Present when `header_size > 16` |
+
+Integrity: tags/headers always carry **magic + generation**. Optional CRC32C is
+**on by default for debug/sanitizer** `BUILD_TYPE` and **off for release**
+(`./configure --enable/--disable-crc32c`, or `-DSPALLOCATOR_ENABLE_CRC32C=0/1`).
+Builds default to `-march=native` (`./configure --disable-native-arch` to opt out).
 
 ### Why an end tag for size-class?
 
@@ -896,8 +901,9 @@ canvas.
 Concurrency: Pool-level **`block_owner_`** map (`std::map` keyed by Block base)
 guarded by **`std::shared_mutex`** (shared lookup on free; exclusive
 insert/erase on grow/trim via `BlockRegistry`). Allocate resolves via
-`resolveSlab` only (map used after allocate to read generation/ElemSize for the
-tag). Per-slab `SpinLock` continues to guard freemaps / Block vectors.
+`resolveSlab` only; size-class `allocateItem` returns `{ptr, ElemSize, generation}`
+so Pool can write the end tag without a map lookup. Per-slab `SpinLock`
+continues to guard freemaps / Block vectors.
 See [design/slot-end-tag.md](design/slot-end-tag.md).
 
 ### Invariants
@@ -907,9 +913,9 @@ See [design/slot-end-tag.md](design/slot-end-tag.md).
 2. Map erase only when the Block has **zero live slots** (same empty rule as
    today’s `reclaimEmptyBlocks`), and **before** `delete[]` of that VA.
 3. Free hot path order: **map shared lock → copy `BlockEntry` → unlock →
-   validate end-tag / CRC → `deallocateItem` (slab lock)**. Never hold the map
-   lock across slab work; never take the map lock while already holding a slab
-   lock on that path.
+   validate end-tag / CRC → `deallocateItem(item, entry.block_base)` (slab lock;
+   known-base exact lookup)**. Never hold the map lock across slab work; never
+   take the map lock while already holding a slab lock on that path.
 4. **Freemap occupancy is the epoch** that keeps a Block alive across the
    map→slab gap for a *live* free racing trim. Generation + CRC harden stale /
    wild pointers and VA reuse.
@@ -919,7 +925,7 @@ See [design/slot-end-tag.md](design/slot-end-tag.md).
 ```text
 [slab lock]   new[] + append; mark UNPUBLISHED (not in alloc scan)
 [unlock]
-[map exclusive]  insert {base → BlockEntry{slab, ElemSize, block_bytes, gen}}
+[map exclusive]  insert {base → BlockEntry{slab, block_base, ElemSize, block_bytes, gen}}
 [unlock]
 [slab lock]   mark PUBLISHED (allocatable)
 [unlock]

@@ -34,17 +34,28 @@
 #define SPALLOCATOR_IMPL_ISLAB_HPP_
 
 #include <cstddef>
+#include <cstdint>
+#include <tuple>
 
 #include "impl/block_registry.hpp"
 
 namespace spallocator
 {
 
+    // ptr, ElemSize (0 for SlabProxy), Block generation (0 for SlabProxy).
+    using AllocateItemResult = std::tuple<std::byte*, std::size_t, std::uint16_t>;
+
     class ISlab
     {
     public: // methods
-        virtual std::byte* allocateItem(std::size_t size) = 0;
-        virtual void deallocateItem(std::byte* item) = 0;
+        // Size-class Slab returns ElemSize + Block generation so Pool can write
+        // the end tag without a Block-map lookup on allocate. SlabProxy returns
+        // {ptr, 0, 0}.
+        virtual AllocateItemResult allocateItem(std::size_t size) = 0;
+
+        // Optional block_base: when non-null (Pool free path), Slab skips the
+        // address-map range search and uses an exact-base lookup instead.
+        virtual void deallocateItem(std::byte* item, std::byte* block_base = nullptr) = 0;
 
         // Release fully empty Blocks back to the OS. Default: no-op
         // (SlabProxy). Returns the number of Blocks deleted.

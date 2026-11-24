@@ -37,7 +37,13 @@
 #include <cstdint>
 #include <cstring>
 
-#include "impl/crc32c.hpp"
+#ifndef SPALLOCATOR_ENABLE_CRC32C
+#  define SPALLOCATOR_ENABLE_CRC32C 0
+#endif
+
+#if SPALLOCATOR_ENABLE_CRC32C
+#  include "impl/crc32c.hpp"
+#endif
 
 namespace spallocator
 {
@@ -49,6 +55,11 @@ namespace spallocator
     inline constexpr std::uint8_t kTagFormatV1 = 0;
     inline constexpr std::size_t kSlotTagBytes = 8;
     inline constexpr std::size_t kSizeClassTrailerTax = 8;
+
+    // Optional CRC32C on size-class tags and proxy headers.
+    // configure defaults: on for debug/sanitizer BUILD_TYPE, off for release.
+    // Override: --enable/--disable-crc32c or -DSPALLOCATOR_ENABLE_CRC32C=0/1.
+    inline constexpr bool kEnableCrc32c = (SPALLOCATOR_ENABLE_CRC32C != 0);
 
     // LE uint64: magic[7:0] | gen[23:8] | crc32c[55:24] | format[63:56]
     inline std::uint64_t pack_slot_tag(std::uint8_t magic,
@@ -74,6 +85,7 @@ namespace spallocator
         format = static_cast<std::uint8_t>((tag >> 56) & 0xffu);
     }
 
+#if SPALLOCATOR_ENABLE_CRC32C
     // CRC coverage: LE concat of user_ptr ‖ elem_size ‖ generation ‖ magic (19 B).
     inline std::uint32_t slot_tag_crc(std::byte* user_ptr,
                                       std::size_t elem_size,
@@ -90,19 +102,22 @@ namespace spallocator
         buf[18] = magic;
         return crc32c(buf, sizeof(buf));
     }
+#endif
 
     inline void write_slot_tag(std::byte* slot_base,
                                std::size_t elem_size,
                                std::uint16_t generation) noexcept
     {
-        const std::uint32_t crc =
-            slot_tag_crc(slot_base, elem_size, generation, kTagMagicLive);
+        std::uint32_t crc = 0;
+#if SPALLOCATOR_ENABLE_CRC32C
+        crc = slot_tag_crc(slot_base, elem_size, generation, kTagMagicLive);
+#endif
         const std::uint64_t tag =
             pack_slot_tag(kTagMagicLive, generation, crc, kTagFormatV1);
         std::memcpy(slot_base + elem_size - kSlotTagBytes, &tag, kSlotTagBytes);
     }
 
-    // Returns true if LIVE tag matches map entry generation + CRC.
+    // Returns true if LIVE tag matches map entry generation (+ CRC when enabled).
     inline bool verify_slot_tag(std::byte* slot_base,
                                 std::size_t elem_size,
                                 std::uint16_t expected_generation) noexcept
@@ -122,9 +137,14 @@ namespace spallocator
         {
             return false;
         }
+#if SPALLOCATOR_ENABLE_CRC32C
         const std::uint32_t expect =
             slot_tag_crc(slot_base, elem_size, expected_generation, kTagMagicLive);
         return crc == expect;
+#else
+        (void)crc;
+        return true;
+#endif
     }
 
     inline void clear_slot_tag(std::byte* slot_base, std::size_t elem_size) noexcept
@@ -135,6 +155,7 @@ namespace spallocator
         std::memcpy(slot_base + elem_size - kSlotTagBytes, &tag, kSlotTagBytes);
     }
 
+#if SPALLOCATOR_ENABLE_CRC32C
     // Proxy front-header CRC: LE concat user_ptr ‖ alloc_size ‖ header_size ‖ magic.
     inline std::uint32_t proxy_header_crc(std::byte* user_ptr,
                                           std::uint32_t alloc_size,
@@ -150,6 +171,7 @@ namespace spallocator
         buf[13] = magic;
         return crc32c(buf, sizeof(buf));
     }
+#endif
 
 } // namespace spallocator
 

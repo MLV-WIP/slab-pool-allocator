@@ -87,6 +87,7 @@ Anything that peeked **before** the size-class user pointer is broken (see
 ```cpp
 struct BlockEntry {
     ISlab*      slab;
+    std::byte*  block_base;   // same as map key; passed into deallocateItem
     std::size_t elem_size;
     std::size_t block_bytes;
     uint16_t    generation;
@@ -163,7 +164,7 @@ LE concat:
 
 ```text
 1. Block-map shared lookup → copy BlockEntry → unlock
-2. If hit: validate tag (magic, gen, CRC) → slab->deallocateItem(p)
+2. If hit: validate tag (magic, gen, CRC) → slab->deallocateItem(p, entry.block_base)
 3. Else: strict proxy front-header probe (header_size ∈ {16,32,64}, magic, size, CRC)
 4. Else: fail closed
 ```

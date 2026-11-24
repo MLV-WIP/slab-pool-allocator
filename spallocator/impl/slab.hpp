@@ -136,8 +136,8 @@ namespace spallocator
     class Slab: public ISlab
     {
     public: // methods
-        std::byte* allocateItem(std::size_t size) override;
-        void deallocateItem(std::byte* item) override;
+        AllocateItemResult allocateItem(std::size_t size) override;
+        void deallocateItem(std::byte* item, std::byte* block_base = nullptr) override;
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
         constexpr std::size_t getAlignment() const { return Alignment; }
@@ -476,10 +476,17 @@ namespace spallocator
         using word_t = unsigned long long;
         constexpr std::size_t kWordBits = std::numeric_limits<word_t>::digits; // 64
         constexpr std::size_t kMaskBits = N < kWordBits ? N : kWordBits;
-        constexpr word_t kLowWordBits =
-            (kMaskBits == kWordBits)
-                ? ~word_t{0}
-                : ((word_t{1} << kMaskBits) - word_t{1});
+        // if constexpr: both arms of ?: are checked, and << kWordBits is UB.
+        constexpr word_t kLowWordBits = [] {
+            if constexpr (kMaskBits == kWordBits)
+            {
+                return ~word_t{0};
+            }
+            else
+            {
+                return (word_t{1} << kMaskBits) - word_t{1};
+            }
+        }();
         constexpr std::bitset<N> kLowWordMask{kLowWordBits};
 
         for (std::size_t base = (start / kWordBits) * kWordBits; base < N;
@@ -514,7 +521,7 @@ namespace spallocator
     // ---------------------------------------------------------------------------
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    std::byte* Slab<ElemSize, Alignment>::allocateItem(std::size_t size)
+    AllocateItemResult Slab<ElemSize, Alignment>::allocateItem(std::size_t size)
     {
         // Must remain active in release builds: an oversized request would
         // otherwise be placed in a too-small slot (silent overrun).
@@ -599,7 +606,9 @@ namespace spallocator
                         debug_println("Item allocated ({}/{}), block_meta.freemap<{},{}>: {}",
                                       block_index, item_index, ElemSize, Alignment,
                                       printHex(block_slots));
-                        return block_bases[block_index] + item_index * ElemSize;
+                        return {block_bases[block_index] + item_index * ElemSize,
+                                ElemSize,
+                                block_meta_[block_index].generation};
                     }
                 }
 
@@ -666,7 +675,7 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    void Slab<ElemSize, Alignment>::deallocateItem(std::byte* item)
+    void Slab<ElemSize, Alignment>::deallocateItem(std::byte* item, std::byte* block_base)
     {
         if (!item)
         {
@@ -675,53 +684,65 @@ namespace spallocator
 
         std::scoped_lock<SpinLock> guard(slab_lock);
 
-        // Find which Block this item belongs to
-        if (auto block_index_opt = findBlockForSlot(item); !block_index_opt.has_value())
+        std::size_t block_index = 0;
+        std::byte* block_start = nullptr;
+
+        if (block_base != nullptr)
         {
-            throw std::invalid_argument("Invalid item pointer; no corresponding block found");
+            // Pool already resolved ownership: exact-base lookup (no upper_bound).
+            auto it = base_address_map.find(block_base);
+            if (it == base_address_map.end())
+            {
+                throw std::invalid_argument(
+                    "Invalid item pointer; known block_base not registered in this Slab");
+            }
+            block_index = it->second;
+            block_start = block_base;
+            if (block_index >= block_bases.size() || block_bases[block_index] != block_base)
+            {
+                throw std::invalid_argument(
+                    "Invalid item pointer; block_base index mismatch");
+            }
+        }
+        else if (auto block_index_opt = findBlockForSlot(item); block_index_opt.has_value())
+        {
+            block_index = *block_index_opt;
+            block_start = block_bases[block_index];
         }
         else
         {
-            auto block_index = *block_index_opt;
-
-            auto block_start = block_bases[block_index];
-            auto& block_slots = block_meta_[block_index].freemap;
-
-            // Require an exact slot base. Integer division alone would map an
-            // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
-            // the freemap — or free a live neighbor.
-            const auto offset = item - block_start;
-            if (offset < 0)
-            {
-                throw std::invalid_argument(
-                    "Invalid item pointer; address is before block start");
-            }
-            const std::size_t byte_offset = static_cast<std::size_t>(offset);
-            const std::size_t item_index = byte_offset / ElemSize;
-            if (item_index >= block_slots.size() ||
-                item != block_start + item_index * ElemSize)
-            {
-                throw std::invalid_argument(
-                    "Invalid item pointer; not aligned to a slot boundary");
-            }
-
-            if (block_slots.test(item_index))
-            {
-                // Free the item
-                block_slots.reset(item_index);
-                // This Block now has free space
-                block_available_map.set(block_index);
-                debug_println("Item freed ({}/{}), block_meta.freemap: {}",
-                              block_index, item_index, printHex(block_slots));
-                return;
-            }
-            else
-            {
-                throw std::invalid_argument("Item is already free");
-            }
+            throw std::invalid_argument("Invalid item pointer; no corresponding block found");
         }
 
-        throw std::invalid_argument("Invalid item pointer; item not found in block");
+        auto& block_slots = block_meta_[block_index].freemap;
+
+        // Require an exact slot base. Integer division alone would map an
+        // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
+        // the freemap — or free a live neighbor.
+        const auto offset = item - block_start;
+        if (offset < 0)
+        {
+            throw std::invalid_argument(
+                "Invalid item pointer; address is before block start");
+        }
+        const std::size_t byte_offset = static_cast<std::size_t>(offset);
+        const std::size_t item_index = byte_offset / ElemSize;
+        if (item_index >= block_slots.size() ||
+            item != block_start + item_index * ElemSize)
+        {
+            throw std::invalid_argument(
+                "Invalid item pointer; not aligned to a slot boundary");
+        }
+
+        if (!block_slots.test(item_index))
+        {
+            throw std::invalid_argument("Item is already free");
+        }
+
+        block_slots.reset(item_index);
+        block_available_map.set(block_index);
+        debug_println("Item freed ({}/{}), block_meta.freemap: {}",
+                      block_index, item_index, printHex(block_slots));
     }
 
 
@@ -791,6 +812,7 @@ namespace spallocator
         {
             BlockEntry entry;
             entry.slab = this;
+            entry.block_base = p.base;
             entry.elem_size = ElemSize;
             entry.block_bytes = block_bytes;
             entry.generation = p.generation;
@@ -913,6 +935,7 @@ namespace spallocator
         {
             BlockEntry entry;
             entry.slab = this;
+            entry.block_base = new_block;
             entry.elem_size = ElemSize;
             entry.block_bytes = block_bytes;
             entry.generation = gen;
