@@ -1,8 +1,12 @@
 # Design: size-class end tags + Block ownership map
 
-**Status:** implemented (size-class end tag + Block map free + proxy front header
-≥ 16 + CRC32C).  
-**Version impact:** **major** release (layout / free-protocol break).
+> **ARCHIVE / ABANDONED (2026-11-24, America/Los_Angeles).**  
+> The slot-end-tag cutover is **not** shipping to `main`. PR #12 was closed without merge; PR #11 was reverted on `main`.  
+> This integration branch (`cursor/slot-end-tag-dev-dc92`) and its docs are retained for **knowledge only**.  
+> Do not open new PRs from this line into `main`. Continue on the header-based allocator path on trunk.
+
+**Status:** abandoned (archive). Formerly implemented on this branch only (size-class end tag + Block map free + proxy front header ≥ 16 + CRC32C).  
+**Version impact:** n/a — not shipping to `main`.
 
 Related: [IMPLEMENTATION.md — Memory layout](../IMPLEMENTATION.md#memory-layout)
 (byte diagrams + rationale),

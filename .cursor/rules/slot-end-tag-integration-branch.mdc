@@ -1,21 +1,14 @@
 ---
-description: Slot-end-tag work stays on integration branch until final cutover to main
+description: Slot-end-tag line is abandoned; knowledge branch only — do not merge to main
 alwaysApply: true
 ---
 
-# Slot-end-tag integration branch
+# Slot-end-tag — ABANDONED (knowledge archive)
 
-All Layout A / Block-map / chase / related header-layout work for this project lands on:
+**As of 2026-11-24:** the slot-end-tag cutover is abandoned. PR #12 closed; PR #11 reverted on `main`.
 
-**`cursor/slot-end-tag-dev-dc92`** (integration / “master dev” branch)
+**`cursor/slot-end-tag-dev-dc92`** is a **knowledge archive** only (docs + experimental history). Do **not** merge it (or its subbranches) to `main`. Do **not** open PRs from this line into `main`.
 
-## Workflow
+New allocator work continues from **`main`** (header-based path). Salvage candidates (chase bench, optional CRC, etc.) should be cherry-picked onto fresh branches off `main`, not continued on this integration line.
 
-- Cut **subbranches** from `cursor/slot-end-tag-dev-dc92` (names still `cursor/<desc>-dc92`).
-- When a chunk is done and reviewed: **`git merge`** the subbranch into `cursor/slot-end-tag-dev-dc92` (no PR for integration-branch merges).
-- **Do not merge to `main`** until the full effort is finished and Michael is confident in the result.
-- Open a PR to **`main` only** for the final cutover (explicit ask).
-
-## Order reminder
-
-Prefer header-layout (`impl/` + slab split) before Block-registry code; chase bench may parallelize. Spec: `docs/design/slot-end-tag.md`.
+Spec archive: `docs/design/slot-end-tag.md` (banner at top).
