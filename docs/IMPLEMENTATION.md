@@ -373,9 +373,10 @@ one `(ElemSize, Alignment)`. It owns zero or more **Blocks** (mapped chunks of
 Slots); each **Slot** is one `ElemSize` unit. Full glossary:
 [terminology-glossary.md](terminology-glossary.md).
 
-**Phase 2 (private) done in code:** `allocateNewBlock`, `destroyBlockAt`,
-`block_bases` / `block_freemaps` / `block_available_map` / `block_bytes` /
-`max_blocks` / `slots_per_block` / `alloc_cursor_block_` / `selectBlockSize`.
+**Phase 2 (private) done in code:** `allocateNewBlock`, `detachBlockAt`,
+`block_bases` / `block_meta_` (`freemap` + `generation`) / `block_available_map` /
+`block_bytes` / `max_blocks` / `slots_per_block` / `alloc_cursor_block_` /
+`selectBlockSize`.
 
 **Phase 3 (public) hard-renamed:** `getBlockCount`, `reclaimEmptyBlocks`,
 `findBlockForSlot`, `PoolLifetimeToken` (keep `PoolControlBlock`). Configure
@@ -857,16 +858,17 @@ canvas.
 
 ## Planned: Block map & trailer locking
 
-**Status:** design freeze for the upcoming cutover — **not implemented yet**.
-Full layout, CRC bit packing, and dispatch:
-[design/slot-end-tag.md](design/slot-end-tag.md). Brief call-site comments in
-`pool.hpp` / `impl/slab.hpp` point here.
+**Status:** Phase 1 **Block registry + staged publish/unpublish** is on the
+integration tree (allocate/free still use today’s front-header protocol). Full
+trailer cutover, CRC, and free dispatch remain ahead — see
+[design/slot-end-tag.md](design/slot-end-tag.md).
 
-After cutover, concurrency gains a Pool-level **`block_owner_`** map
-(`std::map` keyed by Block base) guarded by **`std::shared_mutex`** (shared
-lookup on free; exclusive insert/erase on grow/trim). Allocate still does
-**not** use the map (`resolveSlab` only). Per-slab `SpinLock` continues to
-guard freemaps / Block vectors.
+Concurrency: Pool-level **`block_owner_`** map (`std::map` keyed by Block base)
+guarded by **`std::shared_mutex`** (shared lookup later on free; exclusive
+insert/erase on grow/trim via `BlockRegistry`). Allocate still does **not** use
+the map (`resolveSlab` only). Per-slab `SpinLock` continues to guard freemaps /
+Block vectors. Size-class `Slab` installs the registry after Pool construction
+and registers warm-start Blocks.
 
 ### Invariants
 

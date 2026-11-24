@@ -41,6 +41,7 @@
 #include <format>
 #include <iostream>
 #include <limits>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <new>
@@ -50,6 +51,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "impl/block_registry.hpp"
 #include "impl/helper.hpp"
 #include "impl/islab.hpp"
 #include "mlvlib/spinlock.hpp"
@@ -157,14 +159,22 @@ namespace spallocator
         explicit Slab(bool preallocate_first_block = false);
         ~Slab() override;
 
+        void set_block_registry(BlockRegistry* registry) override;
+
     private: // methods
         Slab(const Slab&) = delete;
         Slab& operator=(const Slab&) = delete;
         Slab(Slab&&) = delete;
         Slab& operator=(Slab&&) = delete;
 
-        void allocateNewBlock();
-        void destroyBlockAt(std::size_t index);
+        // Staged publish (Layout A): create unpublished under slab lock, unlock
+        // for map insert when registry_ is set, then mark allocatable. See
+        // docs/design/slot-end-tag.md.
+        void allocateNewBlock(std::unique_lock<SpinLock>& guard);
+
+        // Detach Block at index (swap-with-last); returns VA for delete[] after
+        // map erase. Caller holds slab lock.
+        std::byte* detachBlockAt(std::size_t index);
     
     private: // data members
         static_assert(Alignment == 16 || Alignment == 32 || Alignment == 64,
@@ -182,9 +192,16 @@ namespace spallocator
             "Block must hold at least kSlabTargetMultiplier slots");
 
         std::vector<std::byte*> block_bases;
-        // Per-Block slot freemap (SlotFreemap): compile-time slot count,
-        // word array storage. Convention: bit set ⇒ occupied; clear ⇒ free.
-        std::vector<SlotFreemap<slots_per_block>> block_freemaps;
+
+        // Per-Block freemap + Layout A generation (one vector so grow/trim stay paired).
+        // Freemap: compile-time slot count, word array. Bit set ⇒ occupied; clear ⇒ free.
+        struct BlockMeta
+        {
+            SlotFreemap<slots_per_block> freemap;
+            std::uint16_t generation{0};
+        };
+        std::vector<BlockMeta> block_meta_;
+
         static constexpr std::size_t max_blocks{kMaxClassBytes / block_bytes};
         static_assert(max_blocks >= 1,
             "kMaxClassBytes must allow at least one Block of this ElemSize");
@@ -196,6 +213,9 @@ namespace spallocator
         // Reset when reclaim/swap-with-last invalidates Block indices.
         std::size_t alloc_cursor_block_{0};
         std::size_t alloc_cursor_slot_{0};
+
+        BlockRegistry* registry_{nullptr};
+        std::uint16_t next_generation_{1};
 
         SpinLock slab_lock;
     };
@@ -230,6 +250,7 @@ namespace spallocator
     };
 
 
+
     // ---------------------------------------------------------------------------
     // DynBitset
     // ---------------------------------------------------------------------------
@@ -239,15 +260,18 @@ namespace spallocator
         return (words_[bit >> 6] >> (bit & 63)) & 1ull;
     }
 
+
     inline void DynBitset::set(std::size_t bit)
     {
         words_[bit >> 6] |= (std::uint64_t{1} << (bit & 63));
     }
 
+
     inline void DynBitset::reset(std::size_t bit)
     {
         words_[bit >> 6] &= ~(std::uint64_t{1} << (bit & 63));
     }
+
 
     inline void DynBitset::push_set()
     {
@@ -262,6 +286,7 @@ namespace spallocator
         ++size_;
         set(bit);
     }
+
 
     inline void DynBitset::swap_bits(std::size_t a, std::size_t b)
     {
@@ -288,6 +313,7 @@ namespace spallocator
         }
     }
 
+
     inline void DynBitset::pop_back()
     {
         if (size_ == 0)
@@ -296,6 +322,7 @@ namespace spallocator
         }
         --size_;
     }
+
 
 
     // ---------------------------------------------------------------------------
@@ -308,17 +335,20 @@ namespace spallocator
         return (words_[i / kWordBits] >> (i % kWordBits)) & 1ull;
     }
 
+
     template<std::size_t N>
     inline void SlotFreemap<N>::set(std::size_t i) noexcept
     {
         words_[i / kWordBits] |= (std::uint64_t{1} << (i % kWordBits));
     }
 
+
     template<std::size_t N>
     inline void SlotFreemap<N>::reset(std::size_t i) noexcept
     {
         words_[i / kWordBits] &= ~(std::uint64_t{1} << (i % kWordBits));
     }
+
 
     template<std::size_t N>
     inline bool SlotFreemap<N>::none() const noexcept
@@ -332,6 +362,7 @@ namespace spallocator
         }
         return true;
     }
+
 
     template<std::size_t N>
     inline bool SlotFreemap<N>::all() const noexcept
@@ -355,6 +386,7 @@ namespace spallocator
         }
         return true;
     }
+
 
     template<std::size_t N>
     inline std::size_t SlotFreemap<N>::find_next_clear(std::size_t start) const noexcept
@@ -386,6 +418,7 @@ namespace spallocator
         }
         return N;
     }
+
 
     template<std::size_t N>
     inline const std::array<std::uint64_t, SlotFreemap<N>::kWordCount>&
@@ -475,6 +508,7 @@ namespace spallocator
     }
 
 
+
     // ---------------------------------------------------------------------------
     // Slab
     // ---------------------------------------------------------------------------
@@ -490,7 +524,8 @@ namespace spallocator
                 std::format("Requested size {} exceeds slab element size {}", size, ElemSize));
         }
 
-        std::scoped_lock<SpinLock> guard(slab_lock);
+        // unique_lock: staged publish may unlock for Block map registration.
+        std::unique_lock<SpinLock> guard(slab_lock);
 
         // Next-fit: resume at (alloc_cursor_block_, alloc_cursor_slot_). When every
         // live Block is full, grow then retry.
@@ -499,7 +534,7 @@ namespace spallocator
             const std::size_t nblocks = block_bases.size();
             if (nblocks == 0)
             {
-                allocateNewBlock();
+                allocateNewBlock(guard);
                 alloc_cursor_block_ = 0;
                 alloc_cursor_slot_ = 0;
                 continue;
@@ -517,7 +552,8 @@ namespace spallocator
             {
                 if (block_available_map.test(block_index))
                 {
-                    auto& block_slots = block_freemaps[block_index];
+                    auto& block_slots = block_meta_[block_index].freemap;
+
                     // Next-fit fast path: if the cursor slot is free, take it
                     // without a freemap word scan (common for LIFO / local churn).
                     std::size_t item_index = block_slots.size();
@@ -560,7 +596,7 @@ namespace spallocator
                             }
                         }
 
-                        debug_println("Item allocated ({}/{}), block_freemaps<{},{}>: {}",
+                        debug_println("Item allocated ({}/{}), block_meta.freemap<{},{}>: {}",
                                       block_index, item_index, ElemSize, Alignment,
                                       printHex(block_slots));
                         return block_bases[block_index] + item_index * ElemSize;
@@ -576,7 +612,7 @@ namespace spallocator
             }
 
             // allocateNewBlock throws when max_blocks is reached.
-            allocateNewBlock();
+            allocateNewBlock(guard);
             alloc_cursor_block_ = block_bases.size() - 1;
             alloc_cursor_slot_ = 0;
             debug_println("New block<{},{}> allocated, total blocks: {}",
@@ -649,7 +685,7 @@ namespace spallocator
             auto block_index = *block_index_opt;
 
             auto block_start = block_bases[block_index];
-            auto& block_slots = block_freemaps[block_index];
+            auto& block_slots = block_meta_[block_index].freemap;
 
             // Require an exact slot base. Integer division alone would map an
             // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
@@ -675,7 +711,7 @@ namespace spallocator
                 block_slots.reset(item_index);
                 // This Block now has free space
                 block_available_map.set(block_index);
-                debug_println("Item freed ({}/{}), block_freemaps: {}",
+                debug_println("Item freed ({}/{}), block_meta.freemap: {}",
                               block_index, item_index, printHex(block_slots));
                 return;
             }
@@ -699,7 +735,8 @@ namespace spallocator
 
         if (preallocate_first_block)
         {
-            allocateNewBlock();
+            std::unique_lock<SpinLock> guard(slab_lock);
+            allocateNewBlock(guard);
         }
     }
 
@@ -707,20 +744,60 @@ namespace spallocator
     Slab<ElemSize, Alignment>::~Slab()
     {
         debug_println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
+        // Unregister before releasing VA (same order as staged unpublish).
         for (auto ptr : block_bases)
         {
-            // C++23 is improved to handle aligned deallocation automatically.
-            // For earlier standards, we need to explicitly pass the alignment
-            // to the delete operator. Unfortunately, this is incomplete in
-            // gcc-14's implementation of the address sanitizer in spite of
-            // otherwise decent C++23 support, so we need to use the older C++17
-            // style deallocation here for portability
+            if (registry_)
+            {
+                registry_->on_block_died(ptr);
+            }
             ::operator delete[](ptr, std::align_val_t{Alignment});
-
-            // Preferred C++23 form that we are avoiding for now due to above issues:
-            //delete[] ptr;
         }
     }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment>
+    void Slab<ElemSize, Alignment>::set_block_registry(BlockRegistry* registry)
+    {
+        debug_println("set_block_registry: registry={}", registry);
+
+        // Snapshot under slab lock, then register without holding it (avoid
+        // nesting slab → map locks). Pool ctor is the intended caller.
+        struct Pending
+        {
+            std::byte* base;
+            std::uint16_t generation;
+        };
+        std::vector<Pending> pending;
+
+        {
+            std::scoped_lock<SpinLock> guard(slab_lock);
+
+            registry_ = registry;
+            if (!registry_)
+            {
+                runtime_assert(registry_ == nullptr, "Registry not set in set_block_registry");
+                return;
+            }
+
+            pending.reserve(block_bases.size());
+            for (std::size_t i = 0; i < block_bases.size(); ++i)
+            {
+                pending.push_back(Pending{block_bases[i], block_meta_[i].generation});
+            }
+        }
+
+        for (const Pending& p: pending)
+        {
+            BlockEntry entry;
+            entry.slab = this;
+            entry.elem_size = ElemSize;
+            entry.block_bytes = block_bytes;
+            entry.generation = p.generation;
+            registry->on_block_born(p.base, entry);
+        }
+    }
+
 
     template<std::size_t ElemSize, std::size_t Alignment>
     std::size_t Slab<ElemSize, Alignment>::reclaimEmptyBlocks(std::size_t keep_min)
@@ -731,10 +808,10 @@ namespace spallocator
             keep_min = 1;
         }
 
-        // Empty-only reclaim is the epoch for planned Layout A free-vs-trim safety
-        // (freemap.none() before destroyBlockAt). Staged unpublish will erase the
-        // Pool Block map entry before delete[]. See docs/design/slot-end-tag.md.
-        std::scoped_lock<SpinLock> guard(slab_lock);
+        // Empty-only reclaim is the epoch for Layout A free-vs-trim safety
+        // (freemap.none() before detach). Staged unpublish: map erase before delete[].
+        // See docs/design/slot-end-tag.md.
+        std::unique_lock<SpinLock> guard(slab_lock);
 
         std::size_t reclaimed = 0;
         std::size_t index = 0;
@@ -745,13 +822,27 @@ namespace spallocator
                 break;
             }
 
-            if (!block_freemaps[index].none())
+            if (!block_meta_[index].freemap.none())
+            {
+                ++index;
+                continue;
+            }
+            // Skip unpublished Blocks (available clear, freemap still empty).
+            // Empty published Blocks keep available set while freemap.none().
+            if (!block_available_map.test(index))
             {
                 ++index;
                 continue;
             }
 
-            destroyBlockAt(index);
+            std::byte* doomed = detachBlockAt(index);
+            guard.unlock();
+            if (registry_)
+            {
+                registry_->on_block_died(doomed);
+            }
+            ::operator delete[](doomed, std::align_val_t{Alignment});
+            guard.lock();
             ++reclaimed;
             // New occupant at index (swap-with-last) must be examined next.
         }
@@ -764,12 +855,9 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    void Slab<ElemSize, Alignment>::destroyBlockAt(std::size_t index)
+    std::byte* Slab<ElemSize, Alignment>::detachBlockAt(std::size_t index)
     {
-        // Planned staged unpublish (Layout A): under slab lock mark DYING / detach,
-        // then map-exclusive erase in Pool *before* delete[] of this VA. Callers
-        // (reclaimEmptyBlocks) already require freemap.none(). See
-        // docs/design/slot-end-tag.md.
+        // Caller holds slab_lock; freemap for index is empty.
         std::byte* doomed = block_bases[index];
         base_address_map.erase(doomed);
 
@@ -777,25 +865,23 @@ namespace spallocator
         if (index != last)
         {
             block_bases[index] = block_bases[last];
-            block_freemaps[index] = block_freemaps[last];
+            block_meta_[index] = block_meta_[last];
             block_available_map.swap_bits(index, last);
             base_address_map[block_bases[index]] = index;
         }
 
         block_bases.pop_back();
-        block_freemaps.pop_back();
+        block_meta_.pop_back();
         block_available_map.pop_back();
 
-        // Block indices may have been swapped; drop the next-fit hint.
         alloc_cursor_block_ = 0;
         alloc_cursor_slot_ = 0;
-
-        ::operator delete[](doomed, std::align_val_t{Alignment});
+        return doomed;
     }
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    void Slab<ElemSize, Alignment>::allocateNewBlock()
+    void Slab<ElemSize, Alignment>::allocateNewBlock(std::unique_lock<SpinLock>& guard)
     {
         if (block_bases.size() >= max_blocks)
         {
@@ -804,19 +890,41 @@ namespace spallocator
                             max_blocks, block_bytes));
         }
 
-        // Planned staged publish (Layout A): append as UNPUBLISHED under slab lock,
-        // unlock, Pool map-exclusive insert, then re-lock and mark PUBLISHED before
-        // the Block is eligible for allocateItem. Today the Block is allocatable
-        // immediately (push_set). See docs/design/slot-end-tag.md.
+        // Staged publish: append UNPUBLISHED (available bit clear), map-register
+        // if a registry is installed, then mark PUBLISHED. See
+        // docs/design/slot-end-tag.md.
         std::byte* new_block = new(std::align_val_t{Alignment}) std::byte[block_bytes];
+        const std::uint16_t gen = next_generation_++;
+        if (next_generation_ == 0)
+        {
+            next_generation_ = 1; // skip 0
+        }
+
         block_bases.push_back(new_block);
-        base_address_map[new_block] = block_bases.size() - 1;
-        block_freemaps.emplace_back();
-        // New Block has free slots; grow availability words only as needed.
+        const std::size_t new_index = block_bases.size() - 1;
+        base_address_map[new_block] = new_index;
+        block_meta_.push_back(BlockMeta{.freemap = {}, .generation = gen});
+
+        // Grow availability word; leave clear ⇒ unpublished / not in alloc scan.
         block_available_map.push_set();
+        block_available_map.reset(new_index);
+
+        if (registry_)
+        {
+            BlockEntry entry;
+            entry.slab = this;
+            entry.elem_size = ElemSize;
+            entry.block_bytes = block_bytes;
+            entry.generation = gen;
+            guard.unlock();
+            registry_->on_block_born(new_block, entry);
+            guard.lock();
+        }
+
+        // Publish: allocatable. new_index remains valid: other threads cannot
+        // detach this unpublished Block (reclaim skips available-clear).
+        block_available_map.set(new_index);
     }
-
-
 
 } // namespace spallocator
 

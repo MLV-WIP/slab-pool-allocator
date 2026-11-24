@@ -35,6 +35,8 @@
 
 #include <cstddef>
 
+#include "impl/block_registry.hpp"
+
 namespace spallocator
 {
 
@@ -48,6 +50,10 @@ namespace spallocator
         // (SlabProxy). Returns the number of Blocks deleted.
         virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
         virtual std::size_t getAllocatedMemory() const { return 0; }
+
+        // Pool installs its Block registry after constructing size-class engines.
+        // Default no-op (SlabProxy). Slab registers any already-published Blocks.
+        virtual void set_block_registry(BlockRegistry* /*registry*/) {}
 
         virtual ~ISlab() = default;
 
