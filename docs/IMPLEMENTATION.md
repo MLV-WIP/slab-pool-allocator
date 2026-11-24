@@ -1023,6 +1023,8 @@ make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
 make bench BUILD_TYPE=release BENCH_ARGS='--align=32'   # Pool vs ::new alignment-class-32 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new alignment-class-64 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
+make bench BUILD_TYPE=release \
+  BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'   # WS pointer-chase cliffs
 ```
 
 Compares `::operator new`, `spallocator::Pool`, `spallocator::PoolMemoryResource`
@@ -1037,11 +1039,24 @@ per-thread `std::minstd_rand` seeded from a fixed key plus worker index
 after scenarios (off by default). Absolute ns are host/toolchain-specific;
 re-run after compiler or stdlib upgrades and compare ratios on the same machine.
 
+**Pointer-chase locality sweep (`--scenario=chase`)** — bench-only, not part of
+`--scenario=all`. Dependent loads (`p = p->next`) over rings while sweeping
+working-set sizes. Default WS list comes from sysfs cache sizes when readable,
+else fixed presets; override with `--ws-bytes=`. Modes: **calibrate** (one
+contiguous `new[]` buffer), **pool** spatial/random, **`::new`** spatial/random.
+Useful flags: `--stride=64`, `--link=spatial|random|all`, `--chase-loads=N`,
+`--align=16|64`. Read ns/load plateaus as L1/L2/L3/DRAM cliffs; knees mark
+capacity.
+
 Filters (for focused timing or profiling):
 
 | Flag | Values | Notes |
 |------|--------|-------|
-| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `all` (comma-ok) | Default `all`. `bulk` is alloc-then-free-all (grows many slab buffers) |
+| `--scenario=` | `lifo`, `multi`, `bulk`, `threaded`, `chase`, `all` (comma-ok) | Default `all` (**excludes** `chase`). `chase` = WS pointer-chase locality sweep |
+| `--ws-bytes=` | e.g. `4K,32K,256K,2M,32M` | Chase WS list (default: sysfs / presets) |
+| `--stride=` | bytes (default **64**) | Chase node stride; multiple of pointer size |
+| `--link=` | `spatial`, `random`, `all` | Chase ring link mode (default `all`) |
+| `--chase-loads=` | N | Dependent loads per cell (default scales with `--iters`) |
 | `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `pool_pmr`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk`. `pool_pmr` shows PMR virtual tax vs raw `pool` |
 | `--pool-stats` | (flag) | Opt-in `[PoolStats]` / slab retained dumps after scenarios |
 | `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
