@@ -1878,19 +1878,63 @@ TEST(PoolTest, MultiThreadTest)
     auto worker = [&pool](std::uint32_t seed) {
         std::mt19937 gen(seed);
         std::uniform_int_distribution<int> dist(0, 1000);
-        std::vector<std::byte*> items;
-        for (int i = 0; i < allocations_per_thread; ++i)
-        {
-            size_t size = 16 + dist(gen);
-            auto item = pool.allocate(size);
-            EXPECT_NE(item, nullptr);
-            items.push_back(item);
-        }
 
-        for (auto it : items)
+        // Interleave alloc/free so threads are not all allocating then all
+        // freeing together. Same totals as before (N of each). Bias toward a
+        // mostly-full live set so contention stays comparable to fill-then-drain.
+        constexpr int N = allocations_per_thread;
+        std::vector<std::byte*> items;
+        items.reserve(static_cast<std::size_t>(N));
+
+        int allocs_done = 0;
+        int frees_done = 0;
+        const std::size_t fill_floor = static_cast<std::size_t>(N) / 2;
+        const std::size_t fill_bias = (static_cast<std::size_t>(N) * 3) / 4;
+        while (allocs_done < N || frees_done < N)
         {
-            pool.deallocate(it);
+            const bool can_alloc = allocs_done < N;
+            const bool can_free = frees_done < N && !items.empty();
+            bool do_alloc = false;
+            if (can_alloc && can_free)
+            {
+                const std::size_t live = items.size();
+                if (live < fill_floor)
+                {
+                    do_alloc = true;
+                }
+                else if (live > fill_bias)
+                {
+                    do_alloc = (gen() & 3u) == 0u;
+                }
+                else
+                {
+                    do_alloc = (gen() & 1u) != 0u;
+                }
+            }
+            else
+            {
+                do_alloc = can_alloc;
+            }
+
+            if (do_alloc)
+            {
+                size_t size = 16 + static_cast<size_t>(dist(gen));
+                auto item = pool.allocate(size);
+                EXPECT_NE(item, nullptr);
+                items.push_back(item);
+                ++allocs_done;
+            }
+            else
+            {
+                std::uniform_int_distribution<std::size_t> pick(0, items.size() - 1);
+                const std::size_t idx = pick(gen);
+                pool.deallocate(items[idx]);
+                items[idx] = items.back();
+                items.pop_back();
+                ++frees_done;
+            }
         }
+        EXPECT_TRUE(items.empty());
     };
 
     std::vector<std::thread> threads;

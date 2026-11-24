@@ -728,6 +728,8 @@ void print_help()
         "Bulk alloc-then-free-all grows many slab buffers (multi-buffer free uses the map).\n"
         "Threaded: shared allocator + start barrier (contention); peak live ≈ threads×batch\n"
         "so multi-buffer growth needs a large batch (default 1024) and --size-mix=class (default).\n"
+        "Each worker randomly interleaves alloc/free (same pair count; live biased high)\n"
+        "so threads do not lock-step through a shared alloc-then-free phase.\n"
         "Chase: build pointer rings then time p=*p only (memory hierarchy, not alloc/free).\n"
         "When ::new is omitted, tables print ns/op only (no vs ::new ratio).\n"
         "\n"
@@ -1037,29 +1039,73 @@ Timing timed_threaded_multi_size_churn(Backend& shared, std::size_t align, SizeM
             // Per-thread RNG: same seed key every process run; distinct stream
             // per worker_index (not std::thread::id - that is not stable).
             std::minstd_rand rng = make_bench_rng(worker_index);
-            std::vector<std::pair<void*, std::size_t>> batch_ptrs(kBatch);
+
+            // Dense live set in [0, live): swap-remove on free. Same peak live
+            // as the old fill-then-drain batch, but alloc vs free is chosen per
+            // op so workers drift out of phase instead of lock-stepping.
+            std::vector<std::pair<void*, std::size_t>> live_ptrs(kBatch);
+            std::size_t live = 0;
+            const int pairs = per * static_cast<int>(kBatch);
 
             ready.fetch_add(1, std::memory_order_acq_rel);
             while (ready.load(std::memory_order_acquire) < threads)
             {
                 std::this_thread::yield();
             }
-            for (int i = 0; i < per; ++i)
+
+            int allocs_done = 0;
+            int frees_done = 0;
+
+            // Bias the random walk toward a mostly-full batch so peak multi-Block
+            // contention pressure stays close to the old fill-then-drain shape,
+            // while still freeing under load so other threads' allocs overlap.
+            const std::size_t fill_floor = kBatch / 2;
+            const std::size_t fill_bias = (kBatch * 3) / 4;
+            while (allocs_done < pairs || frees_done < pairs)
             {
-                for (std::size_t j = 0; j < kBatch; ++j)
+                const bool can_alloc = allocs_done < pairs && live < kBatch;
+                const bool can_free = frees_done < pairs && live > 0;
+                bool do_alloc = false;
+                if (can_alloc && can_free)
+                {
+                    if (live < fill_floor)
+                    {
+                        do_alloc = true;
+                    }
+                    else if (live > fill_bias)
+                    {
+                        do_alloc = (rng() & 3u) == 0u; // mostly free near full
+                    }
+                    else
+                    {
+                        do_alloc = (rng() & 1u) != 0u;
+                    }
+                }
+                else
+                {
+                    do_alloc = can_alloc; // only one side is legal
+                }
+
+                if (do_alloc)
                 {
                     std::size_t s = pick_user_size(rng, mix, align);
-                    batch_ptrs[j].first = shared.allocate(s, align);
-                    batch_ptrs[j].second = s;
-                    sink_ptr(batch_ptrs[j].first);
+                    live_ptrs[live].first = shared.allocate(s, align);
+                    live_ptrs[live].second = s;
+                    sink_ptr(live_ptrs[live].first);
+                    ++live;
+                    ++allocs_done;
                 }
-                // Reverse free; use signed index so j >= 0 is well-defined
-                // (size_t would wrap forever after j hits 0).
-                for (int j = static_cast<int>(kBatch) - 1; j >= 0; --j)
+                else
                 {
-                    auto& slot = batch_ptrs[static_cast<std::size_t>(j)];
+                    // Uniform among live; swap-remove keeps the prefix dense.
+                    const std::size_t idx =
+                        static_cast<std::size_t>(rng() % live);
+                    auto& slot = live_ptrs[idx];
                     shared.deallocate(slot.first, slot.second, align);
-                    slot.first = nullptr;
+                    slot = live_ptrs[live - 1];
+                    live_ptrs[live - 1].first = nullptr;
+                    --live;
+                    ++frees_done;
                 }
             }
         });
