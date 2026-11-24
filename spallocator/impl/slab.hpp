@@ -136,7 +136,7 @@ namespace spallocator
     class Slab: public ISlab
     {
     public: // methods
-        std::byte* allocateItem(std::size_t size) override;
+        AllocateItemResult allocateItem(std::size_t size) override;
         void deallocateItem(std::byte* item) override;
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
@@ -476,10 +476,17 @@ namespace spallocator
         using word_t = unsigned long long;
         constexpr std::size_t kWordBits = std::numeric_limits<word_t>::digits; // 64
         constexpr std::size_t kMaskBits = N < kWordBits ? N : kWordBits;
-        constexpr word_t kLowWordBits =
-            (kMaskBits == kWordBits)
-                ? ~word_t{0}
-                : ((word_t{1} << kMaskBits) - word_t{1});
+        // if constexpr: both arms of ?: are checked, and << kWordBits is UB.
+        constexpr word_t kLowWordBits = [] {
+            if constexpr (kMaskBits == kWordBits)
+            {
+                return ~word_t{0};
+            }
+            else
+            {
+                return (word_t{1} << kMaskBits) - word_t{1};
+            }
+        }();
         constexpr std::bitset<N> kLowWordMask{kLowWordBits};
 
         for (std::size_t base = (start / kWordBits) * kWordBits; base < N;
@@ -514,7 +521,7 @@ namespace spallocator
     // ---------------------------------------------------------------------------
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    std::byte* Slab<ElemSize, Alignment>::allocateItem(std::size_t size)
+    AllocateItemResult Slab<ElemSize, Alignment>::allocateItem(std::size_t size)
     {
         // Must remain active in release builds: an oversized request would
         // otherwise be placed in a too-small slot (silent overrun).
@@ -599,7 +606,9 @@ namespace spallocator
                         debug_println("Item allocated ({}/{}), block_meta.freemap<{},{}>: {}",
                                       block_index, item_index, ElemSize, Alignment,
                                       printHex(block_slots));
-                        return block_bases[block_index] + item_index * ElemSize;
+                        return {block_bases[block_index] + item_index * ElemSize,
+                                ElemSize,
+                                block_meta_[block_index].generation};
                     }
                 }
 

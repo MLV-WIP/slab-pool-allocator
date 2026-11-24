@@ -290,14 +290,17 @@ TEST(SlabTest, NextFitPrefersCursorOverEarlierFree)
 
     for (std::size_t i = 0; i < kCursor; ++i)
     {
-        items.push_back(slab.allocateItem(16));
+        {
+            auto [item, elem_size, generation] = slab.allocateItem(16);
+            items.push_back(item);
+        }
     }
     std::byte* const base = items.front();
     // Hole behind the cursor (would win under first-fit).
     slab.deallocateItem(items[kEarlier]);
     items[kEarlier] = nullptr;
 
-    std::byte* next = slab.allocateItem(16);
+    auto [next, elem_size, generation] = slab.allocateItem(16);
     EXPECT_EQ(next, base + kCursor * 16); // continues forward, ignores hole
     items.push_back(next);
     EXPECT_EQ(slab.getBlockCount(), 1u);
@@ -329,20 +332,26 @@ TEST(SlabTest, NextFitWrapsWithinBuffer)
     items.reserve(kSlots);
     for (std::size_t i = 0; i < kSlots; ++i)
     {
-        items.push_back(slab.allocateItem(16));
+        {
+            auto [item, elem_size, generation] = slab.allocateItem(16);
+            items.push_back(item);
+        }
     }
     EXPECT_EQ(slab.getBlockCount(), 1u);
     std::byte* const base = items.front();
 
     // Re-take kHigh so the cursor sits at kHigh + 1 (past the only soon-free hole).
     slab.deallocateItem(items[kHigh]);
-    items[kHigh] = slab.allocateItem(16);
+    {
+        auto [item, elem_size, generation] = slab.allocateItem(16);
+        items[kHigh] = item;
+    }
     EXPECT_EQ(items[kHigh], base + kHigh * 16);
 
     slab.deallocateItem(items[kLow]);
     items[kLow] = nullptr;
 
-    std::byte* wrapped = slab.allocateItem(16);
+    auto [wrapped, elem_size, generation] = slab.allocateItem(16);
     EXPECT_EQ(wrapped, base + kLow * 16);
     EXPECT_EQ(slab.getBlockCount(), 1u); // wrap, do not grow
     items[kLow] = wrapped;
@@ -365,7 +374,10 @@ TEST(SlabTest, NextFitSurvivesReclaim)
     items.reserve(kSlots + 1);
     for (std::size_t i = 0; i < kSlots + 1; ++i)
     {
-        items.push_back(slab.allocateItem(16));
+        {
+            auto [item, elem_size, generation] = slab.allocateItem(16);
+            items.push_back(item);
+        }
     }
     EXPECT_EQ(slab.getBlockCount(), 2u);
 
@@ -376,7 +388,7 @@ TEST(SlabTest, NextFitSurvivesReclaim)
     EXPECT_EQ(slab.reclaimEmptyBlocks(), 1u);
     EXPECT_EQ(slab.getBlockCount(), 1u);
 
-    auto* p = slab.allocateItem(16);
+    auto [p, elem_size, generation] = slab.allocateItem(16);
     ASSERT_NE(p, nullptr);
     slab.deallocateItem(p);
 }
@@ -402,7 +414,10 @@ TEST(SlabTest, AllocFreeChurnMicrobench)
     warm.reserve(kSlots);
     for (std::size_t i = 0; i < kSlots; ++i)
     {
-        warm.push_back(slab.allocateItem(16));
+        {
+            auto [item, elem_size, generation] = slab.allocateItem(16);
+            warm.push_back(item);
+        }
     }
     for (auto* p : warm)
     {
@@ -412,7 +427,7 @@ TEST(SlabTest, AllocFreeChurnMicrobench)
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kIters; ++i)
     {
-        std::byte* p = slab.allocateItem(16);
+        auto [p, elem_size, generation] = slab.allocateItem(16);
         slab.deallocateItem(p);
     }
     const auto t1 = std::chrono::steady_clock::now();
@@ -443,7 +458,10 @@ TEST(SlabTest, ReclaimEmptyBlocksReturnsBuffers)
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab + 1; ++i)
     {
-        items.push_back(slab.allocateItem(16));
+        {
+            auto [item, elem_size, generation] = slab.allocateItem(16);
+            items.push_back(item);
+        }
     }
     EXPECT_EQ(slab.getBlockCount(), 2u);
     EXPECT_EQ(slab.getAllocatedMemory(), baseline * 2);
@@ -460,11 +478,14 @@ TEST(SlabTest, ReclaimEmptyBlocksReturnsBuffers)
     EXPECT_EQ(slab.reclaimEmptyBlocks(), 0u);
 
     // Live allocations block reclaim of their slab.
-    auto* live = slab.allocateItem(16);
+    auto [live, elem_size, generation] = slab.allocateItem(16);
     items.clear();
     for (std::size_t i = 0; i < kSlotsPerSlab; ++i)
     {
-        items.push_back(slab.allocateItem(16));
+        {
+            auto [item, elem_size, generation] = slab.allocateItem(16);
+            items.push_back(item);
+        }
     }
     EXPECT_EQ(slab.getBlockCount(), 2u);
     for (auto* p : items)
@@ -866,11 +887,17 @@ TEST(SlabTest, AvailabilityMapScalesWithLiveSlabs)
     items.reserve(kSlotsPerSlab + 1);
     for (std::size_t i = 0; i < kSlotsPerSlab; ++i)
     {
-        items.push_back(slab.allocateItem(16));
+        {
+            auto [item, elem_size, generation] = slab.allocateItem(16);
+            items.push_back(item);
+        }
         ASSERT_NE(items.back(), nullptr);
     }
     EXPECT_EQ(slab.getBlockCount(), 1u);
-    items.push_back(slab.allocateItem(16));
+    {
+        auto [item, elem_size, generation] = slab.allocateItem(16);
+        items.push_back(item);
+    }
     EXPECT_EQ(slab.getBlockCount(), 2u);
     EXPECT_LE(slab.getAvailabilityMapBytes(), 64u);
 
@@ -982,7 +1009,7 @@ TEST(SlabTest, ZeroBlockEngineGrowsOnFirstAlloc)
     EXPECT_EQ(slab.getBlockCount(), 0u);
     EXPECT_EQ(slab.getAllocatedMemory(), 0u);
 
-    auto* p = slab.allocateItem(512);
+    auto [p, elem_size, generation] = slab.allocateItem(512);
     ASSERT_NE(p, nullptr);
     EXPECT_EQ(slab.getBlockCount(), 1u);
     EXPECT_EQ(slab.getAllocatedMemory(), selectBlockSize<512>());
@@ -1045,24 +1072,36 @@ TEST(SlabTest, AllocateItems)
     items.reserve(2 * kSlots + 1);
     for (std::size_t i = 0; i < kSlots; ++i)
     {
-        auto* p = slab.allocateItem(120);
+        auto [p, elem_size, generation] = slab.allocateItem(120);
         EXPECT_NE(p, nullptr);
         items.push_back(p);
     }
     EXPECT_EQ(slab.getBlockCount(), 1u);
 
     // One past capacity → second buffer.
-    items.push_back(slab.allocateItem(120));
+    {
+        auto [item, elem_size, generation] = slab.allocateItem(120);
+        items.push_back(item);
+    }
     EXPECT_EQ(slab.getBlockCount(), 2u);
     EXPECT_EQ(slab.getAllocatedMemory(), 2 * kBuf);
 
     for (std::size_t i = 1; i < kSlots; ++i)
     {
-        items.push_back(slab.allocateItem(120));
+        {
+            auto [item, elem_size, generation] = slab.allocateItem(120);
+            items.push_back(item);
+        }
     }
     EXPECT_EQ(slab.getBlockCount(), 2u);
 
-    items.push_back(slab.allocateItem(120));
+    {
+
+        auto [item, elem_size, generation] = slab.allocateItem(120);
+
+        items.push_back(item);
+
+    }
     EXPECT_EQ(slab.getBlockCount(), 3u);
     EXPECT_EQ(slab.getAllocatedMemory(), 3 * kBuf);
 
@@ -1074,7 +1113,10 @@ TEST(SlabTest, AllocateItems)
     // Reuse retained buffers (monotonic growth until trim).
     for (std::size_t i = 0; i < 2 * kSlots + 1; ++i)
     {
-        EXPECT_NE(slab.allocateItem(120), nullptr);
+        {
+            auto [item, elem_size, generation] = slab.allocateItem(120);
+            EXPECT_NE(item, nullptr);
+        }
     }
     EXPECT_EQ(slab.getAllocatedMemory(), 3 * kBuf);
 }
@@ -1084,7 +1126,7 @@ TEST(SlabTest, DeallocateInvalidItem)
 {
     Slab<256> slab;
 
-    auto item1 = slab.allocateItem(200);
+    auto [item1, elem_size, generation] = slab.allocateItem(200);
     EXPECT_NE(item1, nullptr);
 
     // invalid pointer (not from this slab)
@@ -1118,10 +1160,10 @@ TEST(SlabProxyTest, SizeLimitsThrow)
     SlabProxy proxy;
     // Must be strictly greater than 1_KB; 1_KB itself is not a large allocation.
     EXPECT_THROW(proxy.allocateItem(1_KB), std::invalid_argument);
-    EXPECT_NO_THROW({
-        auto* p = proxy.allocateItem(1_KB + 1);
+    EXPECT_NO_THROW((void)([&] {
+        auto [p, elem_size, generation] = proxy.allocateItem(1_KB + 1);
         proxy.deallocateItem(p);
-    });
+    }()));
     EXPECT_THROW(proxy.allocateItem(kMaxAllocationBytes + 1), std::out_of_range);
 }
 
@@ -1133,7 +1175,7 @@ TEST(SlabTest, Alignment)
     std::vector<std::byte*> items;
     for (int i = 0; i < 10; ++i)
     {
-        auto item = slab.allocateItem(60);
+        auto [item, elem_size, generation] = slab.allocateItem(60);
         EXPECT_NE(item, nullptr);
         EXPECT_EQ(reinterpret_cast<std::uintptr_t>(item) % 16, 0u); // 16-byte alignment
         items.push_back(item);
@@ -1290,12 +1332,17 @@ TEST(PoolTest, DeallocateValidatesTag)
     EXPECT_THROW(pool.deallocate(live), std::invalid_argument);
     EXPECT_FALSE(pool.try_deallocate(live));
 
-    // Corrupt CRC only (flip high byte of tag word)
+    // Corrupt integrity fields: CRC when enabled, else generation in the tag.
     auto* live2 = pool.allocate(32);
     ASSERT_NE(live2, nullptr);
     auto* tag_bytes = live2 + kElem32 - kSlotTagBytes;
+#if SPALLOCATOR_ENABLE_CRC32C
     tag_bytes[4] = static_cast<std::byte>(
         static_cast<unsigned char>(tag_bytes[4]) ^ 0xffu);
+#else
+    tag_bytes[1] = static_cast<std::byte>(
+        static_cast<unsigned char>(tag_bytes[1]) ^ 0xffu);
+#endif
     EXPECT_THROW(pool.deallocate(live2), std::invalid_argument);
     EXPECT_FALSE(pool.try_deallocate(live2));
 

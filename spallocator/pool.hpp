@@ -436,15 +436,18 @@ namespace spallocator
                       alloc_size, alignment_class,
                       (slab == &large_slab) ? "large_slab" : "size_class");
 
+        AllocateItemResult allocated{};
         try
         {
-            alloc.ptr = slab->allocateItem(alloc_size);
+            allocated = slab->allocateItem(alloc_size);
         }
         catch (...)
         {
             note_alloc_fail();
             throw;
         }
+        auto [ptr, slot_elem_size, slot_generation] = allocated;
+        alloc.ptr = ptr;
 
         if (slab == &large_slab)
         {
@@ -463,9 +466,11 @@ namespace spallocator
                 static_cast<std::uint8_t>(header_size);
             *reinterpret_cast<std::uint8_t*>(user - 6) = kAllocMagic;
 
+#if SPALLOCATOR_ENABLE_CRC32C
             const std::uint32_t crc = proxy_header_crc(
                 user, alloc_size_u32, static_cast<std::uint8_t>(header_size), kAllocMagic);
             std::memcpy(user - 16, &crc, 4);
+#endif
 
             control_->note_alloc();
             note_alloc_ok();
@@ -473,9 +478,9 @@ namespace spallocator
         }
 
         // Size-class: user pointer == slot base; tag at ElemSize - 8.
+        // Generation/ElemSize come from Slab (no Block-map lookup on allocate).
         std::byte* slot = alloc.ptr;
-        std::optional<BlockEntry> entry = find_block_owner(slot);
-        if (!entry || entry->slab != slab)
+        if (slot_elem_size == 0)
         {
             // Best-effort rollback so the Slot is not leaked; ignore secondary
             // failures — the logic_error below is the primary signal.
@@ -487,14 +492,14 @@ namespace spallocator
             {
             }
             note_alloc_fail();
-            throw std::logic_error("Pool::allocate: Block map missing newly allocated slot");
+            throw std::logic_error("Pool::allocate: size-class Slab omitted slot metadata");
         }
 
 #if defined(SPALLOCATOR_HAS_ASAN)
         // Prior free poisoned the tag word; unpoison the whole Slot for reuse.
-        ASAN_UNPOISON_MEMORY_REGION(slot, entry->elem_size);
+        ASAN_UNPOISON_MEMORY_REGION(slot, slot_elem_size);
 #endif
-        write_slot_tag(slot, entry->elem_size, entry->generation);
+        write_slot_tag(slot, slot_elem_size, slot_generation);
 
         control_->note_alloc();
         note_alloc_ok();
@@ -620,6 +625,7 @@ namespace spallocator
                 return false;
             }
 
+#if SPALLOCATOR_ENABLE_CRC32C
             std::uint32_t stored_crc = 0;
             std::memcpy(&stored_crc, item - 16, 4);
             const std::uint32_t expect_crc =
@@ -636,6 +642,7 @@ namespace spallocator
                 note_free_fail();
                 return false;
             }
+#endif
 
             std::byte* original_ptr = item - header_size;
             *reinterpret_cast<std::uint8_t*>(item - 6) = 0;

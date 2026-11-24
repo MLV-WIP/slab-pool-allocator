@@ -903,7 +903,8 @@ struct Slab16Backend
         {
             throw std::invalid_argument("Slab16Backend only supports n<=16");
         }
-        return slab.allocateItem(16);
+        auto [item, elem_size, generation] = slab.allocateItem(16);
+        return item;
     }
 
     void deallocate(void* p, std::size_t /*n*/, std::size_t /*align*/)
@@ -1336,7 +1337,8 @@ void run_chase_suite(Options const& opt)
               << "\n";
 
     auto run_links = [&](char const* backend_name, std::vector<ChaseHdr*>& nodes,
-                         std::minstd_rand& rng) {
+                         std::minstd_rand& rng)
+    {
         if (nodes.size() < 2)
         {
             return;

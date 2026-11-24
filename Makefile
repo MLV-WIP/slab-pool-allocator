@@ -72,6 +72,17 @@ ifeq ($(ENABLE_TESTS),yes)
     LDLIBS := -L$(GTEST_DIR)/lib -lgtest
 endif
 
+# Host-tuned codegen (./configure --enable-native-arch is the default).
+# --disable-native-arch sets ENABLE_NATIVE_ARCH=no in config.mk.
+# Override with MARCH_FLAGS= on the make command line if needed.
+ENABLE_NATIVE_ARCH ?= yes
+ifeq ($(ENABLE_NATIVE_ARCH),yes)
+    MARCH_FLAGS ?= -march=native
+    ifeq ($(filter -march=%,$(USER_CXXFLAGS)),)
+        USER_CXXFLAGS += $(MARCH_FLAGS)
+    endif
+endif
+
 # Base flags
 CXXFLAGS := $(CXXSTD) $(INCLUDES) $(WARNINGS) -MMD -MP $(USER_CXXFLAGS)
 LDFLAGS := $(LDLIBS)
