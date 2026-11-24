@@ -514,9 +514,9 @@ namespace spallocator
                 : static_cast<std::size_t>(header_size);
 
             // Fail closed on geometry before freemap / proxy delete: slot bases
-            // are always alignment_class-aligned. Do not widen the peek window or
-            // probe other VAs — metadata lives only in the fixed bytes behind
-            // the user pointer (M4-B lesson: never span-probe freed memory).
+            // are always alignment_class-aligned. Metadata lives only in the
+            // fixed bytes behind the user pointer — do not widen the peek or
+            // scan other addresses to invent ownership.
             if ((reinterpret_cast<std::uintptr_t>(original_ptr) % alignment_class) !=
                 0)
             {
