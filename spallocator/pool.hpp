@@ -382,7 +382,9 @@ namespace spallocator
         // header_size = max(8, alignment). For align 4/8 this stays 8 (alignment class 16);
         // for 16/32/64 it equals the request align so free can recover the class.
         // Layout (from user pointer backward): uint32 alloc_size at −4,
-        // uint8 header_size at −5, uint8 magic at −6. Deallocate validates
+        // uint8 header_size at −5, uint8 magic at −6. When header_size ≥ 16,
+        // also uint16 block generation at −8…−7 and block_base pointer at
+        // −16…−9 (routing hints for known-base free). Deallocate validates
         // magic/size then recovers the slot base and re-selects the slab via
         // (alloc_size, alignment-class-from-header_size).
         std::size_t header_size = 8 < alignment ? alignment : 8;
@@ -395,9 +397,11 @@ namespace spallocator
                       alloc_size, alignment_class,
                       (slab == &large_slab) ? "large_slab" : "size_class");
 
+        AllocateItemResult item;
         try
         {
-            alloc.ptr = slab->allocateItem(alloc_size);
+            item = slab->allocateItem(alloc_size);
+            alloc.ptr = item.ptr;
         }
         catch (...)
         {
@@ -418,6 +422,23 @@ namespace spallocator
 
         uint8_t* magic_ptr = reinterpret_cast<uint8_t*>(alloc.ptr + header_size - 6);
         *magic_ptr = kAllocMagic;
+
+        // Routing hints (header_size ≥ 16 only). 8-byte headers have no pad.
+        if (header_size >= 16)
+        {
+            auto* gen_ptr = reinterpret_cast<std::uint16_t*>(alloc.ptr + header_size - 8);
+            auto* base_ptr = reinterpret_cast<std::uintptr_t*>(alloc.ptr + header_size - 16);
+            if (item.block_base != nullptr)
+            {
+                *gen_ptr = item.block_generation;
+                *base_ptr = reinterpret_cast<std::uintptr_t>(item.block_base);
+            }
+            else
+            {
+                *gen_ptr = 0;
+                *base_ptr = 0;
+            }
+        }
 
         control_->note_alloc();
         note_alloc_ok();
@@ -444,9 +465,8 @@ namespace spallocator
 
         try
         {
-            // Metadata always lives in the 8 bytes immediately before the user
-            // pointer. A prior free poisons the header; temporarily unpoison so
-            // double-free / corrupt-header checks can read it without ASan abort.
+            // Peek the fixed trailing metadata first; widen if header_size ≥ 16
+            // so routing hints (base + generation) are readable under ASan.
             [[maybe_unused]] constexpr std::size_t kHeaderPeek = 8;
 #if defined(SPALLOCATOR_HAS_ASAN)
             const bool header_was_poisoned =
@@ -470,6 +490,14 @@ namespace spallocator
                 note_free_fail();
                 return false;
             }
+
+#if defined(SPALLOCATOR_HAS_ASAN)
+            if (header_size > kHeaderPeek)
+            {
+                ASAN_UNPOISON_MEMORY_REGION(item - header_size,
+                                            header_size - kHeaderPeek);
+            }
+#endif
 
             uint8_t magic = *reinterpret_cast<uint8_t*>(item - 6);
             if (magic != kAllocMagic)
@@ -534,8 +562,27 @@ namespace spallocator
                 return false;
             }
 
-            // Invalidate header before returning the slot (detects Pool double-free).
+            std::byte* hint_base = nullptr;
+            std::uint16_t hint_gen = 0;
+            std::uintptr_t saved_hint_base = 0;
+            if (header_size >= 16)
+            {
+                hint_gen = *reinterpret_cast<std::uint16_t*>(item - 8);
+                saved_hint_base = *reinterpret_cast<std::uintptr_t*>(item - 16);
+                if (saved_hint_base != 0 && hint_gen != 0)
+                {
+                    hint_base = reinterpret_cast<std::byte*>(saved_hint_base);
+                }
+            }
+
+            // Invalidate header before freemap (double-free while free runs).
+            // If slab reject throws, restore below so the live slot stays usable.
             *reinterpret_cast<uint8_t*>(item - 6) = 0;
+            if (header_size >= 16)
+            {
+                *reinterpret_cast<std::uint16_t*>(item - 8) = 0;
+                *reinterpret_cast<std::uintptr_t*>(item - 16) = 0;
+            }
 
 #if defined(SPALLOCATOR_HAS_ASAN)
             ASAN_POISON_MEMORY_REGION(original_ptr, header_size);
@@ -545,7 +592,29 @@ namespace spallocator
             debug_println("Deallocating {} bytes at ptr={}, alignment_class={}, slab={}",
                           alloc_size, static_cast<void*>(original_ptr), alignment_class,
                           (slab == &large_slab) ? "large_slab" : "size_class");
-            slab->deallocateItem(original_ptr);
+            try
+            {
+                slab->deallocateItem(original_ptr, hint_base, hint_gen);
+            }
+            catch (...)
+            {
+#if defined(SPALLOCATOR_HAS_ASAN)
+                ASAN_UNPOISON_MEMORY_REGION(original_ptr, header_size);
+#endif
+                *reinterpret_cast<uint8_t*>(item - 6) = kAllocMagic;
+                if (header_size >= 16)
+                {
+                    *reinterpret_cast<std::uint16_t*>(item - 8) = hint_gen;
+                    *reinterpret_cast<std::uintptr_t*>(item - 16) = saved_hint_base;
+                }
+#if defined(SPALLOCATOR_HAS_ASAN)
+                if (header_was_poisoned)
+                {
+                    ASAN_POISON_MEMORY_REGION(original_ptr, header_size);
+                }
+#endif
+                throw;
+            }
             // May return `this` for heap-owned idle pools — delete only after
             // this method is done touching members.
             Pool* doomed = control_->note_free();

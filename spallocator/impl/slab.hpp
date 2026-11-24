@@ -134,8 +134,10 @@ namespace spallocator
     class Slab: public ISlab
     {
     public: // methods
-        std::byte* allocateItem(std::size_t size) override;
-        void deallocateItem(std::byte* item) override;
+        AllocateItemResult allocateItem(std::size_t size) override;
+        void deallocateItem(std::byte* item,
+                            std::byte* block_base = nullptr,
+                            std::uint16_t block_generation = 0) override;
 
         constexpr std::size_t getElemSize() const { return ElemSize; }
         constexpr std::size_t getAlignment() const { return Alignment; }
@@ -182,6 +184,12 @@ namespace spallocator
             "Block must hold at least kSlabTargetMultiplier slots");
 
         std::vector<std::byte*> block_bases;
+
+        // Per-Block generation for header routing hints (stable across
+        // index shuffle; bumped only when a new Block VA is published).
+        std::vector<std::uint16_t> block_generations;
+        std::uint16_t next_block_generation_{1};
+
         // Per-Block slot freemap (SlotFreemap): compile-time slot count,
         // word array storage. Convention: bit set ⇒ occupied; clear ⇒ free.
         std::vector<SlotFreemap<slots_per_block>> block_freemaps;
@@ -443,10 +451,18 @@ namespace spallocator
         using word_t = unsigned long long;
         constexpr std::size_t kWordBits = std::numeric_limits<word_t>::digits; // 64
         constexpr std::size_t kMaskBits = N < kWordBits ? N : kWordBits;
-        constexpr word_t kLowWordBits =
-            (kMaskBits == kWordBits)
-                ? ~word_t{0}
-                : ((word_t{1} << kMaskBits) - word_t{1});
+
+        // Avoid evaluating `1 << 64` in the discarded ternary arm (clang -Werror).
+        constexpr word_t kLowWordBits = []() constexpr {
+            if constexpr (kMaskBits >= kWordBits)
+            {
+                return ~word_t{0};
+            }
+            else
+            {
+                return (word_t{1} << kMaskBits) - word_t{1};
+            }
+        }();
         constexpr std::bitset<N> kLowWordMask{kLowWordBits};
 
         for (std::size_t base = (start / kWordBits) * kWordBits; base < N;
@@ -455,7 +471,7 @@ namespace spallocator
             const std::size_t bits_in_word =
                 (base + kWordBits <= N) ? kWordBits : (N - base);
             const word_t width_mask =
-                (bits_in_word == kWordBits)
+                (bits_in_word >= kWordBits)
                     ? ~word_t{0}
                     : ((word_t{1} << bits_in_word) - word_t{1});
 
@@ -480,7 +496,7 @@ namespace spallocator
     // ---------------------------------------------------------------------------
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    std::byte* Slab<ElemSize, Alignment>::allocateItem(std::size_t size)
+    AllocateItemResult Slab<ElemSize, Alignment>::allocateItem(std::size_t size)
     {
         // Must remain active in release builds: an oversized request would
         // otherwise be placed in a too-small slot (silent overrun).
@@ -563,7 +579,11 @@ namespace spallocator
                         debug_println("Item allocated ({}/{}), block_freemaps<{},{}>: {}",
                                       block_index, item_index, ElemSize, Alignment,
                                       printHex(block_slots));
-                        return block_bases[block_index] + item_index * ElemSize;
+                        AllocateItemResult out;
+                        out.block_base = block_bases[block_index];
+                        out.block_generation = block_generations[block_index];
+                        out.ptr = out.block_base + item_index * ElemSize;
+                        return out;
                     }
                 }
 
@@ -630,7 +650,9 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment>
-    void Slab<ElemSize, Alignment>::deallocateItem(std::byte* item)
+    void Slab<ElemSize, Alignment>::deallocateItem(std::byte* item,
+                                                   std::byte* block_base,
+                                                   std::uint16_t block_generation)
     {
         if (!item)
         {
@@ -639,53 +661,69 @@ namespace spallocator
 
         std::scoped_lock<SpinLock> guard(slab_lock);
 
-        // Find which Block this item belongs to
-        if (auto block_index_opt = findBlockForSlot(item); !block_index_opt.has_value())
+        std::size_t block_index = 0;
+        std::byte* block_start = nullptr;
+
+        if (block_base != nullptr)
         {
-            throw std::invalid_argument("Invalid item pointer; no corresponding block found");
+            // Pool header hint: exact-base lookup (no upper_bound).
+            auto it = base_address_map.find(block_base);
+            if (it == base_address_map.end())
+            {
+                throw std::invalid_argument(
+                    "Invalid item pointer; known block_base not registered in this Slab");
+            }
+            block_index = it->second;
+            block_start = block_base;
+            if (block_index >= block_bases.size() ||
+                block_bases[block_index] != block_base ||
+                block_generations[block_index] != block_generation)
+            {
+                debug_println("Invalid item pointer; block_base / generation mismatch: block_index={} >= block_bases.size()={} || block_bases[block_index]={} != block_base={} || block_generations[block_index]={} != block_generation={}",
+                              block_index, block_bases.size(), static_cast<void*>(block_bases[block_index]), static_cast<void*>(block_base), block_generations[block_index], block_generation);
+                throw std::invalid_argument(
+                    "Invalid item pointer; block_base / generation mismatch");
+            }
+        }
+        else if (auto block_index_opt = findBlockForSlot(item); block_index_opt.has_value())
+        {
+            block_index = *block_index_opt;
+            block_start = block_bases[block_index];
         }
         else
         {
-            auto block_index = *block_index_opt;
-
-            auto block_start = block_bases[block_index];
-            auto& block_slots = block_freemaps[block_index];
-
-            // Require an exact slot base. Integer division alone would map an
-            // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
-            // the freemap — or free a live neighbor.
-            const auto offset = item - block_start;
-            if (offset < 0)
-            {
-                throw std::invalid_argument(
-                    "Invalid item pointer; address is before block start");
-            }
-            const std::size_t byte_offset = static_cast<std::size_t>(offset);
-            const std::size_t item_index = byte_offset / ElemSize;
-            if (item_index >= block_slots.size() ||
-                item != block_start + item_index * ElemSize)
-            {
-                throw std::invalid_argument(
-                    "Invalid item pointer; not aligned to a slot boundary");
-            }
-
-            if (block_slots.test(item_index))
-            {
-                // Free the item
-                block_slots.reset(item_index);
-                // This Block now has free space
-                block_available_map.set(block_index);
-                debug_println("Item freed ({}/{}), block_freemaps: {}",
-                              block_index, item_index, printHex(block_slots));
-                return;
-            }
-            else
-            {
-                throw std::invalid_argument("Item is already free");
-            }
+            throw std::invalid_argument("Invalid item pointer; no corresponding block found");
         }
 
-        throw std::invalid_argument("Invalid item pointer; item not found in block");
+        auto& block_slots = block_freemaps[block_index];
+
+        // Require an exact slot base. Integer division alone would map an
+        // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
+        // the freemap — or free a live neighbor.
+        const auto offset = item - block_start;
+        if (offset < 0)
+        {
+            throw std::invalid_argument(
+                "Invalid item pointer; address is before block start");
+        }
+        const std::size_t byte_offset = static_cast<std::size_t>(offset);
+        const std::size_t item_index = byte_offset / ElemSize;
+        if (item_index >= block_slots.size() ||
+            item != block_start + item_index * ElemSize)
+        {
+            throw std::invalid_argument(
+                "Invalid item pointer; not aligned to a slot boundary");
+        }
+
+        if (!block_slots.test(item_index))
+        {
+            throw std::invalid_argument("Item is already free");
+        }
+
+        block_slots.reset(item_index);
+        block_available_map.set(block_index);
+        debug_println("Item freed ({}/{}), block_freemaps: {}",
+                      block_index, item_index, printHex(block_slots));
     }
 
 
@@ -770,12 +808,14 @@ namespace spallocator
         if (index != last)
         {
             block_bases[index] = block_bases[last];
+            block_generations[index] = block_generations[last];
             block_freemaps[index] = block_freemaps[last];
             block_available_map.swap_bits(index, last);
             base_address_map[block_bases[index]] = index;
         }
 
         block_bases.pop_back();
+        block_generations.pop_back();
         block_freemaps.pop_back();
         block_available_map.pop_back();
 
@@ -799,6 +839,12 @@ namespace spallocator
 
         std::byte* new_block = new(std::align_val_t{Alignment}) std::byte[block_bytes];
         block_bases.push_back(new_block);
+        const std::uint16_t gen = next_block_generation_++;
+        if (next_block_generation_ == 0)
+        {
+            next_block_generation_ = 1; // 0 reserved for “no hint”
+        }
+        block_generations.push_back(gen);
         base_address_map[new_block] = block_bases.size() - 1;
         block_freemaps.emplace_back();
         // New Block has free slots; grow availability words only as needed.
