@@ -3,3 +3,6 @@ obj/
 tester
 tmp/
 config.mk
+
+# Cursor agent/editor local state and project rules (kept on disk; not published).
+.cursor/
