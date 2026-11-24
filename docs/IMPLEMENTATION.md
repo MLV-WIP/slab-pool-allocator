@@ -144,11 +144,16 @@ puts all “pointer looks like a pool allocation” policy in one place.
 
 ### Free validation (pool)
 
-Before trusting the header:
+Before trusting the header (fail closed; fixed peek only — never span-probe
+other VAs to “find” a Block):
 
 1. `header_size ∈ {8,16,32,64}`  
 2. Magic equals `kAllocMagic`  
 3. Footprint in a plausible range (`header_size ≤ alloc_size ≤ kMaxAllocationBytes + max align`)  
+4. Recovered slot base is aligned to the alignment class implied by `header_size`  
+
+Then clear magic, re-resolve the backend, and free. Slab / proxy reject
+unknown bases and interior pointers as a second line of defense.
 
 Failures:
 
@@ -1089,6 +1094,20 @@ make profile BENCH_ARGS='--scenario=lifo --backend=pool --align=32 --iters=20000
 Pin one scenario and one backend so samples concentrate on the path under study.
 Compare Slab-only vs Pool to separate engine cost from Pool routing/header work.
 Do not treat sanitizer or coverage builds as profile baselines.
+
+### Header-path perf habits
+
+Lessons kept after abandoning end-tag / Block-map free (apply to the front-header
+path only):
+
+| Habit | Practice |
+|-------|----------|
+| Fair ratios | `make bench` / `make profile` only — both force `ENABLE_COVERAGE=no`. Prefer `BUILD_TYPE=release` for ns/op. |
+| Split alloc vs free | Profile `lifo` (paired) and `bulk` (alloc-then-free-all) separately; compare `--backend=slab16` vs `pool` to isolate header write/validate from freemap. Use `make profile` with one scenario + one backend. |
+| Locality | `--scenario=chase` (opt-in) for payload working-set cliffs; not a substitute for LIFO latency. |
+| Lock scope | Header free holds **no** pool-wide lock across slab work — only the per-`Slab` `SpinLock` inside `deallocateItem`. Do not reintroduce a free-path Block map / `shared_mutex` without a new premise. |
+| Fail closed | Validate header geometry (size / magic / footprint / base alignment) **before** freemap flips; peek only the fixed bytes behind the user pointer. |
+| Integrity tax | Front headers today use magic + sizes (no CRC). Optional CRC / `-march=native` only if a future build gates integrity work and profiles show it pays for itself — do not copy end-tag CRC machinery as-is. |
 
 If `perf record` fails with “Access to performance monitoring…”, the profile
 binary was still built under `obj/profile/`. Relax

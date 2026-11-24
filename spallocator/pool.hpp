@@ -513,6 +513,27 @@ namespace spallocator
                 ? kSlabNativeAlignment
                 : static_cast<std::size_t>(header_size);
 
+            // Fail closed on geometry before freemap / proxy delete: slot bases
+            // are always alignment_class-aligned. Do not widen the peek window or
+            // probe other VAs — metadata lives only in the fixed bytes behind
+            // the user pointer (M4-B lesson: never span-probe freed memory).
+            if ((reinterpret_cast<std::uintptr_t>(original_ptr) % alignment_class) !=
+                0)
+            {
+                debug_println(
+                    "Invalid allocation base alignment at ptr={} "
+                    "(header_size={}, alignment_class={})",
+                    static_cast<void*>(item), header_size, alignment_class);
+#if defined(SPALLOCATOR_HAS_ASAN)
+                if (header_was_poisoned)
+                {
+                    ASAN_POISON_MEMORY_REGION(item - header_size, header_size);
+                }
+#endif
+                note_free_fail();
+                return false;
+            }
+
             // Invalidate header before returning the slot (detects Pool double-free).
             *reinterpret_cast<uint8_t*>(item - 6) = 0;
 
