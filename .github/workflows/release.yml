@@ -27,11 +27,14 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-    uses: MLV-WIP/release-tooling/.github/workflows/semantic-release.yml@v1.0.0
+    uses: MLV-WIP/release-tooling/.github/workflows/semantic-release.yml@v1.1.0
     with:
       verified-sha: ${{ github.event.workflow_run.head_sha }}
       # Project-specific: update in-tree version macros, then commit them.
       # Literal ${nextRelease.version} is expanded by semantic-release, not Actions.
       prepare-command: "python3 scripts/set-version.py ${nextRelease.version}"
       git-assets: spallocator/version.hpp
+      # Environment on this repo: RELEASE_APP_CLIENT_ID + RELEASE_APP_PRIVATE_KEY
+      github-app-environment: mlv-release-bot-env
+      tooling-ref: v1.1.0
     secrets: inherit
