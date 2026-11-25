@@ -1,6 +1,6 @@
-# Display name may include '+'. Callers of workflow_run must escape it
-# (e.g. 'C\+\+ CI') — see actions/runner#3763. Avoid '/' in the name.
-name: C++ CI
+# Build/test gate. Plain name — workflow_run.workflows is a glob and
+# chokes on '/' and '+' (actions/runner#3763).
+name: Validation
 
 on:
   push:
