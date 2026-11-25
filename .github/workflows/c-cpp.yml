@@ -1,4 +1,5 @@
-# Name must not contain '/' — workflow_run filters cannot parse "C/C++ CI".
+# Display name may include '+'. Callers of workflow_run must escape it
+# (e.g. 'C\+\+ CI') — see actions/runner#3763. Avoid '/' in the name.
 name: C++ CI
 
 on:

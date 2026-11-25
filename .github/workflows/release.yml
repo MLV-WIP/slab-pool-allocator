@@ -4,7 +4,8 @@ name: Release
 
 on:
   workflow_run:
-    workflows: ["C++ CI"]
+    # workflow_run.workflows is a glob; escape '+' (see actions/runner#3763).
+    workflows: ['C\+\+ CI']
     types: [completed]
     branches: [main]
 
