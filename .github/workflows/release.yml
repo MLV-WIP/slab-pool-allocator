@@ -4,7 +4,7 @@ name: Release
 
 on:
   workflow_run:
-    workflows: ["C++ CI"]
+    workflows: ["Validation"]
     types: [completed]
     branches: [main]
 

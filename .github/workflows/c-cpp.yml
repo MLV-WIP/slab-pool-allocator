@@ -1,5 +1,6 @@
-# Name must not contain '/' — workflow_run filters cannot parse "C/C++ CI".
-name: C++ CI
+# Build/test gate. Plain name — workflow_run.workflows is a glob and
+# chokes on '/' and '+' (actions/runner#3763).
+name: Validation
 
 on:
   push:
