@@ -4,5 +4,8 @@ tester
 tmp/
 config.mk
 
+# Accidental local Node installs (tooling lives in MLV-WIP/release-tooling).
+node_modules/
+
 # Cursor agent/editor local state and project rules (kept on disk; not published).
 .cursor/

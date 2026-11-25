@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Enforce Conventional Commits via the shared release-tooling commitlint config.
+# Enable with: git config core.hooksPath .githooks
+#
+# Prefers a sibling checkout of MLV-WIP/release-tooling; otherwise uses npx
+# against the GitHub repo (requires network on first use).
+set -euo pipefail
+
+msg_file="${1:-}"
+if [[ -z "$msg_file" || ! -f "$msg_file" ]]; then
+  echo "commit-msg: missing commit message file" >&2
+  exit 1
+fi
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+if ! command -v npx >/dev/null 2>&1; then
+  echo "commit-msg: npx not found; install Node >= 20 to lint commit messages" >&2
+  exit 1
+fi
+
+TOOLING_REF="${RELEASE_TOOLING_REF:-v1.0.0}"
+SIBLING="$(dirname "$root")/release-tooling"
+CONFIG_FROM_SIBLING="$SIBLING/commitlint.config.cjs"
+
+if [[ -f "$CONFIG_FROM_SIBLING" ]]; then
+  npx --yes -p @commitlint/cli -p @commitlint/config-conventional \
+    commitlint --config "$CONFIG_FROM_SIBLING" --edit "$msg_file"
+  exit 0
+fi
+
+# Fallback: clone/cache shared config (or fail closed with a clear message).
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/mlv-release-tooling/${TOOLING_REF}"
+CONFIG="$CACHE/commitlint.config.cjs"
+if [[ ! -f "$CONFIG" ]]; then
+  if ! command -v git >/dev/null 2>&1; then
+    echo "commit-msg: cannot fetch release-tooling config" >&2
+    exit 1
+  fi
+  mkdir -p "$CACHE"
+  if [[ ! -d "$CACHE/.git" ]]; then
+    git clone --depth 1 --branch "$TOOLING_REF" \
+      https://github.com/MLV-WIP/release-tooling.git "$CACHE" 2>/dev/null \
+      || git clone --depth 1 https://github.com/MLV-WIP/release-tooling.git "$CACHE"
+  fi
+fi
+
+if [[ ! -f "$CACHE/commitlint.config.cjs" ]]; then
+  cat >&2 <<EOF
+commit-msg: MLV-WIP/release-tooling not available yet.
+Create that repo from the scaffold, or clone it next to this project as
+../release-tooling, then retry the commit.
+EOF
+  exit 1
+fi
+
+npx --yes -p @commitlint/cli -p @commitlint/config-conventional \
+  commitlint --config "$CACHE/commitlint.config.cjs" --edit "$msg_file"

@@ -1,0 +1,28 @@
+# Thin wrapper: canonical SemVer via shared MLV-WIP/release-tooling.
+# Create that repo from the scaffold under the project agent store before enabling.
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["C/C++ CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: semantic-release
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    uses: MLV-WIP/release-tooling/.github/workflows/semantic-release.yml@v1.0.0
+    with:
+      verified-sha: ${{ github.event.workflow_run.head_sha }}
+      # Project-specific: update in-tree version macros, then commit them.
+      # Literal ${nextRelease.version} is expanded by semantic-release, not Actions.
+      prepare-command: "python3 scripts/set-version.py ${nextRelease.version}"
+      git-assets: spallocator/version.hpp
+    secrets: inherit

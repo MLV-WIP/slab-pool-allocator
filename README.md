@@ -279,13 +279,23 @@ Production quality and clarity are the same bar. Contributions should:
 - Add or update tests for every behavior change
 - Document design, intention, and tradeoffs
 
-Do **not** push from `main`/`master`, and do not push updates to `refs/heads/main`. Trunk advances via pull request only. This clone should use the repo hook:
+### Git / releases
+
+- Prefer **rebase merge** into `main` so each landed commit stays a Conventional Commit (`feat:`, `fix:`, `perf:`, `docs:`, `chore:`, …). CI runs commitlint on PRs.
+- Do **not** push from `main`/`master`, and do not push updates to `refs/heads/main`. Trunk advances via pull request only.
+- Canonical SemVer is cut by **semantic-release** on `main` only (GitHub Release + `v*` tag + `spallocator/version.hpp`). Dev/PR identity: `git describe --tags --match 'v*' --always`.
+- Node / semantic-release / commitlint live in the shared **[MLV-WIP/release-tooling](https://github.com/MLV-WIP/release-tooling)** repo; this project only has thin workflow wrappers and project-specific `scripts/set-version.py`.
+
+Enable local hooks:
 
 ```bash
 git config core.hooksPath .githooks
+# Optional: clone release-tooling next to this repo for offline commitlint config
+# git clone git@github.com:MLV-WIP/release-tooling.git ../release-tooling
 ```
 
-`.githooks/pre-push` aborts if `HEAD` is trunk or if the push destination is trunk (including when a feature branch’s upstream is wrongly `origin/main`).
+`.githooks/pre-push` aborts if `HEAD` is trunk or if the push destination is trunk (including when a feature branch’s upstream is wrongly `origin/main`).  
+`.githooks/commit-msg` runs commitlint using the shared release-tooling config.
 
 ## AI Assistance Declaration
 
