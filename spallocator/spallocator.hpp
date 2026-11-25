@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <stdexcept>
 
+#include "version.hpp"
 #include "pool.hpp"
 
 
