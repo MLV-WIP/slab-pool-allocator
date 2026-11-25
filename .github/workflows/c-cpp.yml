@@ -1,4 +1,5 @@
-name: C/C++ CI
+# Name must not contain '/' — workflow_run filters cannot parse "C/C++ CI".
+name: C++ CI
 
 on:
   push:
