@@ -39,6 +39,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <gtest/gtest.h>
 
@@ -1956,6 +1957,239 @@ TEST(PoolTest, MultiThreadTest)
     }
 }
 
+
+template <typename Lock>
+class LockPolicyTest : public ::testing::Test
+{
+};
+
+using AllLockPolicies = ::testing::Types<mlvlib::SpinLock, std::mutex, mlvlib::NullLock>;
+TYPED_TEST_SUITE(LockPolicyTest, AllLockPolicies);
+
+TYPED_TEST(LockPolicyTest, MetadataAndSlabProxy)
+{
+    using Lock = TypeParam;
+    using Traits = mlvlib::lock_traits<Lock>;
+
+    bool expected_thread_safe = false;
+    std::string_view expected_name;
+    if constexpr (std::is_same_v<Lock, mlvlib::SpinLock>)
+    {
+        expected_thread_safe = true;
+        expected_name = "spinlock";
+    }
+    else if constexpr (std::is_same_v<Lock, std::mutex>)
+    {
+        expected_thread_safe = true;
+        expected_name = "std::mutex";
+    }
+    else if constexpr (std::is_same_v<Lock, mlvlib::NullLock>)
+    {
+        expected_thread_safe = false;
+        expected_name = "null";
+    }
+    else
+    {
+        static_assert(!std::is_same_v<Lock, Lock>,
+                      "Unhandled lock policy in LockPolicyTest");
+    }
+
+    EXPECT_EQ(Traits::is_thread_safe, expected_thread_safe);
+    EXPECT_EQ(Traits::name, expected_name);
+
+    Slab<64, 16, Lock> slab;
+    EXPECT_EQ(slab.isThreadSafe(), expected_thread_safe);
+    EXPECT_EQ(slab.lockPolicyName(), expected_name);
+    EXPECT_EQ(slab.isThreadSafe(), Traits::is_thread_safe);
+    EXPECT_EQ(slab.lockPolicyName(), Traits::name);
+
+    const ISlab& islab = slab;
+    EXPECT_EQ(islab.isThreadSafe(), expected_thread_safe);
+    EXPECT_EQ(islab.lockPolicyName(), expected_name);
+    EXPECT_EQ(islab.isThreadSafe(), Traits::is_thread_safe);
+    EXPECT_EQ(islab.lockPolicyName(), Traits::name);
+
+    Pool pool(std::in_place_type<Lock>);
+    EXPECT_EQ(pool.isThreadSafe(), expected_thread_safe);
+    EXPECT_EQ(pool.lockPolicyName(), expected_name);
+    EXPECT_EQ(pool.isThreadSafe(), Traits::is_thread_safe);
+    EXPECT_EQ(pool.lockPolicyName(), Traits::name);
+
+    SlabProxy proxy;
+    EXPECT_TRUE(proxy.isThreadSafe());
+    EXPECT_EQ(proxy.lockPolicyName(), "system");
+}
+
+TYPED_TEST(LockPolicyTest, SlabLifecycleKnownBaseFreeAndReclaim)
+{
+    using Lock = TypeParam;
+
+    Slab<64, 16, Lock> slab(/*preallocate_first_block=*/true);
+    ASSERT_EQ(slab.getBlockCount(), 1u);
+
+    const std::size_t slots_per_block = slab.getAllocSize() / slab.getElemSize();
+    const std::size_t total = slots_per_block * 2 + 5;
+
+    std::vector<AllocateItemResult> items;
+    items.reserve(total);
+    for (std::size_t i = 0; i < total; ++i)
+    {
+        AllocateItemResult res = slab.allocateItem(64);
+        ASSERT_NE(res.ptr, nullptr);
+        ASSERT_NE(res.block_base, nullptr);
+        ASSERT_NE(res.block_generation, 0u);
+        EXPECT_TRUE(slab.findBlockForSlot(res.ptr).has_value());
+        items.push_back(res);
+    }
+
+    EXPECT_GE(slab.getBlockCount(), 3u);
+
+    // Mix known-base hint frees and fallback frees.
+    for (std::size_t i = 0; i < items.size(); ++i)
+    {
+        if ((i & 1u) == 0u)
+        {
+            slab.deallocateItem(items[i].ptr, items[i].block_base, items[i].block_generation);
+        }
+        else
+        {
+            slab.deallocateItem(items[i].ptr);
+        }
+    }
+
+    const std::size_t reclaimed = slab.reclaimEmptyBlocks(1);
+    EXPECT_GE(reclaimed, 2u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
+}
+
+TYPED_TEST(LockPolicyTest, PoolTagCtorAllocFreeTrimAndSmartPtrs)
+{
+    using Lock = TypeParam;
+
+    Pool pool(std::in_place_type<Lock>);
+
+    // Exercise alignment classes 16, 32, 64 plus oversize SlabProxy fallback.
+    std::byte* p16 = pool.allocate(48, 16);
+    std::byte* p32 = pool.allocate(128, 32);
+    std::byte* p64 = pool.allocate(256, 64);
+    std::byte* p_large = pool.allocate(32768, 64);
+
+    ASSERT_NE(p16, nullptr);
+    ASSERT_NE(p32, nullptr);
+    ASSERT_NE(p64, nullptr);
+    ASSERT_NE(p_large, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p16) % 16, 0u);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p32) % 32, 0u);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p64) % 64, 0u);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(p_large) % 64, 0u);
+
+    pool.deallocate(p16);
+    pool.deallocate(p32);
+    pool.deallocate(p64);
+    pool.deallocate(p_large);
+
+    // Multi-block growth + trim.
+    std::vector<std::byte*> bulk;
+    bulk.reserve(1024);
+    for (int i = 0; i < 1024; ++i)
+    {
+        bulk.push_back(pool.allocate(48, 16));
+    }
+    for (std::byte* p : bulk)
+    {
+        pool.deallocate(p);
+    }
+    EXPECT_GT(pool.trim(1), 0u);
+
+    // Smart pointer & STL container interoperability on a tag-constructed Pool.
+    {
+        auto u = make_pool_unique<int>(pool, 42);
+        EXPECT_EQ(*u, 42);
+
+        std::vector<int, PoolAllocator<int>> vec{PoolAllocator<int>(pool)};
+        for (int i = 0; i < 128; ++i)
+        {
+            vec.push_back(i);
+        }
+        EXPECT_EQ(vec.size(), 128u);
+    }
+    EXPECT_EQ(pool.live_allocation_count(), 0u);
+}
+
+TYPED_TEST(LockPolicyTest, ThreadedChurnWhenThreadSafe)
+{
+    using Lock = TypeParam;
+    if constexpr (!mlvlib::lock_traits<Lock>::is_thread_safe)
+    {
+        GTEST_SKIP() << "Lock policy '" << mlvlib::lock_traits<Lock>::name
+                     << "' is not thread-safe";
+    }
+
+    Pool pool(std::in_place_type<Lock>);
+    constexpr std::size_t kThreads = 4;
+    constexpr int kPairsPerThread = 2000;
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (std::size_t t = 0; t < kThreads; ++t)
+    {
+        threads.emplace_back([&pool, t]() {
+            std::mt19937 gen(static_cast<std::uint32_t>(0x12345u + t * 997u));
+            std::uniform_int_distribution<std::size_t> size_dist(16, 512);
+
+            std::vector<std::byte*> live;
+            live.reserve(128);
+            for (int i = 0; i < kPairsPerThread; ++i)
+            {
+                std::byte* p = pool.allocate(size_dist(gen));
+                ASSERT_NE(p, nullptr);
+                live.push_back(p);
+                if (live.size() >= 64)
+                {
+                    const std::size_t idx = gen() % live.size();
+                    pool.deallocate(live[idx]);
+                    live[idx] = live.back();
+                    live.pop_back();
+                }
+            }
+            for (std::byte* p : live)
+            {
+                pool.deallocate(p);
+            }
+        });
+    }
+
+    for (auto& th : threads)
+    {
+        th.join();
+    }
+    EXPECT_EQ(pool.live_allocation_count(), 0u);
+}
+
+TEST(LockPolicyLayoutTest, DefaultPolicyAndEmptyLockOptimization)
+{
+    Pool default_pool;
+    EXPECT_EQ(default_pool.isThreadSafe(),
+              mlvlib::lock_traits<DefaultSlabLock>::is_thread_safe);
+    EXPECT_EQ(default_pool.lockPolicyName(),
+              mlvlib::lock_traits<DefaultSlabLock>::name);
+
+    EXPECT_LT(sizeof(Slab<64, 16, mlvlib::NullLock>),
+              sizeof(Slab<64, 16, std::mutex>));
+
+#ifdef NDEBUG
+    static_assert(sizeof(Slab<64, 16, mlvlib::NullLock>) <
+                  sizeof(Slab<64, 16, mlvlib::SpinLock>),
+                  "MLVLIB_NO_UNIQUE_ADDRESS should eliminate NullLock storage in release Slab");
+    static_assert(sizeof(Slab<64, 16, mlvlib::NullLock>) <
+                  sizeof(Slab<64, 16, std::mutex>));
+    EXPECT_LT(sizeof(Slab<64, 16, mlvlib::NullLock>),
+              sizeof(Slab<64, 16, mlvlib::SpinLock>));
+#else
+    EXPECT_LE(sizeof(Slab<64, 16, mlvlib::NullLock>),
+              sizeof(Slab<64, 16, mlvlib::SpinLock>));
+#endif
+}
 
 
 void pre_test()

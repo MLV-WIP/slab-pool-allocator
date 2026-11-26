@@ -74,7 +74,7 @@ you need the “why pools / why slabs” story without code structure.
      ISlab                  ISlab                 SlabProxy
      Slab<…> …         (size-class engine)   (>class max → ::new[])
               │
-              └── Block → Slot; per-slab SpinLock, bitsets, base_address_map
+              └── Block → Slot; per-slab Lock (default SpinLock), bitsets, base_address_map
 
   Smart pointers / PoolAllocator / PoolMemoryResource ──► clients via PoolLifetimeToken / PoolHandle
   LifetimeObserver                 (stand-alone; not part of Pool)
@@ -407,7 +407,7 @@ paths agree on the ladder.
 
 ## Slab strategy
 
-Each `Slab<ElemSize, Alignment>` is a **fixed-size recycler** for one rung of
+Each `Slab<ElemSize, Alignment, Lock = DefaultSlabLock>` is a **fixed-size recycler** for one rung of
 one alignment class.
 
 **Owns**
@@ -423,7 +423,7 @@ one alignment class.
 - Per-Block freemap of Slots  
 - Growable availability map (`DynBitset`) across Blocks  
 - `base_address_map` for free  
-- Its own `SpinLock`  
+- Its own per-slab `Lock` (`MLVLIB_NO_UNIQUE_ADDRESS Lock slab_lock`, defaulting to `DefaultSlabLock` = `mlvlib::SpinLock`)  
 
 **Invariants (informal)**
 
@@ -821,14 +821,44 @@ instances share no locks — isolation is free at the domain boundary.
 
 | Lock | Protects | Hold time intent |
 |------|----------|------------------|
-| Per-`Slab` `SpinLock` | Freemap, availability, address map, Block growth | Brief — bit ops, map update, optional first-Block map |
+| Per-`Slab` `Lock` (`DefaultSlabLock` or `Pool(std::in_place_type<Lock>)`) | Freemap, availability, address map, Block growth | Brief — bit ops, map update, optional first-Block map |
 
 Pool no longer holds registry locks: all alignment-class Slabs are installed in `Pool()`
 and the directory is immutable for the pool lifetime.
 
+### Compile-time lock policy selection
+
+`Slab<ElemSize, Alignment, Lock = DefaultSlabLock>` is parameterized over any
+`mlvlib::BasicLockable` (`mlvlib/lock_traits.hpp`). Because `Pool` stores slabs
+behind `std::unique_ptr<ISlab>`, `Pool` itself stays non-templated while still
+supporting both build-wide and per-pool lock selection:
+
+| Mechanism | Scope | Options |
+|-----------|-------|---------|
+| `SPALLOCATOR_LOCK_*` (`slab_mutex.hpp`) / `./configure --with-lock-policy=` / `make LOCK_POLICY=` | Build-wide `DefaultSlabLock` | `spinlock` (`mlvlib::SpinLock`, default), `mutex` (`std::mutex`), `null` (`mlvlib::NullLock`) |
+| `Pool(std::in_place_type<Lock>)` | Single `Pool` instance | Any `mlvlib::BasicLockable` (`SpinLock`, `std::mutex`, `NullLock`, custom) |
+
+Key design points:
+
+- **Zero overhead for `NullLock`:** `slab_lock` is declared last with
+  `MLVLIB_NO_UNIQUE_ADDRESS`, so `mlvlib::NullLock` adds zero bytes to `Slab` in
+  `NDEBUG` builds and `std::scoped_lock<NullLock>` compiles away completely.
+- **Debug precondition checks:** internal helpers that require the slab lock
+  (`allocateNewBlock`, `destroyBlockAt`) call `mlvlib::assert_lock_held(slab_lock)`,
+  which verifies current-thread ownership in `!NDEBUG` builds for introspectable
+  locks (`SpinLock`, `NullLock`) and compiles to a no-op for `std::mutex` and in
+  `NDEBUG`.
+- **Metadata without leaking the template:** `ISlab` and `Pool` expose
+  `isThreadSafe()` and `lockPolicyName()` (driven by `mlvlib::lock_traits<Lock>`),
+  allowing tests, benchmarks, and callers to guard concurrent paths explicitly.
+- **Single-threaded safety:** `NullLock` provides no mutual exclusion and emits
+  no TSan annotations. Concurrent access to a `NullLock` pool is a caller bug
+  (caught by `NullLock` debug owner assertions in `!NDEBUG` and by TSan if
+  accidentally raced).
+
 ### Ordering intent
 
-- Common allocate / free (any alignment class): lock-free resolve → `Slab::lock` (slot /
+- Common allocate / free (any alignment class): lock-free resolve → `Slab::slab_lock` (slot /
   block growth)  
 - Avoid nesting unrelated slab locks across classes unless a future API requires
   it (today’s hot path never does)  
@@ -840,16 +870,15 @@ truth if this summary drifts.
 
 | Client | Thread notes |
 |--------|----------------|
-| Concurrent `Pool::allocate` / free | Supported on one pool |
+| Concurrent `Pool::allocate` / free | Supported on one pool when `pool.isThreadSafe()` is `true` (`SpinLock` / `std::mutex`); single-thread / externally serialized for `NullLock` |
 | `unique_pool_ptr` | Unique ownership — cross-thread handoff needs external sync on the pointer |
 | `shared_ptr` from `make_pool_shared` | Standard atomic control-block refcounts |
 | Multiple `Pool` instances | Separate domains; no shared locks between pools |
 | `LifetimeObserver` | Allocator-independent; see its own thread model |
 
-Prefer `std::scoped_lock` or `std::unique_lock` around `SpinLock` so exceptions
+Prefer `std::scoped_lock` or `std::unique_lock` around slab locks so exceptions
 cannot leave a lock held (`unique_lock` when early unlock / deferred lock is
-needed). Compile-time swap of the lock type is backlog item R5 on the research
-canvas.
+needed).
 
 ---
 
@@ -868,8 +897,10 @@ non-movable. Full line-by-line analysis:
 Pool/slab critical sections are tiny (route a pointer; flip freemap bits). A
 spinlock that busy-waits briefly often beats sleeping a thread on uncontended or
 lightly contended paths. Under prolonged contention the implementation **stops**
-burning CPU and blocks via `atomic_flag::wait`. Whether a given embed prefers
-`std::mutex` instead is exactly the pluggable-lock backlog item.
+burning CPU and blocks via `atomic_flag::wait`. Embeds that prefer OS blocking
+or zero-overhead single-threaded domains can select `std::mutex` or
+`mlvlib::NullLock` at compile time (`--with-lock-policy=` / `LOCK_POLICY=` /
+`Pool(std::in_place_type<Lock>)`).
 
 ### State
 
@@ -1029,6 +1060,7 @@ ns/op.
 ```bash
 make bench BUILD_TYPE=release
 make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
+make bench BUILD_TYPE=release BENCH_ARGS='--backend=new,locks'  # SpinLock vs std::mutex vs NullLock
 make bench BUILD_TYPE=release BENCH_ARGS='--align=32'   # Pool vs ::new alignment-class-32 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new alignment-class-64 spot
 make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
@@ -1066,7 +1098,7 @@ Filters (for focused timing or profiling):
 | `--stride=` | bytes (default **64**) | Chase node stride; multiple of pointer size |
 | `--link=` | `spatial`, `random`, `all` | Chase ring link mode (default `all`) |
 | `--chase-loads=` | N | Dependent loads per cell (default scales with `--iters`) |
-| `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `pool_pmr`, `all` | Inapplicable combos are skipped with a note; without `new`, ratios show `n/a`. `slab16` participates in `lifo` and `bulk`. `pool_pmr` shows PMR virtual tax vs raw `pool` |
+| `--backend=` | `new`, `pool`, `pmr_unsync`, `pmr_sync`, `slab16`, `pool_pmr`, `all`, `pool_spin`, `pool_mutex`, `pool_null`, `slab16_spin`, `slab16_mutex`, `slab16_null`, `locks` | Inapplicable combos are skipped with a note (including `pool`/`pool_pmr` when built with `LOCK_POLICY=null` and `pool_null` in `threaded`); without `new`, ratios show `n/a`. `locks` expands to all six per-lock backends for side-by-side comparison. `slab16*` participates in `lifo` and `bulk`. `pool_pmr` shows PMR virtual tax vs raw `pool` |
 | `--pool-stats` | (flag) | Opt-in `[PoolStats]` / slab retained dumps after scenarios |
 | `--batch=` | Per-thread live batch for `threaded` (default **1024**) | Peak live ≈ `threads×batch`; sized for multi-buffer growth under `--size-mix=class` |
 | `--size-mix=` | `uniform` or `class` (default **class**) | `class` = equal weight per reachable alignment-class-16 size class (exact-fit user size); better multi-slab coverage than uniform bytes |
@@ -1155,7 +1187,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 | Alloc bit scan | Next-fit + CTZ + `SlotFreemap` (production); freelist deferred (P4 re-baseline) |
 | Address map | O(log m); denser structures deferred (P4 re-baseline) |
 | Fixed size-class ladders | Deliberate; exact-pack buffers within classes; non-ladder shaping is backlog R2 |
-| Lock type | Hard-wired `SpinLock`; pluggable mutex deferred (P4: uncontended TAS dominates, not contention) |
+| Lock type | **Done** — compile-time selectable (`mlvlib::SpinLock` default, `std::mutex`, or zero-overhead `mlvlib::NullLock` for single-thread domains) via `--with-lock-policy=` / `LOCK_POLICY=` or `Pool(std::in_place_type<Lock>)` |
 | `ISlab` virtuals | Deferred de-virt (P4: no measurable thunk hotspot) |
 | MSan in CI | Deferred pending host instrumented runtime |
 | Metrics API | `PoolStats` / `Pool::stats()` (HWMs always; alloc/free tallies opt-in via `SPALLOCATOR_POOL_COUNTERS`); richer per-class breakdown later |
@@ -1208,7 +1240,7 @@ Also tracked on the
 | PMR `memory_resource` adapter | **Done** — `PoolMemoryResource` in `pool_pmr.hpp` (additive; virtual cost); keep `PoolAllocator` as the primary / non-virtual STL path |
 | Baseline ratio benches | **Shipped** — `make bench` (`bench/bench_allocators.cpp`); re-check after toolchain upgrades |
 | C99 wrapper | Opaque pool handle API for C callers |
-| Pluggable lock primitive | **Deferred** (P4) — uncontended TAS dominates profiles; mutex unlikely to win. Revisit if contended threaded workloads show wait time, not TAS |
+| Pluggable lock primitive | **Done** — `Slab<ElemSize, Alignment, Lock = DefaultSlabLock>` + `mlvlib::lock_traits` / `NullLock` + `Pool(std::in_place_type<Lock>)` + `--with-lock-policy=spinlock\|mutex\|null` |
 | Fail-closed allocate policy | Optional: refuse OS / `new` spill when over caps or domain exhausted (timing-critical / bounded domains); loud `bad_alloc` instead of silent fallback |
 | C++26 language contracts | **Deferred** — wait for toolchain contract syntax under default `-std=c++26` |
 | Destroying delete (typed) | **Non-goal** for generic `Pool` / `PoolDeleter`; future type-local path only |

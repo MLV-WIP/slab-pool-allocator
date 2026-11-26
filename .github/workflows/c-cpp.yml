@@ -67,3 +67,32 @@ jobs:
     - name: coverage report
       if: matrix.sanitizer-config.name == 'release'
       run: make coverage
+
+  null-st:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [clang, gcc]
+        cxxstd: [auto, c++20]
+        build-config:
+          - name: addrsan
+            enable-flags: "--enable-asan --enable-lsan --enable-ubsan"
+            build-type: "addrsan"
+          - name: release
+            enable-flags: "--disable-coverage"
+            build-type: "release"
+
+    container:
+      image: ghcr.io/mlv-wip/${{ matrix.compiler }}-builder:latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: configure (null-st ${{ matrix.build-config.name }}, cxxstd=${{ matrix.cxxstd }})
+      run: ./configure ${{ matrix.build-config.enable-flags }} --enable-tests --enable-demo --with-lock-policy=null --build-type=${{ matrix.build-config.build-type }} --with-cxxstd=${{ matrix.cxxstd }}
+    - name: make
+      run: make
+    - name: make test
+      run: make test
