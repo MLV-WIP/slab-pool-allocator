@@ -38,6 +38,7 @@
 #include <format>
 #include <new>
 #include <stdexcept>
+#include <string_view>
 
 #include "impl/helper.hpp"
 #include "impl/islab.hpp"
@@ -58,6 +59,9 @@ namespace spallocator
         void deallocateItem(std::byte* item,
                             std::byte* block_base = nullptr,
                             std::uint16_t block_generation = 0) override;
+
+        bool isThreadSafe() const noexcept override { return true; }
+        std::string_view lockPolicyName() const noexcept override { return "system"; }
 
         SlabProxy() = default;
         ~SlabProxy() override = default;

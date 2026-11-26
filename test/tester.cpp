@@ -1857,6 +1857,12 @@ TEST(PoolTest, HighAlignmentSlabReuseAndProxy)
 
 TEST(PoolTest, MultiThreadTest)
 {
+    if constexpr (!mlvlib::lock_traits<DefaultSlabLock>::is_thread_safe)
+    {
+        GTEST_SKIP() << "DefaultSlabLock (" << mlvlib::lock_traits<DefaultSlabLock>::name
+                     << ") is not thread-safe";
+    }
+
     std::size_t const num_cores = std::thread::hardware_concurrency();
     println("Detected {} hardware threads", num_cores);
     ASSERT_GT(num_cores, 0u);

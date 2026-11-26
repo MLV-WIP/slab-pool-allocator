@@ -29,6 +29,7 @@ ENABLE_UBSAN="auto"
 ENABLE_TSAN="no"
 ENABLE_COVERAGE="auto"
 VERBOSE="no"
+LOCK_POLICY="spinlock"
 SLAB_TARGET_BYTES="8192"
 SLAB_TARGET_MULTIPLIER="16"
 PREALLOCATE_MAX_ELEM_SIZE="256"
@@ -104,6 +105,9 @@ Optional Packages:
   --with-cxxflags=FLAGS   additional C++ compiler flags
   --with-cxxstd=STD       C++ dialect: auto, c++20, c++23, or c++26
                           [default: auto — newest the compiler accepts]
+  --with-lock-policy=POLICY
+                          compile-time slab lock policy: spinlock, mutex, or null
+                          [default: spinlock]
   --with-slab-target-bytes=N
                           slab buffer soft target in bytes (power of two)
                           [default: 8192]
@@ -136,6 +140,7 @@ Examples:
   ./configure --with-max-allocation-mib=256 --with-max-class-mib=1024
   ./configure --with-cxxstd=c++20
   ./configure --with-cxxstd=auto
+  ./configure --with-lock-policy=null --build-type=release
 
 EOF
 }
@@ -225,6 +230,9 @@ for arg in "$@"; do
         --with-cxxstd=*)
             REQUESTED_CXXSTD="${arg#*=}"
             ;;
+        --with-lock-policy=*)
+            LOCK_POLICY="${arg#*=}"
+            ;;
         --with-slab-target-bytes=*)
             SLAB_TARGET_BYTES="${arg#*=}"
             ;;
@@ -293,6 +301,18 @@ if [ "$PREALLOCATE_MAX_ALIGNMENT" != "16" ] && \
 fi
 MAX_ALLOCATION_BYTES=$((MAX_ALLOCATION_MIB * 1024 * 1024))
 MAX_CLASS_BYTES=$((MAX_CLASS_MIB * 1024 * 1024))
+
+# Validate lock policy
+LOCK_POLICY=$(echo "$LOCK_POLICY" | tr '[:upper:]' '[:lower:]')
+case "$LOCK_POLICY" in
+    spinlock|mutex|null)
+        ;;
+    *)
+        print_error "Invalid --with-lock-policy: $LOCK_POLICY"
+        print_error "Valid policies: spinlock, mutex, null"
+        exit 1
+        ;;
+esac
 
 # Validate build type
 case $BUILD_TYPE in
@@ -363,6 +383,10 @@ if [ "$ENABLE_COVERAGE" = "auto" ]; then
     else
         ENABLE_COVERAGE="no"
     fi
+fi
+
+if [ "$LOCK_POLICY" = "null" ] && [ "$ENABLE_TSAN" = "yes" ]; then
+    print_warning "LOCK_POLICY=null provides NO thread safety; concurrent tests under ThreadSanitizer will race (use only single-threaded workloads)."
 fi
 
 print_info "Configuring Slab Pool Allocator..."
@@ -723,6 +747,7 @@ echo "  MemorySanitizer:      $ENABLE_MSAN"
 echo "  UBSanitizer:          $ENABLE_UBSAN"
 echo "  ThreadSanitizer:      $ENABLE_TSAN"
 echo "  Code coverage:        $ENABLE_COVERAGE"
+echo "  Lock policy:          $LOCK_POLICY"
 echo "  Slab target bytes:    $SLAB_TARGET_BYTES"
 echo "  Slab target mult:     $SLAB_TARGET_MULTIPLIER"
 echo "  Prealloc max elem:    $PREALLOCATE_MAX_ELEM_SIZE"
@@ -762,6 +787,7 @@ CXXSTD := $CXXSTD
 
 # Build configuration
 BUILD_TYPE := $BUILD_TYPE
+LOCK_POLICY := $LOCK_POLICY
 ENABLE_TESTS := $ENABLE_TESTS
 ENABLE_DEMO := $ENABLE_DEMO
 ENABLE_BENCH := $ENABLE_BENCH
