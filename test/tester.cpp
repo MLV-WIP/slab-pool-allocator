@@ -522,6 +522,7 @@ TEST(PoolTest, ControlBlockSurvivesPoolWhenHandleRemains)
             Pool pool;
             block = pool.control();
             h = pool.handle();
+            ASSERT_NE(block, nullptr);
             EXPECT_TRUE(block->is_alive());
             EXPECT_EQ(h.get(), &pool);
         } // ~Pool: mark_dead, drop Pool's block_ref; handle keeps block alive
