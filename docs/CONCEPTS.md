@@ -184,11 +184,11 @@ API: [API.md — Slab & SlabProxy](API.md#slab--slabproxy).
 ## How this library composes them
 
 ```text
-  Pool                            ← lifetime / routing / isolation boundary
-    ├── Slab<ElemSize, Align>     ← size-class engine (alignment class 16 / 32 / 64)
-    │     └── Block               ← one mapped chunk
+  Pool                            ← lifetime / routing / isolation boundary (lock-free routing)
+    ├── Slab<ElemSize, Align>     ← size-class engine (alignment class 16 / 32 / 64; per-slab lock)
+    │     └── Block               ← owns one mapped chunk + generation + live count + SlotFreemap
     │           └── Slot          ← one ElemSize cell (freemap unit)
-    └── SlabProxy                 ← oversized: system new[] / delete[] (no Block/Slot recycle)
+    └── SlabProxy                 ← oversized: system new[] / delete[] (no lock, no Block/Slot recycle)
 
   Item (allocateItem) = backend allocation at the slab layer (= slot base for Slab).
   User pointer (Pool::allocate) = slot base + header.
@@ -196,9 +196,10 @@ API: [API.md — Slab & SlabProxy](API.md#slab--slabproxy).
 
 | Concept | Role here |
 |---------|-----------|
-| **`Pool`** | Public facade: choose a backend by footprint + alignment, write the allocation header, own the set of slabs, provide `trim` / accounting, synchronize routing |
-| **`Slab`** | Per–size-class engine: zero or more **Blocks**, freemap bits, address map, per-slab lock, growth / reclaim |
-| **`SlabProxy`** | Same *interface* as a slab backend, different *strategy* (no Block/Slot recycling) |
+| **`Pool`** | Public facade: lock-free routing by footprint + alignment, write/validate the allocation header (including routing hints), own the eager set of slabs, provide `trim` / accounting |
+| **`Slab`** | Per–size-class engine: durable `vector<Block>`, availability bitset, trimmed-shell refill list, cold address map, per-slab lock, out-of-lock growth / reclaim |
+| **`Block`** | Single backing chunk: aligned raw memory (detached to `nullptr` when trimmed), 16-bit ABA generation tag, exact `live_count_`, and inline `SlotFreemap` |
+| **`SlabProxy`** | Same *interface* as a slab backend, different *strategy* (lock-free direct `new[]`/`delete[]`, no Block/Slot recycling) |
 
 Destroying a `Pool` destroys its slabs and drops that whole allocation domain.
 Using several `Pool` instances isolates domains (for example per shard). Speeding
@@ -323,6 +324,24 @@ On free, the pool reads fixed offsets *behind* your pointer, validates them,
 recovers the slot base, and asks the owning slab backend to free that base (or
 `delete[]`s via `SlabProxy`).
 
+### Routing hints in alignment padding
+
+Default allocations (`align = 16`, or `32` / `64`) already require at least a
+16-byte header so the returned user pointer stays aligned. The core metadata
+(`alloc_size`, `header_size`, `magic`) only needs 6 bytes, leaving 10 bytes of
+alignment padding that would otherwise sit unused.
+
+This library packs **routing hints** into those padding bytes: the owning
+`Block`'s durable index (`block_index`), the `Slot` index (`slot_index`), and
+the `Block`'s `generation`. On free, instead of searching an ordered map of
+Block addresses and dividing by `ElemSize`, the `Slab` indexes directly into
+`blocks_[block_index]` and verifies `generation` and
+`item == blk.slotAddress(slot_index)` in **O(1)**.
+
+Requests with `align ≤ 8` use a compact 8-byte header with no room for hints
+and intentionally fall back to the address-lookup path rather than doubling the
+header size to 16 bytes.
+
 ### What to remember as a user
 
 - Do not write into the bytes before the returned pointer.  
@@ -335,7 +354,8 @@ Byte-level layout: [IMPLEMENTATION.md — Memory layout](IMPLEMENTATION.md#memor
 
 **Teaching angle:** metadata placement is a recurring systems theme — allocator
 headers, network packet headers, and database row headers all trade a few hidden
-bytes for a simpler public operation.
+bytes for a simpler (and faster) public operation, and packing hints into
+existing alignment padding gets O(1) lookup with zero extra memory footprint.
 
 ---
 
@@ -382,9 +402,37 @@ When a Block becomes completely empty, the Slab **keeps it mapped by default**
 - Pros: alloc/free avoid mmap/munmap thrash; the next burst is warm  
 - Cons: RSS stays at the high-water mark until you ask to shrink  
 
-Reclaim is exposed on the **Pool** as `Pool::trim()`, which asks each size-class
-Slab to drop empty Blocks — a pool-level policy knob over slab-level storage.
+Reclaim is exposed on the **Pool** as `Pool::trim()`, which synchronously asks
+each size-class Slab to drop empty `Block` backing buffers — a pool-level
+policy knob over slab-level storage, with **no background cleanup thread**.
 Large (`SlabProxy`) allocations already return memory on each free.
+
+### Durable Block indices, trimmed shells, and ABA generations
+
+If allocation headers store a `block_index` for O(1) free, a `Slab` cannot
+renumber surviving Blocks when `trim()` reclaims an empty Block (the classic
+"swap-with-last" vector trick would silently invalidate every `block_index`
+stored in live headers of the moved Block).
+
+Instead, each `Block` lives at a **durable index** in `Slab::blocks_`:
+
+- **Trim detaches the buffer, not live indices:** `reclaimEmptyBlocks` scans
+  empty Blocks high-to-low, frees each large aligned backing chunk (≥8 KiB)
+  outside the lock, and synchronously pops any **trailing** trimmed shells from
+  `blocks_` (plus best-effort `shrink_to_fit` after large spikes) — never during
+  ordinary `deallocate`. Any interior trimmed shell below a still-live
+  higher-index Block stays as a tiny empty shell (`buffer_ == nullptr`,
+  ~24–80 B) for O(1) reuse on the next growth. Surviving live Blocks never move
+  indices.
+- **Why a generation counter is still needed (ABA):** when a trimmed shell at
+  index `k` is later refilled with a brand-new backing buffer, a stale or forged
+  pointer from the *previous* lifetime of index `k` still carries `block_index == k`.
+  Bumping a non-zero `generation` tag every time a `Block` attaches a buffer
+  ensures stale hints fail closed immediately instead of touching a new buffer.
+
+**Teaching angle:** this is the same **generational index** (slot-map / handle
+table) pattern used in game engines, ECS registries, and kernel descriptor
+tables — stable O(1) indexing combined with a generation tag to defeat ABA.
 
 ### Next-fit cursor vs freelist
 
@@ -404,54 +452,73 @@ cost — see IMPLEMENTATION Future Work.
 ### The question free must answer
 
 Given a user pointer (after the Pool recovers the **slot base**), which **Block**
-owns it? Blocks are address **intervals** `[base, base + length)`. Looking up
-“which interval contains this address?” is a standard problem. That is distinct
-from “which **Slab** (size-class engine) handles this class?” — routing answers
-the latter; address lookup answers the former.
+and **Slot** own it? That is distinct from “which **Slab** (size-class engine)
+handles this class?” — Pool routing answers the Slab question in O(1); the Slab
+must then locate the specific Block and Slot.
 
-### Approaches
+### Two paths: O(1) verified index vs O(log m) interval map
 
-| Approach | Intuition | Typical cost |
-|----------|-----------|--------------|
-| Ordered map of bases | `upper_bound` then step back to the owning base | O(log m) |
-| Hash of bases | Fast when you only ever free exact bases | O(1) average; awkward for interior checks |
-| Linear scan of bases | Simple | O(m) — fine only for tiny m |
+| Approach | Intuition | Typical cost | Used here when |
+|----------|-----------|--------------|----------------|
+| **Direct index + verify** | Read `(block_index, slot_index, gen)` from header padding; index `blocks_[block_index]` and verify generation + exact address | **O(1)** | Default `Pool` (`align ≥ 16`, `header_size ≥ 16`) |
+| **Single-Block range check** | If only one live Block exists, check `[base, base + length)` directly | **O(1)** | Unhinted free when `m == 1` |
+| **Ordered map of bases** | `upper_bound` then step back to the candidate interval `[base, base + length)` | **O(log m)** | `align ≤ 8` `Pool` or direct unhinted `Slab` call when `m > 1` |
 
-This project uses an ordered map keyed by Block base addresses. The *concept*
-matters more than the container choice: free must identify a **slot base**, not
-an arbitrary interior address. Interior frees are rejected so a misaligned free
-cannot flip a neighboring object’s freemap bit. (`findBlockForSlot` answers “which Block owns this slot base?”)
+Notice the security / safety principle on *both* paths: **hints are verified,
+never blindly trusted.** On the indexed path, `Slab` checks bounds, live state,
+generation match, and exact address (`item == blk.slotAddress(slot_index)`) in
+O(1) — zero tree traversal and zero integer division. On the unhinted fallback,
+`findBlockForSlot` checks interval containment and exact slot alignment. In both
+cases, interior frees (`p + 1`) and stale pointers fail loudly instead of
+flipping a neighboring object’s freemap bit.
 
-**Teaching angle:** ownership maps and interval trees appear in kernels (vma
-trees), JITs, and sanitizers — same shape of question.
+**Teaching angle:** combining a **fast verified hint** (hot path) with a
+**general interval structure** (cold fallback) is a recurring systems design
+trade-off: get O(1) speed in the common case without losing full validation or
+forcing every caller (such as compact 8-byte-aligned allocations) to pay a
+bigger header.
 
 ---
 
 ## Locking & contention
 
-### Why locks appear at both layers
+### Eliminating the Pool lock (immutable eager routing)
 
-Multiple threads may allocate and free concurrently. The **pool** has shared
-routing state (which slab object serves a class). Each **slab** has shared
-slot state (which bits are free). Both need mutual exclusion (or a proven
-lock-free protocol). This library uses locks with a deliberate **granularity**
-story — and that granularity mirrors the pool-vs-slab split.
+Multiple threads may allocate and free concurrently. A naïve two-level design
+puts one lock on the **Pool** (to protect lazy Slab creation) and another lock
+on each **Slab** (to protect freemaps). Even a brief Pool-wide lock becomes a
+central bottleneck when many threads allocate different sizes.
 
-### Two levels
+This library avoids a Pool lock altogether:
 
-1. **Pool lock** — short critical sections for routing (“which slab handles this
-   footprint?”) and size-class routing (including high-align 32/64-class
-   slabs).  
-2. **Per-slab lock** — protects that size class’s bitsets and address map.  
+1. **Pool routing — lock-free:** every size-class `Slab` across alignment
+   classes 16, 32, and 64 is installed eagerly in `Pool()` and never replaced
+   (cold classes simply start with zero mapped Blocks). `Pool::resolveSlab` only
+   reads immutable pointers — **zero Pool lock** on allocate or free.
+2. **Per-Slab lock — fine-grained:** each `Slab` owns its own compile-time
+   selectable `Lock` (`mlvlib::SpinLock` by default, `std::mutex`, or
+   zero-overhead `mlvlib::NullLock` for single-threaded domains). Different size
+   classes run completely in parallel, and separate `Pool` instances share no
+   locks at all.
 
-Once routing finishes, different size-class slabs can proceed in parallel. That
-is the main scalability idea: do not hold the pool lock across every bitmap
-update. Separately, using **multiple Pool instances** can reduce contention
-further by isolating entire domains (see [pools](#what-is-a-pool-and-why-use-one)).
+### Keeping OS allocation and free outside the lock
 
-Lock **ordering** is fixed so thread A cannot hold lock 1 and wait for lock 2
-while thread B does the reverse (deadlock). Exact order belongs in
-IMPLEMENTATION; the concept is “always acquire in one global sequence.”
+Holding a spinlock (or mutex) across `operator new[]` or `operator delete[]` is
+a classic concurrency hazard: the system allocator may take its own locks, call
+`mmap`/`munmap`, or fault pages, stalling every other thread waiting on that
+`Slab`’s short critical section.
+
+Both cold paths therefore keep OS heap traffic **strictly outside `slab_lock`**:
+
+- **Cold growth (`allocateSlow`):** release `slab_lock` → allocate the raw
+  backing buffer into an RAII guard → re-acquire `slab_lock` → **double-check**
+  whether another thread already grew or freed a Slot while we were unlocked. If
+  so, take that Slot and free the redundant buffer *after* unlocking.
+- **Trim (`reclaimEmptyBlocks`):** detach empty buffers into a local list under
+  `slab_lock`, unlock, then call `delete[]` on each buffer afterward.
+
+This **stage-outside, double-check-inside** pattern keeps critical sections
+bounded to pure in-memory bitset and metadata operations.
 
 ### What a spinlock is optimizing for
 
@@ -756,10 +823,12 @@ explicit `Slab<ElemSize, Alignment>` alignment classes and a pool header of
 `max(8, alignment)`, so high-align traffic does not share a layout that cannot
 recover alignment class and slot base on free.
 
-**Synchronization note:** allocation APIs must be thread-safe. Roy's samples
-often use `std::mutex` and warn that lock cost on free can erase gains. This
-project uses short-section `mlvlib::SpinLock` at pool and per-slab granularity;
-pluggable lock choice is backlog if contention profiles prefer a mutex.
+**Synchronization note:** allocation APIs must be thread-safe when shared across
+threads. Roy's samples often use `std::mutex` and warn that lock cost on free
+can erase gains. This project keeps Pool routing lock-free, keeps OS heap calls
+outside the per-Slab lock, and makes the per-Slab lock **compile-time
+selectable** (`mlvlib::SpinLock` default, `std::mutex`, or zero-overhead
+`mlvlib::NullLock` for single-threaded domains).
 
 More design detail:
 [IMPLEMENTATION.md - Future work](IMPLEMENTATION.md#future-work) and

@@ -2115,11 +2115,12 @@ TYPED_TEST(LockPolicyTest, SlabLifecycleKnownBaseFreeAndReclaim)
     }
 
     const std::size_t capacity_before = slab.getBlockCapacity();
+    EXPECT_GE(capacity_before, 3u);
+    // deallocateItem never compacts trailing Block shells; trim() does.
     const std::size_t reclaimed = slab.reclaimEmptyBlocks(1);
     EXPECT_GE(reclaimed, 2u);
     EXPECT_EQ(slab.getBlockCount(), 1u);
-    // Stable indices: capacity stays at peak while live count drops to 1.
-    EXPECT_EQ(slab.getBlockCapacity(), capacity_before);
+    EXPECT_EQ(slab.getBlockCapacity(), 1u);
 }
 
 TYPED_TEST(LockPolicyTest, PoolTagCtorAllocFreeTrimAndSmartPtrs)
@@ -2333,6 +2334,55 @@ TEST(DynBitsetTest, FindNextSetAcrossWordBoundaries)
     EXPECT_EQ(bits.find_next_set(1), 64u);
 }
 
+TEST(DynBitsetTest, FindPrevSetPopBackAndShrinkToFit)
+{
+    DynBitset bits;
+    EXPECT_EQ(bits.find_prev_set(0), 0u);
+    EXPECT_EQ(bits.find_prev_set(10), 0u);
+    bits.pop_back(); // safe on empty
+    EXPECT_EQ(bits.size(), 0u);
+
+    // 130 bits spans 3 uint64_t words (0..63, 64..127, 128..129).
+    for (std::size_t i = 0; i < 130; ++i)
+    {
+        bits.push_clear();
+    }
+    EXPECT_EQ(bits.find_prev_set(130), 130u);
+
+    bits.set(0);
+    bits.set(63);
+    bits.set(64);
+    bits.set(127);
+    bits.set(129);
+
+    EXPECT_EQ(bits.find_prev_set(200), 129u);
+    EXPECT_EQ(bits.find_prev_set(130), 129u);
+    EXPECT_EQ(bits.find_prev_set(129), 127u);
+    EXPECT_EQ(bits.find_prev_set(127), 64u);
+    EXPECT_EQ(bits.find_prev_set(64), 63u);
+    EXPECT_EQ(bits.find_prev_set(63), 0u);
+    EXPECT_EQ(bits.find_prev_set(1), 0u);
+    EXPECT_EQ(bits.find_prev_set(0), 130u);
+
+    // Popping clears the popped bit so re-pushing starts clean.
+    bits.pop_back(); // removes bit 129
+    EXPECT_EQ(bits.size(), 129u);
+    EXPECT_EQ(bits.find_prev_set(129), 127u);
+    bits.push_clear();
+    EXPECT_FALSE(bits.test(129));
+
+    // Pop down below word boundaries and shrink storage.
+    while (bits.size() > 64)
+    {
+        bits.pop_back();
+    }
+    bits.shrink_to_fit();
+    EXPECT_EQ(bits.size(), 64u);
+    EXPECT_EQ(bits.find_prev_set(64), 63u);
+    EXPECT_EQ(bits.find_next_set(0), 0u);
+    EXPECT_EQ(bits.find_next_set(1), 63u);
+}
+
 TEST(SlabStableIndexTest, TrimPreservesLiveBlockIndicesAndRefillsWithBumpedGeneration)
 {
     Slab<64, 16> slab(/*preallocate_first_block=*/true);
@@ -2400,7 +2450,105 @@ TEST(SlabStableIndexTest, TrimPreservesLiveBlockIndicesAndRefillsWithBumpedGener
     }
     EXPECT_EQ(slab.reclaimEmptyBlocks(1), 2u);
     EXPECT_EQ(slab.getBlockCount(), 1u);
-    EXPECT_EQ(slab.getBlockCapacity(), 3u);
+    // High-to-low reclaim keeps Block 0 live and pops trailing trimmed shells (1 and 2).
+    EXPECT_EQ(slab.getBlockCapacity(), 1u);
+}
+
+TEST(SlabStableIndexTest, TrimCompactsTrailingShellsNotDeallocate)
+{
+    Slab<64, 16> slab(/*preallocate_first_block=*/true);
+    const std::size_t slots = slab.getAllocSize() / slab.getElemSize();
+
+    // Grow to 70 Blocks (above shrink hysteresis threshold of 64).
+    constexpr std::size_t kNumBlocks = 70;
+    std::vector<std::vector<AllocateItemResult>> allocs(kNumBlocks);
+    for (std::size_t b = 0; b < kNumBlocks; ++b)
+    {
+        allocs[b].reserve(slots);
+        for (std::size_t s = 0; s < slots; ++s)
+        {
+            allocs[b].push_back(slab.allocateItem(64));
+        }
+    }
+    ASSERT_EQ(slab.getBlockCount(), kNumBlocks);
+    ASSERT_EQ(slab.getBlockCapacity(), kNumBlocks);
+
+    // Remember a stale hint from the tail Block before freeing it.
+    const AllocateItemResult tail_sample = allocs.back()[0];
+
+    // Free EVERY slot across all 70 Blocks via deallocateItem — must NOT compact shells!
+    for (const auto& blk_allocs : allocs)
+    {
+        for (const auto& r : blk_allocs)
+        {
+            slab.deallocateItem(r.ptr, r.block_index, r.slot_index, r.block_generation);
+        }
+    }
+    EXPECT_EQ(slab.getBlockCount(), kNumBlocks);
+    EXPECT_EQ(slab.getBlockCapacity(), kNumBlocks);
+
+    // Explicit trim (keep_min=1) detaches 69 trailing Blocks and compacts blocks_ down to 1.
+    EXPECT_EQ(slab.reclaimEmptyBlocks(1), kNumBlocks - 1);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
+    EXPECT_EQ(slab.getBlockCapacity(), 1u);
+
+    // Stale hint for popped tail Block index must fail closed (out of range).
+    EXPECT_THROW(slab.deallocateItem(tail_sample.ptr, tail_sample.block_index,
+                                     tail_sample.slot_index, tail_sample.block_generation),
+                 std::invalid_argument);
+
+    // Re-growing back up to 70 Blocks assigns strictly newer generations, so
+    // the old tail_sample hint is STILL rejected even once index 69 exists again.
+    std::vector<AllocateItemResult> regrown;
+    regrown.reserve(kNumBlocks * slots);
+    for (std::size_t i = 0; i < kNumBlocks * slots; ++i)
+    {
+        regrown.push_back(slab.allocateItem(64));
+    }
+    ASSERT_EQ(slab.getBlockCapacity(), kNumBlocks);
+    const AllocateItemResult& new_tail = regrown.back();
+    ASSERT_EQ(new_tail.block_index, tail_sample.block_index);
+    EXPECT_NE(new_tail.block_generation, tail_sample.block_generation);
+
+    EXPECT_THROW(slab.deallocateItem(new_tail.ptr, new_tail.block_index,
+                                     new_tail.slot_index, tail_sample.block_generation),
+                 std::invalid_argument);
+
+    // Keep one slot alive in the highest Block while freeing all others:
+    // trim() detaches interior empty Blocks without moving the tail Block's index,
+    // then compacts the entire tail once that final Block is freed and trimmed.
+    const AllocateItemResult pinned = regrown.back();
+    regrown.pop_back();
+    for (const auto& r : regrown)
+    {
+        slab.deallocateItem(r.ptr, r.block_index, r.slot_index, r.block_generation);
+    }
+    EXPECT_EQ(slab.reclaimEmptyBlocks(1), kNumBlocks - 1);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
+    EXPECT_EQ(slab.getBlockCapacity(), kNumBlocks);
+    EXPECT_EQ(slab.findBlockForSlot(pinned.ptr),
+              std::optional<std::size_t>{pinned.block_index});
+
+    // Freeing the pinned slot does not compact until trim() is invoked again.
+    slab.deallocateItem(pinned.ptr, pinned.block_index,
+                        pinned.slot_index, pinned.block_generation);
+    EXPECT_EQ(slab.getBlockCapacity(), kNumBlocks);
+
+    // Once completely idle, trim() relocates the sole empty Block's buffer to
+    // index 0 with a bumped generation and compacts all 69 shells down to 1.
+    EXPECT_EQ(slab.reclaimEmptyBlocks(0), 0u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
+    EXPECT_EQ(slab.getBlockCapacity(), 1u);
+    EXPECT_THROW(slab.deallocateItem(pinned.ptr, pinned.block_index,
+                                     pinned.slot_index, pinned.block_generation),
+                 std::invalid_argument);
+
+    // Allocation after compaction lands at Block 0 and works cleanly.
+    AllocateItemResult after_idle = slab.allocateItem(64);
+    EXPECT_EQ(after_idle.block_index, 0u);
+    EXPECT_EQ(slab.findBlockForSlot(after_idle.ptr), std::optional<std::size_t>{0u});
+    slab.deallocateItem(after_idle.ptr, after_idle.block_index,
+                        after_idle.slot_index, after_idle.block_generation);
 }
 
 

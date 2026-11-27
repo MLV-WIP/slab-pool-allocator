@@ -33,6 +33,7 @@
 #ifndef SPALLOCATOR_IMPL_SLAB_HPP_
 #define SPALLOCATOR_IMPL_SLAB_HPP_
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -74,8 +75,17 @@ namespace spallocator
         void push_set();
         void push_clear();
 
+        // Remove the highest bit and clear it (used when trim() compacts trailing shells).
+        void pop_back() noexcept;
+
+        // Release excess word storage above size() (best-effort during trim()).
+        void shrink_to_fit();
+
         // Next set bit at or after `start`. Returns size() if none.
         std::size_t find_next_set(std::size_t start) const noexcept;
+
+        // Highest set bit strictly below `before`. Returns size() if none.
+        std::size_t find_prev_set(std::size_t before) const noexcept;
 
         std::size_t size() const noexcept { return size_; }
         // Heap buffer footprint of the word array (capacity, not size).
@@ -167,7 +177,13 @@ namespace spallocator
         Slab& operator=(Slab&&) = delete;
 
         // Try to allocate one slot from an existing live Block. Caller holds slab_lock.
-        std::optional<AllocateItemResult> tryAllocateFromExistingLocked();
+        // Returns AllocateItemResult{} (ptr == nullptr) when no live Block has a free slot.
+        // Returning the 16-byte struct directly avoids both an out-parameter and
+        // std::optional's 24-byte stack-return (sret) ABI on x86-64.
+        AllocateItemResult tryAllocateFromExistingLocked() noexcept;
+
+        // Cold block-availability word scan (called when alloc_cursor_block_ is full).
+        std::size_t findAvailableBlockLocked(std::size_t start, std::size_t nblocks) const noexcept;
 
         // Cold growth path: allocates backing buffer outside slab_lock, publishes
         // (or reuses a concurrently grown Block), and allocates one slot.
@@ -265,6 +281,26 @@ namespace spallocator
         reset(bit);
     }
 
+    inline void DynBitset::pop_back() noexcept
+    {
+        if (size_ == 0)
+        {
+            return;
+        }
+        --size_;
+        reset(size_);
+    }
+
+    inline void DynBitset::shrink_to_fit()
+    {
+        const std::size_t need = (size_ + kWordBits - 1) / kWordBits;
+        if (words_.size() > need)
+        {
+            words_.resize(need);
+        }
+        words_.shrink_to_fit();
+    }
+
     inline std::size_t DynBitset::find_next_set(std::size_t start) const noexcept
     {
         if (start >= size_)
@@ -295,21 +331,72 @@ namespace spallocator
         return size_;
     }
 
+    inline std::size_t DynBitset::find_prev_set(std::size_t before) const noexcept
+    {
+        if (before == 0 || size_ == 0)
+        {
+            return size_;
+        }
+
+        const std::size_t limit = before < size_ ? before : size_;
+        const std::size_t hi = limit - 1;
+        std::size_t word = hi / kWordBits;
+        const std::size_t hi_bit = hi % kWordBits;
+        std::uint64_t mask = (hi_bit == kWordBits - 1)
+            ? ~std::uint64_t{0}
+            : ((std::uint64_t{1} << (hi_bit + 1)) - std::uint64_t{1});
+
+        for (;;)
+        {
+            const std::uint64_t active = words_[word] & mask;
+            if (active != 0)
+            {
+                const std::size_t bit_in_word =
+                    (kWordBits - 1) - static_cast<std::size_t>(std::countl_zero(active));
+                return word * kWordBits + bit_in_word;
+            }
+            if (word == 0)
+            {
+                break;
+            }
+            --word;
+            mask = ~std::uint64_t{0};
+        }
+        return size_;
+    }
+
 
     // ---------------------------------------------------------------------------
     // Slab
     // ---------------------------------------------------------------------------
 
     template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
-    std::optional<AllocateItemResult>
-    Slab<ElemSize, Alignment, Lock>::tryAllocateFromExistingLocked()
+    std::size_t
+    Slab<ElemSize, Alignment, Lock>::findAvailableBlockLocked(std::size_t start,
+                                                              std::size_t nblocks) const noexcept
     {
         mlvlib::assert_lock_held(slab_lock);
 
-        const std::size_t nblocks = blocks_.size();
+        std::size_t block_index = block_available_map_.find_next_set(start);
+        if (block_index >= nblocks && start > 0)
+        {
+            block_index = block_available_map_.find_next_set(0);
+        }
+        return block_index;
+    }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    AllocateItemResult Slab<ElemSize, Alignment, Lock>::tryAllocateFromExistingLocked() noexcept
+    {
+        mlvlib::assert_lock_held(slab_lock);
+
+        // block_available_map_.size() == blocks_.size() by invariant; reading the
+        // stored size avoids dividing (end - begin) by non-power-of-two sizeof(Block).
+        const std::size_t nblocks = block_available_map_.size();
         if (nblocks == 0)
         {
-            return std::nullopt;
+            return {};
         }
 
         if (alloc_cursor_block_ >= nblocks)
@@ -318,35 +405,25 @@ namespace spallocator
             alloc_cursor_slot_ = 0;
         }
 
-        std::size_t block_index = nblocks;
-        std::size_t slot_start = 0;
+        std::size_t block_index = alloc_cursor_block_;
+        std::size_t slot_start = alloc_cursor_slot_;
 
         // O(1) cursor fast path (common LIFO / sequential steady state).
-        if (block_available_map_.test(alloc_cursor_block_))
+        if (!block_available_map_.test(block_index))
         {
-            block_index = alloc_cursor_block_;
-            slot_start = alloc_cursor_slot_;
-        }
-        else
-        {
-            // Word-level scan (64 blocks per uint64_t) with wrap.
-            block_index = block_available_map_.find_next_set(alloc_cursor_block_);
-            if (block_index >= nblocks && alloc_cursor_block_ > 0)
+            block_index = findAvailableBlockLocked(block_index, nblocks);
+            if (block_index >= nblocks)
             {
-                block_index = block_available_map_.find_next_set(0);
+                return {};
             }
-        }
-
-        if (block_index >= nblocks)
-        {
-            return std::nullopt;
+            slot_start = 0;
         }
 
         auto& blk = blocks_[block_index];
         const std::size_t item_index = blk.allocateSlot(slot_start);
         if (item_index >= slots_per_block)
         {
-            return std::nullopt;
+            return {};
         }
 
         // Only update availability bitmap on non-full -> full transition.
@@ -372,12 +449,12 @@ namespace spallocator
                       block_index, item_index, ElemSize, Alignment,
                       printHex(blk.freemap()));
 
-        AllocateItemResult out;
-        out.ptr = blk.slotAddress(item_index);
-        out.block_index = static_cast<std::uint32_t>(block_index);
-        out.slot_index = static_cast<std::uint16_t>(item_index);
-        out.block_generation = blk.generation();
-        return out;
+        return AllocateItemResult{
+            .ptr = blk.slotAddress(item_index),
+            .block_index = static_cast<std::uint32_t>(block_index),
+            .slot_index = static_cast<std::uint16_t>(item_index),
+            .block_generation = blk.generation(),
+        };
     }
 
 
@@ -400,9 +477,9 @@ namespace spallocator
             // Another thread may have grown or freed a slot while we allocated
             // outside the lock. If so, consume it and let staged_buf free after
             // guard releases slab_lock.
-            if (auto existing = tryAllocateFromExistingLocked(); existing.has_value())
+            if (AllocateItemResult result = tryAllocateFromExistingLocked(); result.ptr != nullptr)
             {
-                return *existing;
+                return result;
             }
 
             if (live_block_count_ >= max_blocks)
@@ -418,9 +495,9 @@ namespace spallocator
             debug_println("New block<{},{}> published at index {}, live blocks: {}",
                           ElemSize, Alignment, published_index, live_block_count_);
 
-            if (auto fresh = tryAllocateFromExistingLocked(); fresh.has_value())
+            if (AllocateItemResult result = tryAllocateFromExistingLocked(); result.ptr != nullptr)
             {
-                return *fresh;
+                return result;
             }
         }
     }
@@ -440,9 +517,9 @@ namespace spallocator
         {
             typename lock_traits::guard_type guard(slab_lock);
 
-            if (auto existing = tryAllocateFromExistingLocked(); existing.has_value())
+            if (AllocateItemResult result = tryAllocateFromExistingLocked(); result.ptr != nullptr)
             {
-                return *existing;
+                return result;
             }
 
             if (live_block_count_ >= max_blocks)
@@ -527,7 +604,7 @@ namespace spallocator
         if (has_index && has_gen)
         {
             // O(1) indexed fast path: zero std::map lookup, zero integer division.
-            if (block_index >= blocks_.size())
+            if (block_index >= block_available_map_.size())
             {
                 throw std::invalid_argument(
                     "Invalid item pointer; block_index out of range");
@@ -668,17 +745,18 @@ namespace spallocator
         {
             typename lock_traits::guard_type guard(slab_lock);
 
-            // Every empty live Block has its bit set in block_available_map_, so
-            // word-level find_next_set skips full and already-trimmed Blocks 64 at a time.
-            std::size_t scan = 0;
-            while (live_block_count_ > keep_min)
+            // Scan high-to-low so lower-indexed empty Blocks are kept first,
+            // maximizing trailing empty Block shells that can be popped below
+            // without shifting any surviving live Block's durable index.
+            std::size_t scan = blocks_.size();
+            while (live_block_count_ > keep_min && scan > 0)
             {
-                const std::size_t idx = block_available_map_.find_next_set(scan);
+                const std::size_t idx = block_available_map_.find_prev_set(scan);
                 if (idx >= blocks_.size())
                 {
                     break;
                 }
-                scan = idx + 1;
+                scan = idx;
 
                 auto& blk = blocks_[idx];
                 if (!blk.isLive() || !blk.isEmpty())
@@ -707,6 +785,83 @@ namespace spallocator
                 if (alloc_cursor_block_ == idx)
                 {
                     alloc_cursor_slot_ = 0;
+                }
+            }
+
+            // Compact trailing trimmed Block shells (only in trim(), never on
+            // deallocateItem). Surviving live Blocks keep their durable indices;
+            // next_block_generation_ stays monotonic so re-appended indices
+            // still reject stale routing hints.
+            const std::size_t old_capacity = blocks_.size();
+            while (!blocks_.empty() && !blocks_.back().isLive())
+            {
+                blocks_.pop_back();
+                block_available_map_.pop_back();
+            }
+
+            // If the Slab is completely idle (exactly one live Block, and it is
+            // empty) but that sole Block sits above trimmed shells (e.g. a high-
+            // index straggler was pinned during an earlier trim and later freed),
+            // relocate its empty backing buffer into index 0 with a fresh
+            // generation (zero OS heap calls) and pop the remaining shells.
+            if (live_block_count_ == 1 && blocks_.size() > 1 &&
+                blocks_.back().isLive() && blocks_.back().isEmpty())
+            {
+                const std::uint16_t gen = next_block_generation_;
+                std::uint16_t next_gen = static_cast<std::uint16_t>(gen + 1);
+                if (next_gen == 0)
+                {
+                    next_gen = 1; // 0 reserved for "no hint"
+                }
+
+                std::byte* const buf = blocks_.back().detachBuffer();
+                block_available_map_.reset(blocks_.size() - 1);
+                blocks_[0].attachBuffer(buf, gen);
+                base_address_map_[buf] = 0;
+                block_available_map_.set(0);
+                next_block_generation_ = next_gen;
+
+                while (blocks_.size() > 1)
+                {
+                    blocks_.pop_back();
+                    block_available_map_.pop_back();
+                }
+                trimmed_blocks_.clear();
+                alloc_cursor_block_ = 0;
+                alloc_cursor_slot_ = 0;
+            }
+
+            const std::size_t new_capacity = blocks_.size();
+            if (new_capacity < old_capacity)
+            {
+                if (!trimmed_blocks_.empty())
+                {
+                    std::erase_if(trimmed_blocks_, [new_capacity](std::uint32_t idx) {
+                        return idx >= new_capacity;
+                    });
+                }
+                if (alloc_cursor_block_ >= new_capacity)
+                {
+                    alloc_cursor_block_ = 0;
+                    alloc_cursor_slot_ = 0;
+                }
+            }
+
+            // Release excess metadata vector capacity after large one-time spikes
+            // (4x hysteresis avoids thrashing across normal burst/trim cycles).
+            constexpr std::size_t kMinShrinkCapacity = 64;
+            if (blocks_.capacity() > kMinShrinkCapacity &&
+                blocks_.capacity() >= 4 * std::max<std::size_t>(new_capacity, 1))
+            {
+                try
+                {
+                    blocks_.shrink_to_fit();
+                    trimmed_blocks_.shrink_to_fit();
+                    block_available_map_.shrink_to_fit();
+                }
+                catch (...)
+                {
+                    // Best-effort only: Slab state is already consistent.
                 }
             }
 
@@ -751,12 +906,18 @@ namespace spallocator
 
         // Append a new Block with strong exception safety: do all potentially-
         // throwing allocations/reserves before mutating any container size.
+        // Grow blocks_ geometrically so reserve() preserves O(1) amortized append.
         const std::size_t idx = blocks_.size();
         auto [map_it, inserted] = base_address_map_.emplace(raw_buf.ptr, idx);
         (void)inserted;
         try
         {
-            blocks_.reserve(idx + 1);
+            if (blocks_.capacity() <= idx)
+            {
+                const std::size_t grown =
+                    blocks_.capacity() == 0 ? 1 : blocks_.capacity() * 2;
+                blocks_.reserve(grown > (idx + 1) ? grown : (idx + 1));
+            }
             block_available_map_.reserve(idx + 1);
         }
         catch (...)

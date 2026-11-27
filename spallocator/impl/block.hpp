@@ -239,38 +239,18 @@ namespace spallocator
         }
 
         // Next-fit slot allocation starting at slot_start (wraps within this Block).
+        // Fast path checks slot_start directly (inlineable); cold word scan is
+        // split out so Slab::allocateItem keeps its hot path flat.
         // Returns slots_per_block if full or not live.
         std::size_t allocateSlot(std::size_t slot_start) noexcept
         {
-            if (!hasFree())
+            if (hasFree() && slot_start < slots_per_block && !freemap_.test(slot_start))
             {
-                return slots_per_block;
-            }
-
-            std::size_t item_index = slots_per_block;
-            if (slot_start < slots_per_block && !freemap_.test(slot_start))
-            {
-                item_index = slot_start;
-            }
-            else
-            {
-                item_index = freemap_.find_next_clear(slot_start);
-                if (item_index >= slots_per_block && slot_start > 0)
-                {
-                    item_index = freemap_.find_next_clear(0);
-                    if (item_index >= slot_start)
-                    {
-                        item_index = slots_per_block;
-                    }
-                }
-            }
-
-            if (item_index < slots_per_block)
-            {
-                freemap_.set(item_index);
+                freemap_.set(slot_start);
                 ++live_count_;
+                return slot_start;
             }
-            return item_index;
+            return allocateSlotSlow(slot_start);
         }
 
         bool testSlot(std::size_t slot_index) const noexcept
@@ -285,6 +265,31 @@ namespace spallocator
         }
 
     private:
+        std::size_t allocateSlotSlow(std::size_t slot_start) noexcept
+        {
+            if (!hasFree())
+            {
+                return slots_per_block;
+            }
+
+            std::size_t item_index = freemap_.find_next_clear(slot_start);
+            if (item_index >= slots_per_block && slot_start > 0)
+            {
+                item_index = freemap_.find_next_clear(0);
+                if (item_index >= slot_start)
+                {
+                    item_index = slots_per_block;
+                }
+            }
+
+            if (item_index < slots_per_block)
+            {
+                freemap_.set(item_index);
+                ++live_count_;
+            }
+            return item_index;
+        }
+
         std::byte* buffer_{nullptr};
         std::uint16_t generation_{0};
         // Packed in the 6-byte alignment gap before freemap_'s uint64_t array:
