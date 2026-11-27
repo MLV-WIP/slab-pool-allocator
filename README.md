@@ -8,12 +8,12 @@ A memory **pool** (disposable / isolatable allocation domain) backed by **slabs*
 
 **Terminology:** Pool → Slab (size-class engine) → **Block** (mapped chunk) → Slot. See [docs/terminology-glossary.md](docs/terminology-glossary.md) and [docs/CONCEPTS.md](docs/CONCEPTS.md#terminology).
 
-**Readiness:** The pool, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. Pool lifetime vs clients is defined: orderly RAII (pointers first), optional arena bulk reclaim (`unique_pool_ptr` no-ops when the pool is already dead), and `PoolHandle::create()` for heap domains that retire when idle. Short critical sections use `mlvlib::SpinLock` (from the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule). Known follow-ons (per-class metrics, freelist) are listed under Future Work.
+**Readiness:** The pool, smart-pointer helpers, and `PoolAllocator` are built for concurrent service use. Pool lifetime vs clients is defined: orderly RAII (pointers first), optional arena bulk reclaim (`unique_pool_ptr` no-ops when the pool is already dead), and `PoolHandle::create()` for heap domains that retire when idle. Per-slab locking defaults to `mlvlib::SpinLock` (from the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule) and is compile-time selectable (`spinlock`, `std::mutex`, or zero-overhead `mlvlib::NullLock` for single-threaded domains). Known follow-ons (per-class metrics, freelist) are listed under Future Work.
 
 **Directory map:**
 ```
 spallocator/          # header-only allocator library
-mlvlib/               # git submodule — general utils (SpinLock, LifetimeObserver, helpers)
+mlvlib/               # git submodule — general utils (SpinLock, NullLock, lock_traits, LifetimeObserver, helpers)
 docs/                 # API.md, CONCEPTS.md, IMPLEMENTATION.md, terminology-glossary.md
 test/                 # Google Test suite (tester.cpp)
 demos/                # example programs
@@ -25,11 +25,11 @@ README.md             # this overview + build/run
 
 - **Pool as allocation domain** — construct, share `Pool&` / `PoolHandle`, destroy to dispose; shard pools to isolate or reduce contention
 - **Slab size classes** — alignment-class ladders 16 (16B–4KB), 32 (32B–8KB), 64 (64B–16KB); large fallback via `SlabProxy`
-- **Thread-safe routing** — pool + per-slab locking
+- **Compile-time selectable per-slab locking** — lock-free pool routing + per-slab lock (`mlvlib::SpinLock` default, `std::mutex`, or zero-overhead `mlvlib::NullLock` for single-thread domains via `--with-lock-policy=` or `Pool(std::in_place_type<Lock>)`)
 - **Smart pointers & STL** — `make_pool_unique` / `make_pool_shared` / `PoolAllocator<T>` (via `PoolLifetimeToken`)
 - **Optional PMR bridge** — `PoolMemoryResource` in `pool_pmr.hpp` for `std::pmr` containers (prefer `PoolAllocator` when types can bake it in)
 - **Defined pool lifetime** — orderly RAII, arena bulk reclaim, or `PoolHandle::create()` auto-retire
-- **mlvlib dependency** — `SpinLock`, helpers, and optional `LifetimeObserver` via the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule
+- **mlvlib dependency** — `SpinLock`, `NullLock`, `lock_traits`, helpers, and optional `LifetimeObserver` via the [mlvlib](https://github.com/MLV-WIP/mlvlib) submodule
 - **Modern C++20+** — templates, atomics, ranges, concepts; C++23/26 when the toolchain allows
 
 Design and API detail live under [`docs/`](docs/), not in this README.
@@ -48,6 +48,8 @@ git submodule update --init
 ./configure --enable-tests --enable-demo
 # optional: pin dialect (default = newest of c++26/c++23/c++20 the compiler accepts)
 # ./configure --with-cxxstd=c++20
+# optional: select default slab lock policy (default = spinlock)
+# ./configure --with-lock-policy=spinlock|mutex|null
 # optional compile-time size knobs (defaults 8192 / 16 / 1024 MiB / 4096 MiB):
 # ./configure --with-slab-target-bytes=16384 --with-slab-target-multiplier=16
 # ./configure --with-max-allocation-mib=256 --with-max-class-mib=1024
@@ -61,13 +63,14 @@ make test
 # On-demand allocator comparison (not part of make test; prefer release)
 make bench BUILD_TYPE=release
 # make bench BUILD_TYPE=release BENCH_ARGS='--threads=4'
+# make bench BUILD_TYPE=release BENCH_ARGS='--backend=new,locks'  # side-by-side lock matrix
 # make bench BUILD_TYPE=release BENCH_ARGS='--align=64'   # Pool vs ::new spot-check
 # make bench BUILD_TYPE=release BENCH_ARGS='--scenario=lifo --backend=pool'
 # Focused perf record/report (BUILD_TYPE=profile: -O3 + frame pointers + -g)
 # make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'
 ```
 
-Binaries land under `obj/<build_type>/` (default `obj/addrsan/`), with convenience symlinks in `obj/`:
+Binaries land under `obj/<build_type>/` for the default `spinlock` policy (or `obj/<build_type>-mutex/` / `obj/<build_type>-null/` when overridden via `--with-lock-policy=` or `LOCK_POLICY=`), with convenience symlinks in `obj/`:
 
 ```bash
 ./obj/addrsan/tester
@@ -86,6 +89,7 @@ make BUILD_TYPE=profile     # like release + -g -fno-omit-frame-pointer (for per
 make BUILD_TYPE=addrsan     # AddressSanitizer + LSan + UBSan (default)
 make BUILD_TYPE=memsan      # MemorySanitizer (Clang; needs host MSan runtime — not in CI)
 make BUILD_TYPE=threadsan   # ThreadSanitizer + UBSan
+make LOCK_POLICY=null BUILD_TYPE=release   # single-threaded NullLock build
 make coverage               # run tests and print coverage summary (release)
 ```
 
@@ -170,7 +174,8 @@ int main() {
 | **PoolMemoryResource** | `spallocator/pool_pmr.hpp` | Optional `std::pmr::memory_resource` adapter (additive header) |
 | **PoolHandle** | `spallocator/pool_lifetime.hpp` | Heap domain handle; `create()` retires when idle |
 | **Helper** | `spallocator/impl/helper.hpp` | Pool size caps; re-exports general helpers from mlvlib (impl/) |
-| **SpinLock** | `mlvlib/spinlock.hpp` (submodule) | Short-section lock used by Pool/Slab (`mlvlib::SpinLock`) |
+| **Lock policy** | `spallocator/impl/slab_mutex.hpp` | Compile-time default slab lock selection (`SPALLOCATOR_LOCK_*` → `DefaultSlabLock`) |
+| **Lock primitives** | `mlvlib/spinlock.hpp`, `null_lock.hpp`, `lock_traits.hpp` (submodule) | `mlvlib::SpinLock`, `mlvlib::NullLock`, `BasicLockable` concepts & `lock_traits` |
 | **LifetimeObserver** | `mlvlib/lifetimeobserver.hpp` (submodule) | Standalone liveness helper (optional; not required by Pool) |
 
 ### Size Classes
@@ -223,7 +228,7 @@ The repo-root [`IMPLEMENTATION.md`](IMPLEMENTATION.md) redirects here. Source he
 
 ## Testing
 
-The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, smart-pointer exception safety, `PoolAllocator` / STL integration, and `PoolMemoryResource` / `std::pmr`. SpinLock and LifetimeObserver tests live in mlvlib.
+The suite in `test/tester.cpp` covers slab growth/trim, size-class routing, header validation (including interior frees), thread safety, compile-time lock policies (`SpinLock`, `std::mutex`, `NullLock`), smart-pointer exception safety, `PoolAllocator` / STL integration, and `PoolMemoryResource` / `std::pmr`. SpinLock, NullLock, lock_traits, and LifetimeObserver tests live in mlvlib.
 
 ```bash
 make test
@@ -231,10 +236,11 @@ make test
 make && ./obj/addrsan/tester
 ```
 
-CI (`.github/workflows/c-cpp.yml`) runs the full suite for **release** (`-O3 -DNDEBUG`, plus coverage), **addrsan**, and **threadsan**, on both clang and gcc. Locally:
+CI (`.github/workflows/c-cpp.yml`) runs the full suite for **release** (`-O3 -DNDEBUG`, plus coverage), **addrsan**, and **threadsan** (covering both `SpinLock` and `std::mutex`), plus a **null-st** single-threaded `NullLock` matrix (`addrsan` and `release`), on both clang and gcc. Locally:
 
 ```bash
 ./configure --build-type=release --enable-tests && make test
+./configure --with-lock-policy=null --build-type=release --enable-tests && make test
 ```
 
 ## Future Work
@@ -253,8 +259,6 @@ Recorded for later (not scheduled). See also
   for bulk reclaim today; see IMPLEMENTATION backlog for revival shape)
 - Consider a C99-compliant wrapper API for callers that want the pool interface
   from C (opaque handle ≈ `PoolHandle`)
-- Abstract the lock primitive so a build can choose `SpinLock` or another
-  standard lock (e.g. `std::mutex`) at compile time
 
 ## References
 

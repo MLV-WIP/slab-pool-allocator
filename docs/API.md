@@ -11,7 +11,8 @@ the [root README](../README.md).
 
 Unless noted, types are in namespace `spallocator`. General locking and
 liveness utilities live in the [mlvlib](https://github.com/MLV-WIP/mlvlib)
-submodule (`mlvlib::SpinLock`, `mlvlib::LifetimeObserver`, helpers). This
+submodule (`mlvlib::SpinLock`, `mlvlib::NullLock`, `mlvlib::lock_traits`,
+`mlvlib::LifetimeObserver`, helpers). This
 package’s `impl/helper.hpp` re-exports those helpers into `spallocator` for
 convenience and defines allocator-only size caps.
 
@@ -55,12 +56,15 @@ convenience and defines allocator-only size caps.
 | `spallocator/pool.hpp` | `Pool`, ladders (includes `pool_lifetime.hpp`) |
 | `spallocator/pool_lifetime.hpp` | `PoolHandle`, `PoolLifetimeToken`, `PoolControlBlock` |
 | `spallocator/impl/islab.hpp` | `ISlab` |
+| `spallocator/impl/slab_mutex.hpp` | Compile-time default slab lock policy (`SPALLOCATOR_LOCK_*` → `DefaultSlabLock`) |
 | `spallocator/impl/slab.hpp` | `Slab`, `SlotFreemap`, `DynBitset` |
 | `spallocator/impl/slab_proxy.hpp` | `SlabProxy` |
 | `spallocator/spallocator.hpp` | `make_pool_unique` / `make_pool_shared`, `PoolAllocator`, deleters |
 | `spallocator/pool_pmr.hpp` | `PoolMemoryResource` (`std::pmr::memory_resource`; additive — not pulled by `spallocator.hpp`) |
 | `spallocator/impl/helper.hpp` | Pool size caps; re-exports mlvlib helpers into `spallocator` |
-| `mlvlib/spinlock.hpp` | `mlvlib::SpinLock` (submodule; used by Pool/Slab) |
+| `mlvlib/lock_traits.hpp` | `BasicLockable`, `Lockable`, `DebugIntrospectableLock`, `lock_traits`, `assert_lock_held`, `MLVLIB_NO_UNIQUE_ADDRESS` (submodule) |
+| `mlvlib/spinlock.hpp` | `mlvlib::SpinLock` (submodule; default lock for `Slab`) |
+| `mlvlib/null_lock.hpp` | `mlvlib::NullLock` (submodule; zero-overhead single-thread lock) |
 | `mlvlib/lifetimeobserver.hpp` | `mlvlib::LifetimeObserver` (submodule; optional) |
 
 ```
@@ -73,7 +77,7 @@ convenience and defines allocator-only size caps.
               │
               └── Block (mapped chunk) → Slot (cell)
   Smart pointers / PoolAllocator / PoolMemoryResource ──► PoolLifetimeToken / PoolHandle
-  mlvlib::SpinLock / helpers       (submodule; SpinLock used by Pool/Slab)
+  mlvlib lock primitives / helpers (submodule; DefaultSlabLock = SpinLock|mutex|NullLock)
 ```
 
 **Stack:** Pool → Slab → Block → Slot. **Item** (`allocateItem` / `deallocateItem`) is the backend allocation handle at the slab layer (a **slot base** for `Slab`); the Pool’s **user pointer** is `slot_base + header_size`.
@@ -161,24 +165,34 @@ Helpers you may see in headers (usually not called directly from apps):
 ### Construction
 
 ```cpp
-Pool();
+Pool();  // uses DefaultSlabLock (compile-time default: mlvlib::SpinLock)
+
+template<mlvlib::BasicLockable Lock>
+explicit Pool(std::in_place_type_t<Lock>);
+
 ~Pool();
 PoolHandle handle();
 PoolLifetimeToken lifetime_token();
 std::uint64_t live_allocation_count() const noexcept;
 PoolStats stats();
+bool isThreadSafe() const noexcept;
+std::string_view lockPolicyName() const noexcept;
 PoolControlBlock* control() const noexcept;  // diagnostics
 ```
 
 | | |
 |--|--|
-| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); all alignment-class Slabs installed; first **Blocks** follow preallocate knobs (default: alignment class ≤16 and ElemSize ≤256). |
+| **Effects** | Constructs an empty pool with a heap `PoolControlBlock` (`heap_owned_ == false`); all alignment-class Slabs installed with `DefaultSlabLock` (or the requested `Lock` via `std::in_place_type<Lock>`); first **Blocks** follow preallocate knobs (default: alignment class ≤16 and ElemSize ≤256). |
+| **Default lock macro** | Define at most one of `SPALLOCATOR_LOCK_SPINLOCK` (default), `SPALLOCATOR_LOCK_STD_MUTEX`, or `SPALLOCATOR_LOCK_NULL` (or pass `./configure --with-lock-policy=spinlock\|mutex\|null` / `make LOCK_POLICY=...`). Defining more than one is a compile-time error (`slab_mutex.hpp`). |
+| **`isThreadSafe()` / `lockPolicyName()`** | Report whether this `Pool`’s slabs use a thread-safe lock (`mlvlib::lock_traits<Lock>::is_thread_safe`) and its policy name (`"spinlock"`, `"std::mutex"`, `"null"`, or `"custom"`). |
 | **`~Pool`** | Marks the control block dead, then destroys slabs. Safe with outstanding `PoolLifetimeToken`s (arena observers). |
-| **Thread safety** | Construct/destroy from one thread; do not use the pool concurrently with its destructor. |
+| **Thread safety** | Construct/destroy from one thread; do not use the pool concurrently with its destructor. Runtime allocate/free concurrency is supported iff `isThreadSafe()` is `true` (pools built with `mlvlib::NullLock` require single-threaded or externally serialized access). |
 | **Copy / move** | Deleted. |
 
 ```cpp
-spallocator::Pool pool;  // ready to allocate
+spallocator::Pool pool;                                     // DefaultSlabLock
+spallocator::Pool mutex_pool(std::in_place_type<std::mutex>);
+spallocator::Pool st_pool(std::in_place_type<mlvlib::NullLock>);
 auto h = pool.handle();  // optional handle pin (does not make stack pool heap-owned)
 ```
 
@@ -357,7 +371,7 @@ a pointer to that payload (past the hidden header).
 |--|--|
 | **Returns** | Pointer to `size` usable bytes, aligned to `alignment`. Exclusive ownership until free. |
 | **Throws** | `std::out_of_range` if `size > kMaxAllocationBytes`; `std::invalid_argument` if `alignment` is out of range or not a power of two; may also throw from the underlying system allocator (`std::bad_alloc` / `new`). |
-| **Thread safety** | Safe for concurrent callers on the same `Pool`. |
+| **Thread safety** | Safe for concurrent callers on the same `Pool` when `pool.isThreadSafe()` is `true`; single-threaded / externally serialized when constructed with `mlvlib::NullLock`. |
 
 ```cpp
 std::byte* p = pool.allocate(100);        // default align → typically 16-byte header
@@ -527,6 +541,8 @@ public:
                                 std::uint16_t block_generation = 0) = 0;
     virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
     virtual std::size_t getAllocatedMemory() const;
+    virtual bool isThreadSafe() const noexcept = 0;
+    virtual std::string_view lockPolicyName() const noexcept = 0;
     virtual ~ISlab() = default;
 };
 ```
@@ -537,24 +553,30 @@ public:
 | `deallocateItem(item, block_base=nullptr, block_generation=0)` | Free an **Item** (a **slot base** for `Slab`). When `block_base` is set (Pool free with header hints), uses an exact-base lookup and checks `block_generation`; otherwise searches by address. Rejects unknown, interior, stale-hint, or already-free addresses (`std::invalid_argument`). |
 | `reclaimEmptyBlocks(keep_min)` | Drop fully empty **Blocks**; keep at least `keep_min` (default 1). Default base implementation is a no-op; `Slab` overrides. Returns how many Blocks were deleted. |
 | `getAllocatedMemory()` | Bytes retained by this Slab’s **Blocks** (default `0`). |
+| `isThreadSafe()` / `lockPolicyName()` | Report the backend’s lock thread-safety (`mlvlib::lock_traits<Lock>::is_thread_safe` for `Slab`, `true` for `SlabProxy`) and name (`mlvlib::lock_traits<Lock>::name` or `"system"`). |
 
 Copy/move of `ISlab` are deleted.
 
 ### `Slab`
 
 ```cpp
-template<std::size_t ElemSize, std::size_t Alignment = 16>
+template<std::size_t ElemSize,
+         std::size_t Alignment = 16,
+         mlvlib::BasicLockable Lock = DefaultSlabLock>
 class Slab : public ISlab;
 ```
 
 Fixed-size Slot allocator: each Slot is `ElemSize` bytes and `Alignment`-aligned
 (`Alignment` must be 16, 32, or 64; `ElemSize` must be a multiple of
 `Alignment`). Maintains freemap bitsets, a growable availability map, and a
-base-address map for frees. Owns zero or more **Blocks**.
+base-address map for frees. Owns zero or more **Blocks**. The per-slab lock
+member (`Lock slab_lock`) uses `MLVLIB_NO_UNIQUE_ADDRESS` so empty lock types
+such as `mlvlib::NullLock` add zero bytes in `NDEBUG` builds.
 
 | Method | Description |
 |--------|-------------|
-| `allocateItem` / `deallocateItem` | See `ISlab`; guarded by the Slab’s `SpinLock`. Slot base in / out — Pool owns the user-pointer offset. |
+| `allocateItem` / `deallocateItem` | See `ISlab`; guarded by `std::scoped_lock<Lock>` on the Slab’s `slab_lock`. Slot base in / out — Pool owns the user-pointer offset. |
+| `isThreadSafe()` / `lockPolicyName()` | `mlvlib::lock_traits<Lock>::is_thread_safe` and `mlvlib::lock_traits<Lock>::name`. |
 | `getElemSize()` / `getAlignment()` / `getAllocSize()` | Compile-time Slot size, alignment, and **Block** bytes (`selectBlockSize`; exact multiple of `ElemSize`; see `kSlabTargetBytes` / `kSlabTargetMultiplier`). |
 | `getAllocatedMemory()` | `getBlockCount() × getAllocSize()` currently retained (**Blocks** × Block bytes). |
 | `getAvailabilityMapBytes()` | Bytes used by the growable availability bitset (diagnostics). |
@@ -575,6 +597,7 @@ Large / overflow path: each `allocateItem` is a distinct aligned `new[]`;
 `deallocateItem` always `delete[]`s that pointer. No freemap, no retention
 across frees. Returns a **slot base** equivalent (allocation base); the Pool
 still attaches its usual allocation header and returns the **user pointer**.
+`isThreadSafe()` returns `true` and `lockPolicyName()` returns `"system"`.
 
 ### `DynBitset`
 
@@ -819,7 +842,9 @@ and local docs under `mlvlib/docs/` after `git submodule update --init`.
 
 | Utility | Header | Notes |
 |---------|--------|-------|
-| `mlvlib::SpinLock` | `mlvlib/spinlock.hpp` | Used by Pool/Slab; deep dive in `mlvlib/docs/deepdive/SpinLock_Analysis.md` |
+| `mlvlib::lock_traits` & concepts | `mlvlib/lock_traits.hpp` | `BasicLockable`, `Lockable`, `DebugIntrospectableLock`, `assert_lock_held`, `MLVLIB_NO_UNIQUE_ADDRESS` |
+| `mlvlib::SpinLock` | `mlvlib/spinlock.hpp` | Default lock for `Slab`; deep dive in `mlvlib/docs/deepdive/SpinLock_Analysis.md` |
+| `mlvlib::NullLock` | `mlvlib/null_lock.hpp` | Zero-overhead no-op lock for single-threaded domains (debug owner assertions in `!NDEBUG`) |
 | `mlvlib::LifetimeObserver` | `mlvlib/lifetimeobserver.hpp` | Optional; not required by the allocator |
 | Helpers | `mlvlib/helper.hpp` | Canonical home; re-exported via `spallocator/impl/helper.hpp` |
 
@@ -832,10 +857,10 @@ against the submodule root.
 
 | Surface | On failure | Threads |
 |---------|------------|---------|
-| `Pool::allocate` | throws | Concurrent allocate/free on one pool is supported |
+| `Pool::allocate` | throws | Concurrent allocate/free supported when `pool.isThreadSafe()` is `true`; single-thread / externally serialized with `NullLock` |
 | `Pool::deallocate` | throws | Same |
 | `Pool::try_deallocate` | `false` | Same |
-| `Pool::trim` / `getAllocatedMemory` | — | Safe |
+| `Pool::trim` / `getAllocatedMemory` | — | Same |
 | `PoolDeleter` / `PoolAllocator::deallocate` | `abort` on bad pointer if alive; no-op if dead | Pool-safe; pointer handoff is the caller’s protocol |
 | `PoolMemoryResource::allocate` | `bad_alloc` (dead / unsupported align / mapped Pool throws) | Same as Pool |
 | `PoolMemoryResource::deallocate` | `abort` on bad pointer if alive; no-op if dead | Same as PoolAllocator |

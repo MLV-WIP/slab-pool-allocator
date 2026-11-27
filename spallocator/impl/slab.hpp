@@ -47,18 +47,17 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
 #include "impl/helper.hpp"
 #include "impl/islab.hpp"
-#include "mlvlib/spinlock.hpp"
+#include "impl/slab_mutex.hpp"
 
 
 namespace spallocator
 {
-    using mlvlib::SpinLock;
-
     // Compile-time slab buffer packing knobs (override via -D / ./configure).
 #ifndef SPALLOCATOR_SLAB_TARGET_BYTES
 #  define SPALLOCATOR_SLAB_TARGET_BYTES (8u * 1024u)
@@ -130,9 +129,15 @@ namespace spallocator
 
     // Compound key: every slot is Alignment-aligned because the Block uses
     // align_val_t{Alignment} and ElemSize is a multiple of Alignment.
-    template<std::size_t ElemSize, std::size_t Alignment = 16>
+    template<std::size_t ElemSize,
+             std::size_t Alignment = 16,
+             mlvlib::BasicLockable Lock = DefaultSlabLock>
     class Slab: public ISlab
     {
+    public: // types
+        using lock_type = Lock;
+        using lock_traits = mlvlib::lock_traits<Lock>;
+
     public: // methods
         AllocateItemResult allocateItem(std::size_t size) override;
         void deallocateItem(std::byte* item,
@@ -145,6 +150,9 @@ namespace spallocator
         std::size_t getAllocatedMemory() const override { return block_bases.size() * block_bytes; }
         std::size_t getAvailabilityMapBytes() const { return block_available_map.bytes(); }
         std::size_t getBlockCount() const { return block_bases.size(); }
+
+        bool isThreadSafe() const noexcept override { return lock_traits::is_thread_safe; }
+        std::string_view lockPolicyName() const noexcept override { return lock_traits::name; }
 
         // Delete fully empty data blocks; always retain at least keep_min
         // blocks (clamped to ≥ 1). Not called from the alloc/free hot path.
@@ -205,7 +213,9 @@ namespace spallocator
         std::size_t alloc_cursor_block_{0};
         std::size_t alloc_cursor_slot_{0};
 
-        SpinLock slab_lock;
+        // Placed last so [[no_unique_address]] collapses empty Lock types (NullLock
+        // in release) to 0 bytes without exposing tail padding to later members.
+        MLVLIB_NO_UNIQUE_ADDRESS Lock slab_lock;
     };
 
 
@@ -495,8 +505,8 @@ namespace spallocator
     // Slab
     // ---------------------------------------------------------------------------
 
-    template<std::size_t ElemSize, std::size_t Alignment>
-    AllocateItemResult Slab<ElemSize, Alignment>::allocateItem(std::size_t size)
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    AllocateItemResult Slab<ElemSize, Alignment, Lock>::allocateItem(std::size_t size)
     {
         // Must remain active in release builds: an oversized request would
         // otherwise be placed in a too-small slot (silent overrun).
@@ -506,7 +516,7 @@ namespace spallocator
                 std::format("Requested size {} exceeds slab element size {}", size, ElemSize));
         }
 
-        std::scoped_lock<SpinLock> guard(slab_lock);
+        typename lock_traits::guard_type guard(slab_lock);
 
         // Next-fit: resume at (alloc_cursor_block_, alloc_cursor_slot_). When every
         // live Block is full, grow then retry.
@@ -605,8 +615,8 @@ namespace spallocator
     }
 
 
-    template<std::size_t ElemSize, std::size_t Alignment>
-    std::optional<std::size_t> Slab<ElemSize, Alignment>::findBlockForSlot(std::byte* slot_base) const
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    std::optional<std::size_t> Slab<ElemSize, Alignment, Lock>::findBlockForSlot(std::byte* slot_base) const
     {
         // Single-Block fast path: skip the address map (common steady state).
         if (block_bases.size() == 1)
@@ -649,17 +659,17 @@ namespace spallocator
     }
 
 
-    template<std::size_t ElemSize, std::size_t Alignment>
-    void Slab<ElemSize, Alignment>::deallocateItem(std::byte* item,
-                                                   std::byte* block_base,
-                                                   std::uint16_t block_generation)
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    void Slab<ElemSize, Alignment, Lock>::deallocateItem(std::byte* item,
+                                                         std::byte* block_base,
+                                                         std::uint16_t block_generation)
     {
         if (!item)
         {
             return;
         }
 
-        std::scoped_lock<SpinLock> guard(slab_lock);
+        typename lock_traits::guard_type guard(slab_lock);
 
         std::size_t block_index = 0;
         std::byte* block_start = nullptr;
@@ -727,8 +737,8 @@ namespace spallocator
     }
 
 
-    template<std::size_t ElemSize, std::size_t Alignment>
-    Slab<ElemSize, Alignment>::Slab(bool preallocate_first_block)
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    Slab<ElemSize, Alignment, Lock>::Slab(bool preallocate_first_block)
     {
         debug_println(
             "Slab created with element size: {}, alignment: {}, allocation size: {}, "
@@ -737,12 +747,13 @@ namespace spallocator
 
         if (preallocate_first_block)
         {
+            typename lock_traits::guard_type guard(slab_lock);
             allocateNewBlock();
         }
     }
 
-    template<std::size_t ElemSize, std::size_t Alignment>
-    Slab<ElemSize, Alignment>::~Slab()
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    Slab<ElemSize, Alignment, Lock>::~Slab()
     {
         debug_println("Slab destroyed, freeing {} bytes of memory", getAllocatedMemory());
         for (auto ptr : block_bases)
@@ -760,8 +771,8 @@ namespace spallocator
         }
     }
 
-    template<std::size_t ElemSize, std::size_t Alignment>
-    std::size_t Slab<ElemSize, Alignment>::reclaimEmptyBlocks(std::size_t keep_min)
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    std::size_t Slab<ElemSize, Alignment, Lock>::reclaimEmptyBlocks(std::size_t keep_min)
     {
         // Retain at least one Block so the class stays warm for the next alloc.
         if (keep_min < 1)
@@ -769,7 +780,7 @@ namespace spallocator
             keep_min = 1;
         }
 
-        std::scoped_lock<SpinLock> guard(slab_lock);
+        typename lock_traits::guard_type guard(slab_lock);
 
         std::size_t reclaimed = 0;
         std::size_t index = 0;
@@ -798,9 +809,11 @@ namespace spallocator
     }
 
 
-    template<std::size_t ElemSize, std::size_t Alignment>
-    void Slab<ElemSize, Alignment>::destroyBlockAt(std::size_t index)
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    void Slab<ElemSize, Alignment, Lock>::destroyBlockAt(std::size_t index)
     {
+        mlvlib::assert_lock_held(slab_lock);
+
         std::byte* doomed = block_bases[index];
         base_address_map.erase(doomed);
 
@@ -827,9 +840,11 @@ namespace spallocator
     }
 
 
-    template<std::size_t ElemSize, std::size_t Alignment>
-    void Slab<ElemSize, Alignment>::allocateNewBlock()
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    void Slab<ElemSize, Alignment, Lock>::allocateNewBlock()
     {
+        mlvlib::assert_lock_held(slab_lock);
+
         if (block_bases.size() >= max_blocks)
         {
             throw std::out_of_range(

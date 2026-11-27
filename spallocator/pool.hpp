@@ -39,6 +39,8 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
+#include <utility>
 
 #include "impl/islab.hpp"
 #include "impl/slab.hpp"
@@ -129,12 +131,14 @@ namespace spallocator
                alignment <= kPreallocateMaxAlignment;
     }
 
-    template<std::size_t ElemSize, std::size_t Alignment>
+    template<std::size_t ElemSize,
+             std::size_t Alignment,
+             mlvlib::BasicLockable Lock = DefaultSlabLock>
     inline std::unique_ptr<ISlab> makePoolSlab()
     {
         constexpr bool pre =
             shouldPreallocateFirstBlock(ElemSize, Alignment);
-        return std::make_unique<Slab<ElemSize, Alignment>>(pre);
+        return std::make_unique<Slab<ElemSize, Alignment, Lock>>(pre);
     }
 
     // Map request alignment to a native alignment class (4/8 → 16).
@@ -252,7 +256,17 @@ namespace spallocator
 
         PoolControlBlock* control() const noexcept { return control_; }
 
+        // Concurrency contract of this Pool's size-class Slabs.
+        bool isThreadSafe() const noexcept;
+        std::string_view lockPolicyName() const noexcept;
+
         Pool();
+
+        // Single-binary lock-policy selection (e.g. Pool(std::in_place_type<std::mutex>)).
+        // Leaves Pool non-templated while instantiating all Slabs with Lock.
+        template<mlvlib::BasicLockable Lock>
+        explicit Pool(std::in_place_type_t<Lock>);
+
         ~Pool();
 
         // Class selection: use free function selectClassIndex(footprint, alignment_class).
@@ -262,6 +276,9 @@ namespace spallocator
         Pool& operator=(const Pool&) = delete;
         Pool(Pool&&) = delete;
         Pool& operator=(Pool&&) = delete;
+
+        template<mlvlib::BasicLockable Lock>
+        void initSlabs();
 
         ISlab* resolveSlab(std::size_t alloc_size, std::size_t alignment_class);
 
@@ -791,8 +808,34 @@ namespace spallocator
     }
 
 
-    Pool::Pool()
+    inline bool Pool::isThreadSafe() const noexcept
+    {
+        return slabs16[0] ? slabs16[0]->isThreadSafe() : false;
+    }
+
+
+    inline std::string_view Pool::lockPolicyName() const noexcept
+    {
+        return slabs16[0] ? slabs16[0]->lockPolicyName() : std::string_view{};
+    }
+
+
+    inline Pool::Pool()
+        : Pool(std::in_place_type<DefaultSlabLock>)
+    {
+    }
+
+
+    template<mlvlib::BasicLockable Lock>
+    inline Pool::Pool(std::in_place_type_t<Lock>)
         : control_(PoolControlBlock::create(this))
+    {
+        initSlabs<Lock>();
+    }
+
+
+    template<mlvlib::BasicLockable Lock>
+    inline void Pool::initSlabs()
     {
         // Every alignment-class engine is filled here (immutable thereafter). First
         // data-block mapping follows shouldPreallocateFirstBlock (defaults:
@@ -800,56 +843,56 @@ namespace spallocator
         static_assert(kLadder16Count == 16 && kLadder32Count == 16 && kLadder64Count == 16,
             "Pool ctor installs one engine per ladder rung; update makePoolSlab list when counts change");
 
-        slabs16[0]  = makePoolSlab<16, 16>();
-        slabs16[1]  = makePoolSlab<32, 16>();
-        slabs16[2]  = makePoolSlab<48, 16>();
-        slabs16[3]  = makePoolSlab<64, 16>();
-        slabs16[4]  = makePoolSlab<96, 16>();
-        slabs16[5]  = makePoolSlab<128, 16>();
-        slabs16[6]  = makePoolSlab<192, 16>();
-        slabs16[7]  = makePoolSlab<256, 16>();
-        slabs16[8]  = makePoolSlab<384, 16>();
-        slabs16[9]  = makePoolSlab<512, 16>();
-        slabs16[10] = makePoolSlab<768, 16>();
-        slabs16[11] = makePoolSlab<1024, 16>();
-        slabs16[12] = makePoolSlab<1536, 16>();
-        slabs16[13] = makePoolSlab<2048, 16>();
-        slabs16[14] = makePoolSlab<3072, 16>();
-        slabs16[15] = makePoolSlab<4096, 16>();
+        slabs16[0]  = makePoolSlab<16, 16, Lock>();
+        slabs16[1]  = makePoolSlab<32, 16, Lock>();
+        slabs16[2]  = makePoolSlab<48, 16, Lock>();
+        slabs16[3]  = makePoolSlab<64, 16, Lock>();
+        slabs16[4]  = makePoolSlab<96, 16, Lock>();
+        slabs16[5]  = makePoolSlab<128, 16, Lock>();
+        slabs16[6]  = makePoolSlab<192, 16, Lock>();
+        slabs16[7]  = makePoolSlab<256, 16, Lock>();
+        slabs16[8]  = makePoolSlab<384, 16, Lock>();
+        slabs16[9]  = makePoolSlab<512, 16, Lock>();
+        slabs16[10] = makePoolSlab<768, 16, Lock>();
+        slabs16[11] = makePoolSlab<1024, 16, Lock>();
+        slabs16[12] = makePoolSlab<1536, 16, Lock>();
+        slabs16[13] = makePoolSlab<2048, 16, Lock>();
+        slabs16[14] = makePoolSlab<3072, 16, Lock>();
+        slabs16[15] = makePoolSlab<4096, 16, Lock>();
 
-        slabs32[0]  = makePoolSlab<32, 32>();
-        slabs32[1]  = makePoolSlab<64, 32>();
-        slabs32[2]  = makePoolSlab<96, 32>();
-        slabs32[3]  = makePoolSlab<128, 32>();
-        slabs32[4]  = makePoolSlab<192, 32>();
-        slabs32[5]  = makePoolSlab<256, 32>();
-        slabs32[6]  = makePoolSlab<384, 32>();
-        slabs32[7]  = makePoolSlab<512, 32>();
-        slabs32[8]  = makePoolSlab<768, 32>();
-        slabs32[9]  = makePoolSlab<1024, 32>();
-        slabs32[10] = makePoolSlab<1536, 32>();
-        slabs32[11] = makePoolSlab<2048, 32>();
-        slabs32[12] = makePoolSlab<3072, 32>();
-        slabs32[13] = makePoolSlab<4096, 32>();
-        slabs32[14] = makePoolSlab<6144, 32>();
-        slabs32[15] = makePoolSlab<8192, 32>();
+        slabs32[0]  = makePoolSlab<32, 32, Lock>();
+        slabs32[1]  = makePoolSlab<64, 32, Lock>();
+        slabs32[2]  = makePoolSlab<96, 32, Lock>();
+        slabs32[3]  = makePoolSlab<128, 32, Lock>();
+        slabs32[4]  = makePoolSlab<192, 32, Lock>();
+        slabs32[5]  = makePoolSlab<256, 32, Lock>();
+        slabs32[6]  = makePoolSlab<384, 32, Lock>();
+        slabs32[7]  = makePoolSlab<512, 32, Lock>();
+        slabs32[8]  = makePoolSlab<768, 32, Lock>();
+        slabs32[9]  = makePoolSlab<1024, 32, Lock>();
+        slabs32[10] = makePoolSlab<1536, 32, Lock>();
+        slabs32[11] = makePoolSlab<2048, 32, Lock>();
+        slabs32[12] = makePoolSlab<3072, 32, Lock>();
+        slabs32[13] = makePoolSlab<4096, 32, Lock>();
+        slabs32[14] = makePoolSlab<6144, 32, Lock>();
+        slabs32[15] = makePoolSlab<8192, 32, Lock>();
 
-        slabs64[0]  = makePoolSlab<64, 64>();
-        slabs64[1]  = makePoolSlab<128, 64>();
-        slabs64[2]  = makePoolSlab<192, 64>();
-        slabs64[3]  = makePoolSlab<256, 64>();
-        slabs64[4]  = makePoolSlab<384, 64>();
-        slabs64[5]  = makePoolSlab<512, 64>();
-        slabs64[6]  = makePoolSlab<768, 64>();
-        slabs64[7]  = makePoolSlab<1024, 64>();
-        slabs64[8]  = makePoolSlab<1536, 64>();
-        slabs64[9]  = makePoolSlab<2048, 64>();
-        slabs64[10] = makePoolSlab<3072, 64>();
-        slabs64[11] = makePoolSlab<4096, 64>();
-        slabs64[12] = makePoolSlab<6144, 64>();
-        slabs64[13] = makePoolSlab<8192, 64>();
-        slabs64[14] = makePoolSlab<12288, 64>();
-        slabs64[15] = makePoolSlab<16384, 64>();
+        slabs64[0]  = makePoolSlab<64, 64, Lock>();
+        slabs64[1]  = makePoolSlab<128, 64, Lock>();
+        slabs64[2]  = makePoolSlab<192, 64, Lock>();
+        slabs64[3]  = makePoolSlab<256, 64, Lock>();
+        slabs64[4]  = makePoolSlab<384, 64, Lock>();
+        slabs64[5]  = makePoolSlab<512, 64, Lock>();
+        slabs64[6]  = makePoolSlab<768, 64, Lock>();
+        slabs64[7]  = makePoolSlab<1024, 64, Lock>();
+        slabs64[8]  = makePoolSlab<1536, 64, Lock>();
+        slabs64[9]  = makePoolSlab<2048, 64, Lock>();
+        slabs64[10] = makePoolSlab<3072, 64, Lock>();
+        slabs64[11] = makePoolSlab<4096, 64, Lock>();
+        slabs64[12] = makePoolSlab<6144, 64, Lock>();
+        slabs64[13] = makePoolSlab<8192, 64, Lock>();
+        slabs64[14] = makePoolSlab<12288, 64, Lock>();
+        slabs64[15] = makePoolSlab<16384, 64, Lock>();
     }
 
 

@@ -35,6 +35,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 namespace spallocator
 {
@@ -68,6 +69,10 @@ namespace spallocator
         // (SlabProxy). Returns the number of Blocks deleted.
         virtual std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1);
         virtual std::size_t getAllocatedMemory() const { return 0; }
+
+        // Read-only concurrency contract metadata for this backend.
+        virtual bool isThreadSafe() const noexcept = 0;
+        virtual std::string_view lockPolicyName() const noexcept = 0;
 
         virtual ~ISlab() = default;
 

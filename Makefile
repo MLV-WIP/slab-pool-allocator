@@ -11,6 +11,7 @@ PREFIX ?= /usr/local
 CXX ?= c++
 IS_CLANG ?= no
 BUILD_TYPE ?= addrsan
+LOCK_POLICY ?= spinlock
 ENABLE_TESTS ?= yes
 ENABLE_DEMO ?= yes
 ENABLE_BENCH ?= yes
@@ -178,7 +179,29 @@ else
     ECHO := @echo
 endif
 
+# Lock policy mapping (compile-time DefaultSlabLock + policy-scoped OBJDIR).
+# Not baked into USER_CXXFLAGS by ./configure so `make LOCK_POLICY=...` overrides cleanly.
+ifeq ($(LOCK_POLICY),spinlock)
+    CXXFLAGS += -DSPALLOCATOR_LOCK_POLICY=SPALLOCATOR_LOCK_SPINLOCK
+    LOCK_OBJDIR_SUFFIX :=
+else ifeq ($(LOCK_POLICY),mutex)
+    CXXFLAGS += -DSPALLOCATOR_LOCK_POLICY=SPALLOCATOR_LOCK_STD_MUTEX
+    LOCK_OBJDIR_SUFFIX := -mutex
+else ifeq ($(LOCK_POLICY),null)
+    CXXFLAGS += -DSPALLOCATOR_LOCK_POLICY=SPALLOCATOR_LOCK_NULL
+    LOCK_OBJDIR_SUFFIX := -null
+else
+    $(error Invalid LOCK_POLICY='$(LOCK_POLICY)' (expected spinlock, mutex, or null))
+endif
+
+ifeq ($(BUILD_TYPE),threadsan)
+    ifeq ($(LOCK_POLICY),null)
+        $(warning LOCK_POLICY=null is not thread-safe; threadsan builds should run single-threaded workloads only)
+    endif
+endif
+
 # Object directory
+OBJDIRNAME := $(OBJDIRNAME)$(LOCK_OBJDIR_SUFFIX)
 OBJDIR := $(BASEOBJDIR)/$(OBJDIRNAME)
 
 # Source files
@@ -193,8 +216,8 @@ BENCH_SRC := $(BENCHDIR)/bench_allocators.cpp
 BENCH_TARGET := bench_allocators
 BENCH_DEPFILE := $(OBJDIR)/$(BENCH_TARGET).d
 
-# Header dependencies (public + impl/)
-HEADERS := $(wildcard $(INCLUDEDIR)/*.hpp) $(wildcard $(INCLUDEDIR)/impl/*.hpp)
+# Header dependencies (public + impl/ + mlvlib submodule)
+HEADERS := $(wildcard $(INCLUDEDIR)/*.hpp) $(wildcard $(INCLUDEDIR)/impl/*.hpp) $(wildcard $(MLVLIB_ROOT)/mlvlib/*.hpp)
 
 # Targets built by `make all`. Bench is on-demand only (`make bench`) so
 # routine builds / CI are not slowed by timing harness compiles.
@@ -214,7 +237,7 @@ endif
 
 all: check-config $(TARGETS)
 	$(Q)if [ -n "$(TARGETS)" ]; then \
-		echo "Build complete ($(BUILD_TYPE) mode)"; \
+		echo "Build complete ($(BUILD_TYPE) mode, lock=$(LOCK_POLICY))"; \
 	else \
 		echo "Nothing to build (tests and demo disabled)"; \
 	fi
@@ -428,8 +451,14 @@ help:
 	@echo "  make BUILD_TYPE=memsan     # MemorySanitizer + UBSan, implies debug"
 	@echo "  make BUILD_TYPE=threadsan  # ThreadSanitizer (UBSan opt-in), implies debug"
 	@echo ""
+	@echo "Lock policy override (overrides config.mk default):"
+	@echo "  make LOCK_POLICY=spinlock  # default (mlvlib::SpinLock)"
+	@echo "  make LOCK_POLICY=mutex     # std::mutex"
+	@echo "  make LOCK_POLICY=null      # single-thread no-op (mlvlib::NullLock)"
+	@echo ""
 	@echo "Current configuration:"
 	@echo "  Build type:    $(BUILD_TYPE)"
+	@echo "  Lock policy:   $(LOCK_POLICY)"
 	@echo "  Compiler:      $(CXX)"
 	@echo "  Tests:         $(ENABLE_TESTS)"
 	@echo "  Demo:          $(ENABLE_DEMO)"

@@ -26,7 +26,9 @@
 #include <iomanip>
 #include <iostream>
 #include <memory_resource>
+#include <mutex>
 #include <new>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -151,9 +153,10 @@ void print_pool_stats(std::string_view label, spallocator::Pool& pool)
     std::cout << "\n";
 }
 
-void print_slab16_stats(std::string_view label, spallocator::Slab<16, 16>& slab)
+template <mlvlib::BasicLockable Lock>
+void print_slab16_stats(std::string_view label, spallocator::Slab<16, 16, Lock>& slab)
 {
-    std::cout << "  [Slab<16,16>] " << label << "\n"
+    std::cout << "  [Slab<16,16," << slab.lockPolicyName() << ">] " << label << "\n"
               << "    slab_count=" << slab.getBlockCount()
               << " retained_bytes=" << slab.getAllocatedMemory()
               << " availability_map_bytes=" << slab.getAvailabilityMapBytes()
@@ -202,6 +205,13 @@ enum class BackendId : unsigned
     PmrSync = 1u << 3,
     Slab16 = 1u << 4,
     PoolPmr = 1u << 5,
+    PoolSpin = 1u << 6,
+    PoolMutex = 1u << 7,
+    PoolNull = 1u << 8,
+    Slab16Spin = 1u << 9,
+    Slab16Mutex = 1u << 10,
+    Slab16Null = 1u << 11,
+    Locks = PoolSpin | PoolMutex | PoolNull | Slab16Spin | Slab16Mutex | Slab16Null,
     All = New | Pool | PmrUnsync | PmrSync | Slab16 | PoolPmr,
 };
 
@@ -332,6 +342,34 @@ bool parse_backend_list(std::string_view csv, BackendId& out, std::string& err)
         {
             out |= BackendId::PoolPmr;
         }
+        else if (tok == "pool_spin")
+        {
+            out |= BackendId::PoolSpin;
+        }
+        else if (tok == "pool_mutex")
+        {
+            out |= BackendId::PoolMutex;
+        }
+        else if (tok == "pool_null")
+        {
+            out |= BackendId::PoolNull;
+        }
+        else if (tok == "slab16_spin")
+        {
+            out |= BackendId::Slab16Spin;
+        }
+        else if (tok == "slab16_mutex")
+        {
+            out |= BackendId::Slab16Mutex;
+        }
+        else if (tok == "slab16_null")
+        {
+            out |= BackendId::Slab16Null;
+        }
+        else if (tok == "locks")
+        {
+            out |= BackendId::Locks;
+        }
         else
         {
             err = "unknown --backend value: " + std::string(tok);
@@ -428,6 +466,30 @@ char const* backend_label(BackendId b)
     if (has(b, BackendId::PoolPmr))
     {
         append("pool_pmr");
+    }
+    if (has(b, BackendId::PoolSpin))
+    {
+        append("pool_spin");
+    }
+    if (has(b, BackendId::PoolMutex))
+    {
+        append("pool_mutex");
+    }
+    if (has(b, BackendId::PoolNull))
+    {
+        append("pool_null");
+    }
+    if (has(b, BackendId::Slab16Spin))
+    {
+        append("slab16_spin");
+    }
+    if (has(b, BackendId::Slab16Mutex))
+    {
+        append("slab16_mutex");
+    }
+    if (has(b, BackendId::Slab16Null))
+    {
+        append("slab16_null");
     }
     return buf.c_str();
 }
@@ -713,8 +775,11 @@ void print_help()
         "                      reachable alignment-class-16 size class (exact-fit user size).\n"
         "  --scenario=LIST     lifo,multi,bulk,threaded,chase,all (comma-separated; default all).\n"
         "                      'chase' is opt-in (not included in all).\n"
-        "  --backend=LIST      new,pool,pmr_unsync,pmr_sync,slab16,pool_pmr,all\n"
-        "                      (comma-separated; default all). Chase uses new+pool (+calibrate).\n"
+        "  --backend=LIST      new,pool,pmr_unsync,pmr_sync,slab16,pool_pmr,all,\n"
+        "                      pool_spin,pool_mutex,pool_null,slab16_spin,slab16_mutex,\n"
+        "                      slab16_null,locks (comma-separated; default all).\n"
+        "                      'locks' selects all six per-lock Pool/Slab16 backends for\n"
+        "                      side-by-side comparison. Chase uses new+pool* (+calibrate).\n"
         "  --pool-stats        Print PoolStats / slab retained dumps after scenarios\n"
         "  --ws-bytes=LIST     Chase working sets (e.g. 4K,32K,256K,2M,32M). Default: sysfs\n"
         "                      cache sizes when readable, else fixed presets.\n"
@@ -737,6 +802,7 @@ void print_help()
         "Recommended: make bench BUILD_TYPE=release\n"
         "Profiling:   make profile BENCH_ARGS='--scenario=lifo --backend=slab16 --iters=2000000'\n"
         "Threaded:    make bench BUILD_TYPE=release BENCH_ARGS='--scenario=threaded --threads=4'\n"
+        "Lock matrix: make bench BUILD_TYPE=release BENCH_ARGS='--backend=new,locks'\n"
         "Chase:       make bench BUILD_TYPE=release "
         "BENCH_ARGS='--scenario=chase --backend=new,pool --align=64'\n";
 }
@@ -751,6 +817,10 @@ void print_banner(Options const& opt)
     std::cout << "  size-mix:  " << size_mix_label(opt.size_mix) << "\n";
     std::cout << "  scenario:  " << scenario_label(opt.scenarios) << "\n";
     std::cout << "  backend:   " << backend_label(opt.backends) << "\n";
+    std::cout << "  lock:      " << mlvlib::lock_traits<spallocator::DefaultSlabLock>::name
+              << (mlvlib::lock_traits<spallocator::DefaultSlabLock>::is_thread_safe
+                      ? " (default; thread-safe)\n"
+                      : " (default; single-thread only)\n");
     if (has(opt.scenarios, Scenario::Chase))
     {
         std::cout << "  chase:     stride=" << opt.stride << " link=";
@@ -904,6 +974,53 @@ struct Slab16Backend
         if (n > 16)
         {
             throw std::invalid_argument("Slab16Backend only supports n<=16");
+        }
+        return slab.allocateItem(16);
+    }
+
+    void deallocate(void* p, std::size_t /*n*/, std::size_t /*align*/)
+    {
+        slab.deallocateItem(static_cast<std::byte*>(p));
+    }
+};
+
+template <mlvlib::BasicLockable Lock>
+struct PoolLockBackend
+{
+    static std::string label()
+    {
+        return std::string("Pool<") + std::string(mlvlib::lock_traits<Lock>::name) + ">";
+    }
+
+    spallocator::Pool pool{std::in_place_type<Lock>};
+
+    void* allocate(std::size_t n, std::size_t align)
+    {
+        return pool.allocate(n, align);
+    }
+
+    void deallocate(void* p, std::size_t /*n*/, std::size_t /*align*/)
+    {
+        pool.deallocate(static_cast<std::byte*>(p));
+    }
+};
+
+template <mlvlib::BasicLockable Lock>
+struct Slab16LockBackend
+{
+    static std::string label()
+    {
+        return std::string("Slab<16,16,") +
+               std::string(mlvlib::lock_traits<Lock>::name) + ">";
+    }
+
+    spallocator::Slab<16, 16, Lock> slab;
+
+    void* allocate(std::size_t n, std::size_t /*align*/)
+    {
+        if (n > 16)
+        {
+            throw std::invalid_argument("Slab16LockBackend only supports n<=16");
         }
         return slab.allocateItem(16);
     }
@@ -1169,9 +1286,22 @@ void print_table(std::string_view title, std::vector<Row> const& rows)
 }
 
 template <class Backend>
+std::string backend_row_name()
+{
+    if constexpr (requires { Backend::label(); })
+    {
+        return Backend::label();
+    }
+    else
+    {
+        return Backend::name;
+    }
+}
+
+template <class Backend>
 Row row_from(Backend& /*b*/, Timing t, bool is_new_baseline = false)
 {
-    return Row{Backend::name, t, is_new_baseline};
+    return Row{backend_row_name<Backend>(), t, is_new_baseline};
 }
 
 void note_skip(std::string_view why)
@@ -1351,6 +1481,9 @@ void run_chase_suite(Options const& opt)
 
     const bool do_new = has(opt.backends, BackendId::New) || opt.backends == BackendId::All;
     const bool do_pool = has(opt.backends, BackendId::Pool) || opt.backends == BackendId::All;
+    const bool do_pool_spin = has(opt.backends, BackendId::PoolSpin);
+    const bool do_pool_mutex = has(opt.backends, BackendId::PoolMutex);
+    const bool do_pool_null = has(opt.backends, BackendId::PoolNull);
 
     std::cout << "Pointer-chase working-set sweep (dependent loads; graph built before timing)\n";
     std::cout << "  stride=" << stride << " chase_loads=" << loads
@@ -1441,9 +1574,7 @@ void run_chase_suite(Options const& opt)
             }
         }
 
-        if (do_pool)
-        {
-            spallocator::Pool pool;
+        auto run_pool_chase = [&](char const* label, spallocator::Pool& pool) {
             std::vector<std::byte*> owned;
             owned.reserve(n);
             std::vector<ChaseHdr*> nodes;
@@ -1454,11 +1585,32 @@ void run_chase_suite(Options const& opt)
                 owned.push_back(p);
                 nodes.push_back(reinterpret_cast<ChaseHdr*>(p));
             }
-            run_links("pool", nodes, rng);
+            run_links(label, nodes, rng);
             for (std::byte* p : owned)
             {
                 pool.deallocate(p);
             }
+        };
+
+        if (do_pool)
+        {
+            spallocator::Pool pool;
+            run_pool_chase("pool", pool);
+        }
+        if (do_pool_spin)
+        {
+            spallocator::Pool pool(std::in_place_type<mlvlib::SpinLock>);
+            run_pool_chase("pool_spin", pool);
+        }
+        if (do_pool_mutex)
+        {
+            spallocator::Pool pool(std::in_place_type<std::mutex>);
+            run_pool_chase("pool_mutex", pool);
+        }
+        if (do_pool_null)
+        {
+            spallocator::Pool pool(std::in_place_type<mlvlib::NullLock>);
+            run_pool_chase("pool_null", pool);
         }
     }
     std::cout << "\n";
@@ -1484,12 +1636,15 @@ void run_default_align_suite(Options const& opt)
     if (has(opt.scenarios, Scenario::Lifo))
     {
         std::vector<Row> rows;
-        PoolBackend pool_b;
-        PoolPmrBackend pool_pmr_b;
-        Slab16Backend slab_b;
-        bool ran_pool = false;
-        bool ran_pool_pmr = false;
-        bool ran_slab = false;
+        std::optional<PoolBackend> pool_b;
+        std::optional<PoolPmrBackend> pool_pmr_b;
+        std::optional<Slab16Backend> slab_b;
+        std::optional<PoolLockBackend<mlvlib::SpinLock>> pool_spin_b;
+        std::optional<PoolLockBackend<std::mutex>> pool_mutex_b;
+        std::optional<PoolLockBackend<mlvlib::NullLock>> pool_null_b;
+        std::optional<Slab16LockBackend<mlvlib::SpinLock>> slab_spin_b;
+        std::optional<Slab16LockBackend<std::mutex>> slab_mutex_b;
+        std::optional<Slab16LockBackend<mlvlib::NullLock>> slab_null_b;
 
         if (has(be, BackendId::New))
         {
@@ -1499,16 +1654,16 @@ void run_default_align_suite(Options const& opt)
         }
         if (has(be, BackendId::Pool))
         {
+            pool_b.emplace();
             rows.push_back(row_from(
-                pool_b, timed_lifo_churn(pool_b, kSize, opt.alignment, opt.iters)));
-            ran_pool = true;
+                *pool_b, timed_lifo_churn(*pool_b, kSize, opt.alignment, opt.iters)));
         }
         if (has(be, BackendId::PoolPmr))
         {
+            pool_pmr_b.emplace();
             rows.push_back(row_from(
-                pool_pmr_b,
-                timed_lifo_churn(pool_pmr_b, kSize, opt.alignment, opt.iters)));
-            ran_pool_pmr = true;
+                *pool_pmr_b,
+                timed_lifo_churn(*pool_pmr_b, kSize, opt.alignment, opt.iters)));
         }
         if (has(be, BackendId::PmrUnsync))
         {
@@ -1522,24 +1677,90 @@ void run_default_align_suite(Options const& opt)
         }
         if (has(be, BackendId::Slab16))
         {
+            slab_b.emplace();
             rows.push_back(row_from(
-                slab_b, timed_lifo_churn(slab_b, kSize, opt.alignment, opt.iters)));
-            ran_slab = true;
+                *slab_b, timed_lifo_churn(*slab_b, kSize, opt.alignment, opt.iters)));
+        }
+        if (has(be, BackendId::PoolSpin))
+        {
+            pool_spin_b.emplace();
+            rows.push_back(row_from(
+                *pool_spin_b,
+                timed_lifo_churn(*pool_spin_b, kSize, opt.alignment, opt.iters)));
+        }
+        if (has(be, BackendId::PoolMutex))
+        {
+            pool_mutex_b.emplace();
+            rows.push_back(row_from(
+                *pool_mutex_b,
+                timed_lifo_churn(*pool_mutex_b, kSize, opt.alignment, opt.iters)));
+        }
+        if (has(be, BackendId::PoolNull))
+        {
+            pool_null_b.emplace();
+            rows.push_back(row_from(
+                *pool_null_b,
+                timed_lifo_churn(*pool_null_b, kSize, opt.alignment, opt.iters)));
+        }
+        if (has(be, BackendId::Slab16Spin))
+        {
+            slab_spin_b.emplace();
+            rows.push_back(row_from(
+                *slab_spin_b,
+                timed_lifo_churn(*slab_spin_b, kSize, opt.alignment, opt.iters)));
+        }
+        if (has(be, BackendId::Slab16Mutex))
+        {
+            slab_mutex_b.emplace();
+            rows.push_back(row_from(
+                *slab_mutex_b,
+                timed_lifo_churn(*slab_mutex_b, kSize, opt.alignment, opt.iters)));
+        }
+        if (has(be, BackendId::Slab16Null))
+        {
+            slab_null_b.emplace();
+            rows.push_back(row_from(
+                *slab_null_b,
+                timed_lifo_churn(*slab_null_b, kSize, opt.alignment, opt.iters)));
         }
         print_table("Warmed LIFO churn (size=16, alloc+free pair)", rows);
         if (opt.pool_stats)
         {
-            if (ran_pool)
+            if (pool_b)
             {
-                print_pool_stats("after LIFO churn", pool_b.pool);
+                print_pool_stats("after LIFO churn", pool_b->pool);
             }
-            if (ran_pool_pmr)
+            if (pool_pmr_b)
             {
-                print_pool_stats("pool_pmr after LIFO churn", pool_pmr_b.pool);
+                print_pool_stats("pool_pmr after LIFO churn", pool_pmr_b->pool);
             }
-            if (ran_slab)
+            if (slab_b)
             {
-                print_slab16_stats("after LIFO churn", slab_b.slab);
+                print_slab16_stats("after LIFO churn", slab_b->slab);
+            }
+            if (pool_spin_b)
+            {
+                print_pool_stats("pool_spin after LIFO churn", pool_spin_b->pool);
+            }
+            if (pool_mutex_b)
+            {
+                print_pool_stats("pool_mutex after LIFO churn", pool_mutex_b->pool);
+            }
+            if (pool_null_b)
+            {
+                print_pool_stats("pool_null after LIFO churn", pool_null_b->pool);
+            }
+            if (slab_spin_b)
+            {
+                print_slab16_stats("after LIFO churn", slab_spin_b->slab);
+            }
+            if (slab_mutex_b)
+            {
+                print_slab16_stats("after LIFO churn", slab_mutex_b->slab);
+            }
+            if (slab_null_b)
+            {
+                print_slab16_stats("after LIFO churn", slab_null_b->slab);
             }
         }
         std::cout << "\n";
@@ -1549,33 +1770,34 @@ void run_default_align_suite(Options const& opt)
     if (has(opt.scenarios, Scenario::Multi))
     {
         std::vector<Row> rows;
-        PoolBackend pool_b;
-        PoolPmrBackend pool_pmr_b;
-        bool ran_pool = false;
-        bool ran_pool_pmr = false;
+        std::optional<PoolBackend> pool_b;
+        std::optional<PoolPmrBackend> pool_pmr_b;
+        std::optional<PoolLockBackend<mlvlib::SpinLock>> pool_spin_b;
+        std::optional<PoolLockBackend<std::mutex>> pool_mutex_b;
+        std::optional<PoolLockBackend<mlvlib::NullLock>> pool_null_b;
 
         if (has(be, BackendId::New))
         {
             NewDeleteBackend new_b;
-                rows.push_back(row_from(
+            rows.push_back(row_from(
                 new_b,
                 timed_multi_size_churn(new_b, opt.alignment, opt.size_mix, opt.iters),
                 true));
         }
         if (has(be, BackendId::Pool))
         {
+            pool_b.emplace();
             rows.push_back(row_from(
-                pool_b,
-                timed_multi_size_churn(pool_b, opt.alignment, opt.size_mix, opt.iters)));
-            ran_pool = true;
+                *pool_b,
+                timed_multi_size_churn(*pool_b, opt.alignment, opt.size_mix, opt.iters)));
         }
         if (has(be, BackendId::PoolPmr))
         {
+            pool_pmr_b.emplace();
             rows.push_back(row_from(
-                pool_pmr_b,
+                *pool_pmr_b,
                 timed_multi_size_churn(
-                    pool_pmr_b, opt.alignment, opt.size_mix, opt.iters)));
-            ran_pool_pmr = true;
+                    *pool_pmr_b, opt.alignment, opt.size_mix, opt.iters)));
         }
         if (has(be, BackendId::PmrUnsync))
         {
@@ -1588,9 +1810,34 @@ void run_default_align_suite(Options const& opt)
         {
             note_skip("pmr_sync not used in single-thread multi (use --scenario=threaded)");
         }
-        if (has(be, BackendId::Slab16))
+        if (has(be, BackendId::Slab16) || has(be, BackendId::Slab16Spin) ||
+            has(be, BackendId::Slab16Mutex) || has(be, BackendId::Slab16Null))
         {
-            note_skip("slab16 only supports size<=16 (use --scenario=lifo or bulk)");
+            note_skip("slab16* only supports size<=16 (use --scenario=lifo or bulk)");
+        }
+        if (has(be, BackendId::PoolSpin))
+        {
+            pool_spin_b.emplace();
+            rows.push_back(row_from(
+                *pool_spin_b,
+                timed_multi_size_churn(
+                    *pool_spin_b, opt.alignment, opt.size_mix, opt.iters)));
+        }
+        if (has(be, BackendId::PoolMutex))
+        {
+            pool_mutex_b.emplace();
+            rows.push_back(row_from(
+                *pool_mutex_b,
+                timed_multi_size_churn(
+                    *pool_mutex_b, opt.alignment, opt.size_mix, opt.iters)));
+        }
+        if (has(be, BackendId::PoolNull))
+        {
+            pool_null_b.emplace();
+            rows.push_back(row_from(
+                *pool_null_b,
+                timed_multi_size_churn(
+                    *pool_null_b, opt.alignment, opt.size_mix, opt.iters)));
         }
         print_table(
             std::string("Multi-size mix (size-mix=") + size_mix_label(opt.size_mix) +
@@ -1598,13 +1845,25 @@ void run_default_align_suite(Options const& opt)
             rows);
         if (opt.pool_stats)
         {
-            if (ran_pool)
+            if (pool_b)
             {
-                print_pool_stats("after multi-size mix", pool_b.pool);
+                print_pool_stats("after multi-size mix", pool_b->pool);
             }
-            if (ran_pool_pmr)
+            if (pool_pmr_b)
             {
-                print_pool_stats("pool_pmr after multi-size mix", pool_pmr_b.pool);
+                print_pool_stats("pool_pmr after multi-size mix", pool_pmr_b->pool);
+            }
+            if (pool_spin_b)
+            {
+                print_pool_stats("pool_spin after multi-size mix", pool_spin_b->pool);
+            }
+            if (pool_mutex_b)
+            {
+                print_pool_stats("pool_mutex after multi-size mix", pool_mutex_b->pool);
+            }
+            if (pool_null_b)
+            {
+                print_pool_stats("pool_null after multi-size mix", pool_null_b->pool);
             }
         }
         std::cout << "\n";
@@ -1623,7 +1882,15 @@ void run_default_align_suite(Options const& opt)
         const bool want_pool_pmr = has(be, BackendId::PoolPmr);
         const bool want_pmr = has(be, BackendId::PmrUnsync);
         const bool want_slab = has(be, BackendId::Slab16);
-        if (!want_new && !want_pool && !want_pool_pmr && !want_pmr && !want_slab)
+        const bool want_pool_spin = has(be, BackendId::PoolSpin);
+        const bool want_pool_mutex = has(be, BackendId::PoolMutex);
+        const bool want_pool_null = has(be, BackendId::PoolNull);
+        const bool want_slab_spin = has(be, BackendId::Slab16Spin);
+        const bool want_slab_mutex = has(be, BackendId::Slab16Mutex);
+        const bool want_slab_null = has(be, BackendId::Slab16Null);
+        if (!want_new && !want_pool && !want_pool_pmr && !want_pmr && !want_slab &&
+            !want_pool_spin && !want_pool_mutex && !want_pool_null &&
+            !want_slab_spin && !want_slab_mutex && !want_slab_null)
         {
             std::cout << "Alloc-then-free-all skipped (no applicable backends selected).\n\n";
         }
@@ -1653,8 +1920,8 @@ void run_default_align_suite(Options const& opt)
                 have_baseline = true;
             }
 
-            auto print_bulk = [&](char const* name, Timing a, Timing f) {
-                std::cout << std::left << std::setw(28) << (std::string("  ") + name)
+            auto print_bulk = [&](std::string_view name, Timing a, Timing f) {
+                std::cout << std::left << std::setw(28) << ("  " + std::string(name))
                           << std::right << std::fixed << std::setprecision(1)
                           << std::setw(14) << a.ns_per_op
                           << std::setw(14) << f.ns_per_op;
@@ -1675,9 +1942,9 @@ void run_default_align_suite(Options const& opt)
             {
                 print_bulk(NewDeleteBackend::name, base_a, base_f);
             }
-            PoolBackend pool_b;
             if (want_pool)
             {
+                PoolBackend pool_b;
                 auto [a, f] =
                     timed_alloc_then_free_all(pool_b, kSize, opt.alignment, bulk_count);
                 print_bulk(PoolBackend::name, a, f);
@@ -1716,6 +1983,53 @@ void run_default_align_suite(Options const& opt)
                     print_slab16_stats("after alloc-then-free-all", slab_b.slab);
                 }
             }
+            auto run_pool_lock_bulk = [&]<mlvlib::BasicLockable Lock>(char const* stats_tag) {
+                PoolLockBackend<Lock> b;
+                auto [a, f] =
+                    timed_alloc_then_free_all(b, kSize, opt.alignment, bulk_count);
+                print_bulk(PoolLockBackend<Lock>::label(), a, f);
+                if (opt.pool_stats)
+                {
+                    print_pool_stats(stats_tag, b.pool);
+                }
+            };
+            auto run_slab_lock_bulk = [&]<mlvlib::BasicLockable Lock>() {
+                Slab16LockBackend<Lock> b;
+                auto [a, f] =
+                    timed_alloc_then_free_all(b, kSize, opt.alignment, bulk_count);
+                print_bulk(Slab16LockBackend<Lock>::label(), a, f);
+                if (opt.pool_stats)
+                {
+                    print_slab16_stats("after alloc-then-free-all", b.slab);
+                }
+            };
+            if (want_pool_spin)
+            {
+                run_pool_lock_bulk.template operator()<mlvlib::SpinLock>(
+                    "pool_spin after alloc-then-free-all");
+            }
+            if (want_pool_mutex)
+            {
+                run_pool_lock_bulk.template operator()<std::mutex>(
+                    "pool_mutex after alloc-then-free-all");
+            }
+            if (want_pool_null)
+            {
+                run_pool_lock_bulk.template operator()<mlvlib::NullLock>(
+                    "pool_null after alloc-then-free-all");
+            }
+            if (want_slab_spin)
+            {
+                run_slab_lock_bulk.template operator()<mlvlib::SpinLock>();
+            }
+            if (want_slab_mutex)
+            {
+                run_slab_lock_bulk.template operator()<std::mutex>();
+            }
+            if (want_slab_null)
+            {
+                run_slab_lock_bulk.template operator()<mlvlib::NullLock>();
+            }
             std::cout << "\n";
         }
     }
@@ -1733,16 +2047,18 @@ void run_default_align_suite(Options const& opt)
             {
                 note_skip("pmr_unsync not thread-safe (use pmr_sync for threaded)");
             }
-            if (has(be, BackendId::Slab16))
+            if (has(be, BackendId::Slab16) || has(be, BackendId::Slab16Spin) ||
+                has(be, BackendId::Slab16Mutex) || has(be, BackendId::Slab16Null))
             {
-                note_skip("slab16 omitted from threaded multi-size (size<=16 only; use lifo/bulk)");
+                note_skip(
+                    "slab16* omitted from threaded multi-size (size<=16 only; use lifo/bulk)");
             }
 
             std::vector<Row> rows;
-            PoolBackend pool_b;
-            PoolPmrBackend pool_pmr_b;
-            bool ran_pool = false;
-            bool ran_pool_pmr = false;
+            std::optional<PoolBackend> pool_b;
+            std::optional<PoolPmrBackend> pool_pmr_b;
+            std::optional<PoolLockBackend<mlvlib::SpinLock>> pool_spin_b;
+            std::optional<PoolLockBackend<std::mutex>> pool_mutex_b;
 
             const int peak_live = opt.threads * opt.batch;
             std::cout << "Multi-thread multi-size (shared allocator; size-mix="
@@ -1761,21 +2077,43 @@ void run_default_align_suite(Options const& opt)
             }
             if (has(be, BackendId::Pool))
             {
-                rows.push_back(row_from(
-                    pool_b,
-                    timed_threaded_multi_size_churn(
-                        pool_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
-                        opt.batch)));
-                ran_pool = true;
+                pool_b.emplace();
+                if (!pool_b->pool.isThreadSafe())
+                {
+                    note_skip(
+                        std::string("pool built with ") +
+                        std::string(pool_b->pool.lockPolicyName()) +
+                        " is not thread-safe");
+                    pool_b.reset();
+                }
+                else
+                {
+                    rows.push_back(row_from(
+                        *pool_b,
+                        timed_threaded_multi_size_churn(
+                            *pool_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
+                            opt.batch)));
+                }
             }
             if (has(be, BackendId::PoolPmr))
             {
-                rows.push_back(row_from(
-                    pool_pmr_b,
-                    timed_threaded_multi_size_churn(
-                        pool_pmr_b, opt.alignment, opt.size_mix, opt.iters,
-                        opt.threads, opt.batch)));
-                ran_pool_pmr = true;
+                pool_pmr_b.emplace();
+                if (!pool_pmr_b->pool.isThreadSafe())
+                {
+                    note_skip(
+                        std::string("pool_pmr built with ") +
+                        std::string(pool_pmr_b->pool.lockPolicyName()) +
+                        " is not thread-safe");
+                    pool_pmr_b.reset();
+                }
+                else
+                {
+                    rows.push_back(row_from(
+                        *pool_pmr_b,
+                        timed_threaded_multi_size_churn(
+                            *pool_pmr_b, opt.alignment, opt.size_mix, opt.iters,
+                            opt.threads, opt.batch)));
+                }
             }
             if (has(be, BackendId::PmrSync))
             {
@@ -1786,19 +2124,55 @@ void run_default_align_suite(Options const& opt)
                         pmr_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
                         opt.batch)));
             }
+            if (has(be, BackendId::PoolSpin))
+            {
+                pool_spin_b.emplace();
+                rows.push_back(row_from(
+                    *pool_spin_b,
+                    timed_threaded_multi_size_churn(
+                        *pool_spin_b, opt.alignment, opt.size_mix, opt.iters, opt.threads,
+                        opt.batch)));
+            }
+            if (has(be, BackendId::PoolMutex))
+            {
+                pool_mutex_b.emplace();
+                rows.push_back(row_from(
+                    *pool_mutex_b,
+                    timed_threaded_multi_size_churn(
+                        *pool_mutex_b, opt.alignment, opt.size_mix, opt.iters,
+                        opt.threads, opt.batch)));
+            }
+            if (has(be, BackendId::PoolNull))
+            {
+                if constexpr (!mlvlib::lock_traits<mlvlib::NullLock>::is_thread_safe)
+                {
+                    note_skip(
+                        "pool_null is not thread-safe (use pool_spin or pool_mutex for threaded)");
+                }
+            }
             print_table("Multi-thread timing", rows);
             if (opt.pool_stats)
             {
-                if (ran_pool)
+                if (pool_b)
                 {
-                    print_pool_stats("after multi-thread multi-size", pool_b.pool);
+                    print_pool_stats("after multi-thread multi-size", pool_b->pool);
                     std::cout << "    (peak live ≈ " << peak_live
                               << "; retained_mapped_bytes reflects multi-buffer growth)\n";
                 }
-                if (ran_pool_pmr)
+                if (pool_pmr_b)
                 {
                     print_pool_stats(
-                        "pool_pmr after multi-thread multi-size", pool_pmr_b.pool);
+                        "pool_pmr after multi-thread multi-size", pool_pmr_b->pool);
+                }
+                if (pool_spin_b)
+                {
+                    print_pool_stats(
+                        "pool_spin after multi-thread multi-size", pool_spin_b->pool);
+                }
+                if (pool_mutex_b)
+                {
+                    print_pool_stats(
+                        "pool_mutex after multi-thread multi-size", pool_mutex_b->pool);
                 }
             }
             std::cout << "\n";
@@ -1811,7 +2185,7 @@ void run_high_align_spot(Options const& opt)
     constexpr std::size_t kSize = 16;
     std::cout << "Align-" << opt.alignment
               << " spot-check (Pool alignment-class/header tax vs ::new; size=16)\n";
-    std::cout << "Only ::new and Pool participate; other --backend values are skipped.\n\n";
+    std::cout << "Only ::new and Pool* participate; other --backend values are skipped.\n\n";
 
     // High-align spots are LIFO-only tax checks (alignment class 32 or 64).
     if (!has(opt.scenarios, Scenario::Lifo))
@@ -1823,8 +2197,10 @@ void run_high_align_spot(Options const& opt)
 
     const BackendId be = opt.backends;
     std::vector<Row> rows;
-    PoolBackend pool_b;
-    bool ran_pool = false;
+    std::optional<PoolBackend> pool_b;
+    std::optional<PoolLockBackend<mlvlib::SpinLock>> pool_spin_b;
+    std::optional<PoolLockBackend<std::mutex>> pool_mutex_b;
+    std::optional<PoolLockBackend<mlvlib::NullLock>> pool_null_b;
 
     if (has(be, BackendId::New))
     {
@@ -1834,22 +2210,59 @@ void run_high_align_spot(Options const& opt)
     }
     if (has(be, BackendId::Pool))
     {
+        pool_b.emplace();
         rows.push_back(row_from(
-            pool_b, timed_lifo_churn(pool_b, kSize, opt.alignment, opt.iters)));
-        ran_pool = true;
+            *pool_b, timed_lifo_churn(*pool_b, kSize, opt.alignment, opt.iters)));
+    }
+    if (has(be, BackendId::PoolSpin))
+    {
+        pool_spin_b.emplace();
+        rows.push_back(row_from(
+            *pool_spin_b,
+            timed_lifo_churn(*pool_spin_b, kSize, opt.alignment, opt.iters)));
+    }
+    if (has(be, BackendId::PoolMutex))
+    {
+        pool_mutex_b.emplace();
+        rows.push_back(row_from(
+            *pool_mutex_b,
+            timed_lifo_churn(*pool_mutex_b, kSize, opt.alignment, opt.iters)));
+    }
+    if (has(be, BackendId::PoolNull))
+    {
+        pool_null_b.emplace();
+        rows.push_back(row_from(
+            *pool_null_b,
+            timed_lifo_churn(*pool_null_b, kSize, opt.alignment, opt.iters)));
     }
     if (has(be, BackendId::PmrUnsync) || has(be, BackendId::PmrSync) ||
-        has(be, BackendId::Slab16))
+        has(be, BackendId::Slab16) || has(be, BackendId::Slab16Spin) ||
+        has(be, BackendId::Slab16Mutex) || has(be, BackendId::Slab16Null))
     {
         note_skip("align=" + std::to_string(opt.alignment) +
-                  " spot-check is Pool vs ::new only");
+                  " spot-check is Pool* vs ::new only");
     }
     print_table("Warmed LIFO churn", rows);
-    if (opt.pool_stats && ran_pool)
+    if (opt.pool_stats)
     {
-        print_pool_stats(
-            ("after align-" + std::to_string(opt.alignment) + " LIFO churn").c_str(),
-            pool_b.pool);
+        const std::string suffix =
+            "after align-" + std::to_string(opt.alignment) + " LIFO churn";
+        if (pool_b)
+        {
+            print_pool_stats(suffix.c_str(), pool_b->pool);
+        }
+        if (pool_spin_b)
+        {
+            print_pool_stats(("pool_spin " + suffix).c_str(), pool_spin_b->pool);
+        }
+        if (pool_mutex_b)
+        {
+            print_pool_stats(("pool_mutex " + suffix).c_str(), pool_mutex_b->pool);
+        }
+        if (pool_null_b)
+        {
+            print_pool_stats(("pool_null " + suffix).c_str(), pool_null_b->pool);
+        }
     }
     std::cout << "\n";
 }
