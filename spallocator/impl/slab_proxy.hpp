@@ -57,7 +57,8 @@ namespace spallocator
     public: // methods
         AllocateItemResult allocateItem(std::size_t size) override;
         void deallocateItem(std::byte* item,
-                            std::byte* block_base = nullptr,
+                            std::uint32_t block_index = kInvalidBlockIndex,
+                            std::uint16_t slot_index = 0,
                             std::uint16_t block_generation = 0) override;
 
         bool isThreadSafe() const noexcept override { return true; }
@@ -103,12 +104,13 @@ namespace spallocator
         std::byte* item = new(std::align_val_t{kProxyAlignment}) std::byte[elem_size];
         debug_println("Allocated {} bytes via SlabProxy (align={}), ptr={}",
                       elem_size, kProxyAlignment, static_cast<void*>(item));
-        return AllocateItemResult{item, nullptr, 0};
+        return AllocateItemResult{item, kInvalidBlockIndex, 0, 0};
     }
 
 
     inline void SlabProxy::deallocateItem(std::byte* item,
-                                          std::byte* /*block_base*/,
+                                          std::uint32_t /*block_index*/,
+                                          std::uint16_t /*slot_index*/,
                                           std::uint16_t /*block_generation*/)
     {
         debug_println("Deallocated item via SlabProxy, ptr={}", static_cast<void*>(item));

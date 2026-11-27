@@ -1281,17 +1281,21 @@ TEST(PoolTest, DeallocateRejectsMisalignedBase)
 }
 
 
-// Default align writes block_base + generation hints; free consumes them.
+// Default align writes (block_index, slot_index, block_generation) hints; free consumes them.
 TEST(PoolTest, HeaderRoutingHintsRoundTrip)
 {
     Pool pool;
     auto* p = pool.allocate(16);
     ASSERT_NE(p, nullptr);
     EXPECT_EQ(*reinterpret_cast<std::uint8_t*>(p - 5), 16);
-    const auto hint_base = *reinterpret_cast<std::uintptr_t*>(p - 16);
+    const auto hint_block = *reinterpret_cast<std::uint32_t*>(p - 16);
+    const auto hint_slot = *reinterpret_cast<std::uint16_t*>(p - 12);
+    const auto hint_reserved = *reinterpret_cast<std::uint16_t*>(p - 10);
     const auto hint_gen = *reinterpret_cast<std::uint16_t*>(p - 8);
-    EXPECT_NE(hint_base, 0u);
-    EXPECT_NE(hint_gen, 0);
+    EXPECT_NE(hint_block, kInvalidBlockIndex);
+    EXPECT_LT(hint_slot, 65535u);
+    EXPECT_EQ(hint_reserved, 0u);
+    EXPECT_NE(hint_gen, 0u);
     EXPECT_NO_THROW(pool.deallocate(p));
 }
 
@@ -1316,17 +1320,56 @@ TEST(PoolTest, DeallocateRejectsStaleBlockHint)
 }
 
 
-TEST(PoolTest, DeallocateRejectsForgedBlockBase)
+TEST(PoolTest, DeallocateRejectsForgedBlockIndex)
 {
     Pool pool;
     auto* p = pool.allocate(16);
     ASSERT_NE(p, nullptr);
 
-    const auto good_base = *reinterpret_cast<std::uintptr_t*>(p - 16);
-    *reinterpret_cast<std::uintptr_t*>(p - 16) = good_base ^ std::uintptr_t{0x40};
+    const auto good_block = *reinterpret_cast<std::uint32_t*>(p - 16);
+    *reinterpret_cast<std::uint32_t*>(p - 16) = good_block + 42u;
     EXPECT_FALSE(pool.try_deallocate(p));
 
-    *reinterpret_cast<std::uintptr_t*>(p - 16) = good_base;
+    *reinterpret_cast<std::uint32_t*>(p - 16) = good_block;
+    EXPECT_NO_THROW(pool.deallocate(p));
+}
+
+
+TEST(PoolTest, DeallocateRejectsForgedSlotIndex)
+{
+    Pool pool;
+    auto* p = pool.allocate(16);
+    ASSERT_NE(p, nullptr);
+
+    const auto good_slot = *reinterpret_cast<std::uint16_t*>(p - 12);
+    *reinterpret_cast<std::uint16_t*>(p - 12) =
+        static_cast<std::uint16_t>(good_slot + 1);
+    EXPECT_FALSE(pool.try_deallocate(p));
+
+    *reinterpret_cast<std::uint16_t*>(p - 12) = good_slot;
+    EXPECT_NO_THROW(pool.deallocate(p));
+}
+
+
+TEST(PoolTest, DeallocateRejectsInconsistentRoutingHint)
+{
+    Pool pool;
+    auto* p = pool.allocate(16);
+    ASSERT_NE(p, nullptr);
+
+    const auto good_block = *reinterpret_cast<std::uint32_t*>(p - 16);
+    const auto good_gen = *reinterpret_cast<std::uint16_t*>(p - 8);
+
+    // Non-zero gen with invalid block_index must fail closed.
+    *reinterpret_cast<std::uint32_t*>(p - 16) = kInvalidBlockIndex;
+    EXPECT_FALSE(pool.try_deallocate(p));
+    *reinterpret_cast<std::uint32_t*>(p - 16) = good_block;
+
+    // Valid block_index with zero gen must fail closed.
+    *reinterpret_cast<std::uint16_t*>(p - 8) = 0;
+    EXPECT_FALSE(pool.try_deallocate(p));
+    *reinterpret_cast<std::uint16_t*>(p - 8) = good_gen;
+
     EXPECT_NO_THROW(pool.deallocate(p));
 }
 
@@ -1334,10 +1377,20 @@ TEST(PoolTest, DeallocateRejectsForgedBlockBase)
 TEST(PoolTest, Align8FreeWithoutRoutingHints)
 {
     Pool pool;
-    auto* p = pool.allocate(16, 8);
-    ASSERT_NE(p, nullptr);
-    EXPECT_EQ(*reinterpret_cast<std::uint8_t*>(p - 5), 8);
-    EXPECT_NO_THROW(pool.deallocate(p));
+    // Grow across multiple Blocks so O(log m) unhinted lookup is exercised too.
+    std::vector<std::byte*> ptrs;
+    ptrs.reserve(600);
+    for (int i = 0; i < 600; ++i)
+    {
+        auto* p = pool.allocate(16, 8);
+        ASSERT_NE(p, nullptr);
+        EXPECT_EQ(*reinterpret_cast<std::uint8_t*>(p - 5), 8);
+        ptrs.push_back(p);
+    }
+    for (auto* p : ptrs)
+    {
+        EXPECT_NO_THROW(pool.deallocate(p));
+    }
 }
 
 
@@ -2037,20 +2090,23 @@ TYPED_TEST(LockPolicyTest, SlabLifecycleKnownBaseFreeAndReclaim)
     {
         AllocateItemResult res = slab.allocateItem(64);
         ASSERT_NE(res.ptr, nullptr);
-        ASSERT_NE(res.block_base, nullptr);
-        ASSERT_NE(res.block_generation, 0u);
-        EXPECT_TRUE(slab.findBlockForSlot(res.ptr).has_value());
+        ASSERT_TRUE(res.hasRoutingHint());
+        ASSERT_LT(res.slot_index, slots_per_block);
+        EXPECT_EQ(slab.findBlockForSlot(res.ptr), std::optional<std::size_t>{res.block_index});
         items.push_back(res);
     }
 
     EXPECT_GE(slab.getBlockCount(), 3u);
 
-    // Mix known-base hint frees and fallback frees.
+    // Mix indexed hint frees and O(log m) unhinted fallback frees.
     for (std::size_t i = 0; i < items.size(); ++i)
     {
         if ((i & 1u) == 0u)
         {
-            slab.deallocateItem(items[i].ptr, items[i].block_base, items[i].block_generation);
+            slab.deallocateItem(items[i].ptr,
+                                items[i].block_index,
+                                items[i].slot_index,
+                                items[i].block_generation);
         }
         else
         {
@@ -2058,9 +2114,12 @@ TYPED_TEST(LockPolicyTest, SlabLifecycleKnownBaseFreeAndReclaim)
         }
     }
 
+    const std::size_t capacity_before = slab.getBlockCapacity();
     const std::size_t reclaimed = slab.reclaimEmptyBlocks(1);
     EXPECT_GE(reclaimed, 2u);
     EXPECT_EQ(slab.getBlockCount(), 1u);
+    // Stable indices: capacity stays at peak while live count drops to 1.
+    EXPECT_EQ(slab.getBlockCapacity(), capacity_before);
 }
 
 TYPED_TEST(LockPolicyTest, PoolTagCtorAllocFreeTrimAndSmartPtrs)
@@ -2190,6 +2249,158 @@ TEST(LockPolicyLayoutTest, DefaultPolicyAndEmptyLockOptimization)
     EXPECT_LE(sizeof(Slab<64, 16, mlvlib::NullLock>),
               sizeof(Slab<64, 16, mlvlib::SpinLock>));
 #endif
+}
+
+
+// ===========================================================================
+// Phase 4: Block class, DynBitset::find_next_set, stable-index refill & stale
+// hint rejection after trim/refill
+// ===========================================================================
+
+TEST(BlockTest, LifecycleNoexceptMoveAndDetachAttach)
+{
+    using Block64 = Block<64, 16>;
+    static_assert(std::is_nothrow_move_constructible_v<Block64>);
+    static_assert(std::is_nothrow_move_assignable_v<Block64>);
+    static_assert(!std::is_copy_constructible_v<Block64>);
+
+    Block64 empty;
+    EXPECT_FALSE(empty.isLive());
+    EXPECT_TRUE(empty.isEmpty());
+    EXPECT_FALSE(empty.hasFree());
+    EXPECT_EQ(empty.allocateSlot(0), Block64::slots_per_block);
+
+    std::byte* buf = Block64::allocateRawBuffer();
+    Block64 blk(buf, 7);
+    EXPECT_TRUE(blk.isLive());
+    EXPECT_TRUE(blk.isEmpty());
+    EXPECT_TRUE(blk.hasFree());
+    EXPECT_EQ(blk.generation(), 7u);
+    EXPECT_EQ(blk.buffer(), buf);
+
+    const std::size_t s0 = blk.allocateSlot(0);
+    EXPECT_EQ(s0, 0u);
+    EXPECT_EQ(blk.liveCount(), 1u);
+    EXPECT_FALSE(blk.isEmpty());
+    EXPECT_TRUE(blk.testSlot(0));
+    EXPECT_TRUE(blk.containsAddress(blk.slotAddress(0)));
+
+    // Move preserves ownership and nulls source.
+    Block64 moved(std::move(blk));
+    EXPECT_FALSE(blk.isLive());
+    EXPECT_EQ(blk.buffer(), nullptr);
+    EXPECT_TRUE(moved.isLive());
+    EXPECT_EQ(moved.buffer(), buf);
+    EXPECT_EQ(moved.liveCount(), 1u);
+    EXPECT_TRUE(moved.testSlot(0));
+
+    moved.deallocateSlot(0);
+    EXPECT_TRUE(moved.isEmpty());
+    std::byte* detached = moved.detachBuffer();
+    EXPECT_EQ(detached, buf);
+    EXPECT_FALSE(moved.isLive());
+    Block64::freeRawBuffer(detached);
+}
+
+TEST(DynBitsetTest, FindNextSetAcrossWordBoundaries)
+{
+    DynBitset bits;
+    EXPECT_EQ(bits.find_next_set(0), 0u);
+
+    // 130 bits spans 3 uint64_t words (0..63, 64..127, 128..129).
+    for (std::size_t i = 0; i < 130; ++i)
+    {
+        bits.push_clear();
+    }
+    EXPECT_EQ(bits.size(), 130u);
+    EXPECT_EQ(bits.find_next_set(0), 130u);
+
+    bits.set(0);
+    bits.set(63);
+    bits.set(64);
+    bits.set(127);
+    bits.set(129);
+
+    EXPECT_EQ(bits.find_next_set(0), 0u);
+    EXPECT_EQ(bits.find_next_set(1), 63u);
+    EXPECT_EQ(bits.find_next_set(63), 63u);
+    EXPECT_EQ(bits.find_next_set(64), 64u);
+    EXPECT_EQ(bits.find_next_set(65), 127u);
+    EXPECT_EQ(bits.find_next_set(128), 129u);
+    EXPECT_EQ(bits.find_next_set(130), 130u);
+
+    bits.reset(63);
+    EXPECT_EQ(bits.find_next_set(1), 64u);
+}
+
+TEST(SlabStableIndexTest, TrimPreservesLiveBlockIndicesAndRefillsWithBumpedGeneration)
+{
+    Slab<64, 16> slab(/*preallocate_first_block=*/true);
+    const std::size_t slots = slab.getAllocSize() / slab.getElemSize();
+
+    // Fill 3 Blocks: block 0, block 1, block 2.
+    std::vector<AllocateItemResult> b0, b1, b2;
+    for (std::size_t i = 0; i < slots; ++i) b0.push_back(slab.allocateItem(64));
+    for (std::size_t i = 0; i < slots; ++i) b1.push_back(slab.allocateItem(64));
+    for (std::size_t i = 0; i < slots; ++i) b2.push_back(slab.allocateItem(64));
+
+    ASSERT_EQ(slab.getBlockCount(), 3u);
+    ASSERT_EQ(slab.getBlockCapacity(), 3u);
+
+    const auto b0_idx = b0[0].block_index;
+    const auto b1_idx = b1[0].block_index;
+    const auto b2_idx = b2[0].block_index;
+    const auto b1_old_gen = b1[0].block_generation;
+    const auto b1_old_ptr = b1[0].ptr;
+    const auto b1_old_slot = b1[0].slot_index;
+
+    // Empty block 1 completely while keeping block 0 and block 2 live.
+    for (const auto& r : b1)
+    {
+        slab.deallocateItem(r.ptr, r.block_index, r.slot_index, r.block_generation);
+    }
+
+    EXPECT_EQ(slab.reclaimEmptyBlocks(/*keep_min=*/1), 1u);
+    EXPECT_EQ(slab.getBlockCount(), 2u);
+    EXPECT_EQ(slab.getBlockCapacity(), 3u);
+    EXPECT_EQ(slab.getAllocatedMemory(), 2u * slab.getAllocSize());
+
+    // Stale hint into trimmed Block 1 must be rejected.
+    EXPECT_THROW(slab.deallocateItem(b1_old_ptr, b1_idx, b1_old_slot, b1_old_gen),
+                 std::invalid_argument);
+
+    // Block 0 and Block 2 indices did NOT move when Block 1 was trimmed!
+    EXPECT_EQ(slab.findBlockForSlot(b0[0].ptr), std::optional<std::size_t>{b0_idx});
+    EXPECT_EQ(slab.findBlockForSlot(b2[0].ptr), std::optional<std::size_t>{b2_idx});
+
+    // Allocate again: should O(1)-refill the trimmed Block 1 shell (no capacity growth)
+    // with a strictly new generation.
+    AllocateItemResult refilled = slab.allocateItem(64);
+    EXPECT_EQ(refilled.block_index, b1_idx);
+    EXPECT_NE(refilled.block_generation, b1_old_gen);
+    EXPECT_EQ(slab.getBlockCount(), 3u);
+    EXPECT_EQ(slab.getBlockCapacity(), 3u);
+
+    // Even after refill, the old generation hint targeting the same (block_index, slot_index)
+    // is rejected.
+    EXPECT_THROW(slab.deallocateItem(refilled.ptr, refilled.block_index,
+                                     refilled.slot_index, b1_old_gen),
+                 std::invalid_argument);
+
+    // Clean up all live allocations via their original stable hints.
+    slab.deallocateItem(refilled.ptr, refilled.block_index,
+                        refilled.slot_index, refilled.block_generation);
+    for (const auto& r : b0)
+    {
+        slab.deallocateItem(r.ptr, r.block_index, r.slot_index, r.block_generation);
+    }
+    for (const auto& r : b2)
+    {
+        slab.deallocateItem(r.ptr, r.block_index, r.slot_index, r.block_generation);
+    }
+    EXPECT_EQ(slab.reclaimEmptyBlocks(1), 2u);
+    EXPECT_EQ(slab.getBlockCount(), 1u);
+    EXPECT_EQ(slab.getBlockCapacity(), 3u);
 }
 
 

@@ -398,12 +398,13 @@ namespace spallocator
         // pointer.
         // header_size = max(8, alignment). For align 4/8 this stays 8 (alignment class 16);
         // for 16/32/64 it equals the request align so free can recover the class.
-        // Layout (from user pointer backward): uint32 alloc_size at −4,
-        // uint8 header_size at −5, uint8 magic at −6. When header_size ≥ 16,
-        // also uint16 block generation at −8…−7 and block_base pointer at
-        // −16…−9 (routing hints for known-base free). Deallocate validates
-        // magic/size then recovers the slot base and re-selects the slab via
-        // (alloc_size, alignment-class-from-header_size).
+        // Layout (from user pointer backward, every field naturally aligned):
+        // uint32 alloc_size at −4…−1, uint8 header_size at −5, uint8 magic at
+        // −6. When header_size ≥ 16, also uint16 block_generation at −8…−7,
+        // uint16 reserved at −10…−9, uint16 slot_index at −12…−11, and uint32
+        // block_index at −16…−13 (O(1) indexed routing hints). Deallocate
+        // validates magic/size then recovers the slot base and re-selects the
+        // slab via (alloc_size, alignment-class-from-header_size).
         std::size_t header_size = 8 < alignment ? alignment : 8;
         std::size_t alloc_size = item_size + header_size;
         alloc.size = alloc_size;
@@ -444,16 +445,21 @@ namespace spallocator
         if (header_size >= 16)
         {
             auto* gen_ptr = reinterpret_cast<std::uint16_t*>(alloc.ptr + header_size - 8);
-            auto* base_ptr = reinterpret_cast<std::uintptr_t*>(alloc.ptr + header_size - 16);
-            if (item.block_base != nullptr)
+            auto* reserved_ptr = reinterpret_cast<std::uint16_t*>(alloc.ptr + header_size - 10);
+            auto* slot_idx_ptr = reinterpret_cast<std::uint16_t*>(alloc.ptr + header_size - 12);
+            auto* block_idx_ptr = reinterpret_cast<std::uint32_t*>(alloc.ptr + header_size - 16);
+            *reserved_ptr = 0;
+            if (item.hasRoutingHint())
             {
                 *gen_ptr = item.block_generation;
-                *base_ptr = reinterpret_cast<std::uintptr_t>(item.block_base);
+                *slot_idx_ptr = item.slot_index;
+                *block_idx_ptr = item.block_index;
             }
             else
             {
                 *gen_ptr = 0;
-                *base_ptr = 0;
+                *slot_idx_ptr = 0;
+                *block_idx_ptr = kInvalidBlockIndex;
             }
         }
 
@@ -579,17 +585,14 @@ namespace spallocator
                 return false;
             }
 
-            std::byte* hint_base = nullptr;
+            std::uint32_t hint_block_index = kInvalidBlockIndex;
+            std::uint16_t hint_slot_index = 0;
             std::uint16_t hint_gen = 0;
-            std::uintptr_t saved_hint_base = 0;
             if (header_size >= 16)
             {
                 hint_gen = *reinterpret_cast<std::uint16_t*>(item - 8);
-                saved_hint_base = *reinterpret_cast<std::uintptr_t*>(item - 16);
-                if (saved_hint_base != 0 && hint_gen != 0)
-                {
-                    hint_base = reinterpret_cast<std::byte*>(saved_hint_base);
-                }
+                hint_slot_index = *reinterpret_cast<std::uint16_t*>(item - 12);
+                hint_block_index = *reinterpret_cast<std::uint32_t*>(item - 16);
             }
 
             // Invalidate header before freemap (double-free while free runs).
@@ -598,7 +601,8 @@ namespace spallocator
             if (header_size >= 16)
             {
                 *reinterpret_cast<std::uint16_t*>(item - 8) = 0;
-                *reinterpret_cast<std::uintptr_t*>(item - 16) = 0;
+                *reinterpret_cast<std::uint16_t*>(item - 12) = 0;
+                *reinterpret_cast<std::uint32_t*>(item - 16) = kInvalidBlockIndex;
             }
 
 #if defined(SPALLOCATOR_HAS_ASAN)
@@ -611,7 +615,10 @@ namespace spallocator
                           (slab == &large_slab) ? "large_slab" : "size_class");
             try
             {
-                slab->deallocateItem(original_ptr, hint_base, hint_gen);
+                slab->deallocateItem(original_ptr,
+                                     hint_block_index,
+                                     hint_slot_index,
+                                     hint_gen);
             }
             catch (...)
             {
@@ -622,7 +629,8 @@ namespace spallocator
                 if (header_size >= 16)
                 {
                     *reinterpret_cast<std::uint16_t*>(item - 8) = hint_gen;
-                    *reinterpret_cast<std::uintptr_t*>(item - 16) = saved_hint_base;
+                    *reinterpret_cast<std::uint16_t*>(item - 12) = hint_slot_index;
+                    *reinterpret_cast<std::uint32_t*>(item - 16) = hint_block_index;
                 }
 #if defined(SPALLOCATOR_HAS_ASAN)
                 if (header_was_poisoned)

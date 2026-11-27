@@ -35,19 +35,30 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string_view>
 
 namespace spallocator
 {
 
-    // Result of allocateItem. For Slab, block_base/generation identify the
-    // owning Block so Pool can stash routing hints in the front header.
-    // SlabProxy leaves block_base null and generation 0.
+    inline constexpr std::uint32_t kInvalidBlockIndex =
+        std::numeric_limits<std::uint32_t>::max();
+
+    // Result of allocateItem. For Slab, (block_index, slot_index,
+    // block_generation) identify the owning Block and Slot so Pool can stash
+    // O(1) routing hints in the front header. SlabProxy leaves block_index
+    // as kInvalidBlockIndex and block_generation as 0.
     struct AllocateItemResult
     {
         std::byte* ptr = nullptr;
-        std::byte* block_base = nullptr;
+        std::uint32_t block_index = kInvalidBlockIndex;
+        std::uint16_t slot_index = 0;
         std::uint16_t block_generation = 0;
+
+        constexpr bool hasRoutingHint() const noexcept
+        {
+            return block_index != kInvalidBlockIndex && block_generation != 0;
+        }
 
         // Convenience for call sites that only need the slot / allocation base.
         operator std::byte*() const noexcept { return ptr; }
@@ -58,11 +69,14 @@ namespace spallocator
     public: // methods
         virtual AllocateItemResult allocateItem(std::size_t size) = 0;
 
-        // Optional block_base + generation: when block_base is non-null (Pool
-        // free with header hints), Slab verifies generation and uses an
-        // exact-base lookup instead of an address-range search.
+        // Optional (block_index, slot_index, block_generation) hints: when
+        // provided (Pool free with header_size >= 16), Slab indexes directly
+        // into blocks_[block_index] in O(1) and verifies generation + exact
+        // slot address. When omitted (kInvalidBlockIndex / gen 0), Slab falls
+        // back to O(log m) address-range lookup.
         virtual void deallocateItem(std::byte* item,
-                                    std::byte* block_base = nullptr,
+                                    std::uint32_t block_index = kInvalidBlockIndex,
+                                    std::uint16_t slot_index = 0,
                                     std::uint16_t block_generation = 0) = 0;
 
         // Release fully empty Blocks back to the OS. Default: no-op
