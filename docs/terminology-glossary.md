@@ -115,12 +115,13 @@ mlvlib itself has **no** Pool/Slab/Slot/Block storage vocabulary worth renaming 
 
 | Kind | Location | Examples |
 |------|----------|----------|
-| Methods | `spallocator/impl/slab.hpp` | `allocateNewBlock`, `destroyBlockAt`, `getBlockCount`, `reclaimEmptyBlocks`, `findBlockForSlot` |
-| Members | `impl/slab.hpp` | `block_bases`, `block_freemaps`, `block_available_map`, … |
+| Types | `spallocator/impl/block.hpp` | `Block<ElemSize, Alignment>` (owns backing buffer, `generation_`, `live_count_`, and inline `SlotFreemap`) |
+| Methods | `spallocator/impl/slab.hpp` | `publishBlockBuffer`, `getBlockCount`, `getBlockCapacity`, `reclaimEmptyBlocks`, `findBlockForSlot` |
+| Members | `impl/slab.hpp` | `blocks_`, `block_available_map_`, `trimmed_blocks_`, `address_index_`, `live_block_count_`, … |
 | Knobs | `impl/slab.hpp` / configure | `kSlabTargetBytes`, `kSlabTargetMultiplier`, `--with-slab-target-*` (these size **Blocks**, not the Slab type) |
 | Messages | `impl/slab.hpp` | growth / reclaim debug lines |
-| Tests | `test/tester.cpp` | Many `getBlockCount` / `reclaimEmptyBlocks` expectations; comments mix “data block” and count-as-slab |
-| Docs | API / IMPLEMENTATION / CONCEPTS | “slab buffers”, `reclaimEmptyBlocks`, “Finding a pointer’s slab”, trim “per size class” buffer language |
+| Tests | `test/tester.cpp` | `BlockTest`, `SlabStableIndexTest`, `getBlockCount` / `getBlockCapacity` / `reclaimEmptyBlocks` expectations |
+| Docs | API / IMPLEMENTATION / CONCEPTS | `Block` / `Slot` vocabulary, `reclaimEmptyBlocks`, “Finding a pointer’s owning Block” |
 
 ### Hotspots where naming is OK but should stay consistent
 
@@ -158,6 +159,7 @@ Order of operations after Michael locks names — **not started this round**.
 Hard renames (no aliases): `allocateNewBlock`, `destroyBlockAt`, `block_bases`,
 `block_freemaps`, `block_available_map`, `block_bytes`, `max_blocks`,
 `slots_per_block`, `alloc_cursor_block_`, `selectBlockSize`, local `new_block`.
+*(Later consolidated by the Block-class freemap redesign into `Block<ElemSize, Alignment>` in `spallocator/impl/block.hpp` and `Slab::blocks_`, `trimmed_blocks_`, `address_index_`, `publishBlockBuffer`.)*
 
 Compile knobs (`SPALLOCATOR_SLAB_TARGET_*` / `kSlabTarget*`) kept; comment notes they size Blocks.
 

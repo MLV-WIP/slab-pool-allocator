@@ -508,7 +508,7 @@ namespace spallocator
             }
         }
 
-        debug_println("Item allocated ({}/{}), block_freemaps<{},{}>: {}",
+        debug_println("Item allocated ({}/{}), block.freemap<{},{}>: {}",
                       block_index, item_index, ElemSize, Alignment,
                       printHex(blk.freemap()));
 
@@ -752,7 +752,7 @@ namespace spallocator
         {
             block_available_map_.set(resolved_block);
         }
-        debug_println("Item freed ({}/{}), block_freemaps: {}",
+        debug_println("Item freed ({}/{}), block.freemap: {}",
                       resolved_block, item_index, printHex(blk.freemap()));
     }
 
@@ -817,7 +817,7 @@ namespace spallocator
             {
                 block_available_map_.set(block_index);
             }
-            debug_println("Item freed via hint ({}/{}), block_freemaps: {}",
+            debug_println("Item freed via hint ({}/{}), block.freemap: {}",
                           block_index, slot_index, printHex(blk.freemap()));
             return;
         }
