@@ -44,6 +44,100 @@
 
 #include "mlvlib/helper.hpp"
 
+// -----------------------------------------------------------------------------
+// Hot/cold inlining and code-placement hints (spallocator/impl/helper.hpp)
+// -----------------------------------------------------------------------------
+// Allocator hot paths (Slab::allocateItem, Slab::deallocateItem) are called
+// millions of times per second behind an ISlab virtual dispatch. Even a never-
+// taken error throw, std::format call, or slow-growth fallback inside a hot
+// function can:
+//   1. Pull std::string / std::format temporaries and C++ EH landing pads into
+//      the hot function's stack frame, forcing callee-saved register spills in
+//      the prologue/epilogue on EVERY hot call.
+//   2. Inflate the function's IR size enough to trip compiler inlining budgets,
+//      preventing tiny hot helpers from inlining into allocateItem/deallocateItem.
+//   3. Spread hot instructions across extra I-cache lines and branch-predictor
+//      entries.
+//
+// We use three distinct macros because "don't inline into the caller" and
+// "optimize the callee as cold/rare" are independent decisions. Each macro is
+// #ifndef-guarded so builds can override them if needed.
+//
+// 1. SPALLOCATOR_COLD_NOINLINE
+//    - GCC/Clang: [[gnu::cold, gnu::noinline]]
+//    - MSVC:      __declspec(noinline)
+//    - Effect on caller:
+//        * Never inlined into the caller, keeping the caller's stack frame,
+//          register pressure, and instruction footprint minimal.
+//        * GCC/Clang automatically treat branches leading to a [[gnu::cold]]
+//          callee as unlikely (like [[unlikely]] at every call site), keeping
+//          the hot path straight-line fall-through.
+//    - Effect on callee:
+//        * Compiled for size (-Os) and placed in a cold text section
+//          (.text.unlikely) away from hot I-cache lines.
+//    - Use for: truly rare slow paths (Slab::allocateSlow,
+//      Slab::findAvailableBlockLocked, Block::allocateSlotSlow) and [[noreturn]]
+//      out-of-line throw helpers (detail::throw*). Do NOT use on paths that can
+//      be hot for some callers (e.g., align <= 8 unhinted frees).
+//
+// 2. SPALLOCATOR_NOINLINE
+//    - GCC/Clang: [[gnu::noinline]]
+//    - MSVC:      __declspec(noinline)
+//    - Effect on caller:
+//        * Never inlined into the caller, keeping the primary hot path compact,
+//          avoiding extra callee-saved spills, and enabling tail-call dispatch.
+//    - Effect on callee:
+//        * Still compiled at full -O3 in the normal hot .text section and free
+//          to inline its own callees (unlike SPALLOCATOR_COLD_NOINLINE).
+//    - Use for: secondary fast paths that must not bloat the primary path yet
+//      run hot in specific workloads (e.g., Slab::deallocateUnhintedLocked for
+//      align <= 8 Pool allocations and direct unhinted Slab::deallocateItem).
+//
+// 3. SPALLOCATOR_ALWAYS_INLINE
+//    - GCC/Clang: [[gnu::always_inline]] inline
+//    - MSVC:      __forceinline
+//    - Effect:
+//        * Forces inlining of a small hot helper even when compiler cost
+//          heuristics hesitate around lock guards or template wrappers, and
+//          preserves `inline` linkage for header-defined templates.
+//        * Eliminates call/return overhead and lets values (such as
+//          AllocateItemResult returned in registers) stay in registers across
+//          the boundary.
+//    - Use sparingly and pair with SPALLOCATOR_COLD_NOINLINE on any slow
+//      branches inside the helper so only the tiny hot core is inlined (e.g.,
+//      Slab::tryAllocateFromExistingLocked).
+// -----------------------------------------------------------------------------
+
+#ifndef SPALLOCATOR_COLD_NOINLINE
+#  if defined(__GNUC__) || defined(__clang__)
+#    define SPALLOCATOR_COLD_NOINLINE [[gnu::cold, gnu::noinline]]
+#  elif defined(_MSC_VER)
+#    define SPALLOCATOR_COLD_NOINLINE __declspec(noinline)
+#  else
+#    define SPALLOCATOR_COLD_NOINLINE
+#  endif
+#endif
+
+#ifndef SPALLOCATOR_NOINLINE
+#  if defined(__GNUC__) || defined(__clang__)
+#    define SPALLOCATOR_NOINLINE [[gnu::noinline]]
+#  elif defined(_MSC_VER)
+#    define SPALLOCATOR_NOINLINE __declspec(noinline)
+#  else
+#    define SPALLOCATOR_NOINLINE
+#  endif
+#endif
+
+#ifndef SPALLOCATOR_ALWAYS_INLINE
+#  if defined(__GNUC__) || defined(__clang__)
+#    define SPALLOCATOR_ALWAYS_INLINE [[gnu::always_inline]] inline
+#  elif defined(_MSC_VER)
+#    define SPALLOCATOR_ALWAYS_INLINE __forceinline
+#  else
+#    define SPALLOCATOR_ALWAYS_INLINE inline
+#  endif
+#endif
+
 namespace spallocator
 {
 

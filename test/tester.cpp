@@ -2552,6 +2552,99 @@ TEST(SlabStableIndexTest, TrimCompactsTrailingShellsNotDeallocate)
 }
 
 
+// Regression test for lazy-sorted flat address_index_:
+// Growing many Blocks after glibc LIFO frees frequently yields descending or
+// non-monotonic OS buffer addresses. Both const findBlockForSlot() (before any
+// locked sort) and unhinted deallocateItem() (which sorts lazily once) must
+// resolve every Block accurately across growth, trim, and refill cycles.
+TEST(SlabTest, AddressIndexLazySortAndRefill)
+{
+    constexpr std::size_t kElem = 64;
+    constexpr std::size_t kBlocks = 48;
+    constexpr std::size_t kSlots = Block<kElem, 16>::slots_per_block;
+
+    // Seed glibc's free list with many same-sized blocks so the second Slab
+    // is likely to receive buffers in non-ascending (LIFO) address order.
+    {
+        Slab<kElem, 16, mlvlib::NullLock> primer;
+        std::vector<std::byte*> primer_ptrs;
+        primer_ptrs.reserve(kBlocks * kSlots);
+        for (std::size_t i = 0; i < kBlocks * kSlots; ++i)
+        {
+            primer_ptrs.push_back(primer.allocateItem(kElem).ptr);
+        }
+        for (std::byte* p : primer_ptrs)
+        {
+            primer.deallocateItem(p);
+        }
+    }
+
+    Slab<kElem, 16, mlvlib::NullLock> slab;
+    std::vector<AllocateItemResult> items;
+    items.reserve(kBlocks * kSlots);
+    for (std::size_t i = 0; i < kBlocks * kSlots; ++i)
+    {
+        items.push_back(slab.allocateItem(kElem));
+    }
+    ASSERT_EQ(slab.getBlockCount(), kBlocks);
+
+    // Const findBlockForSlot() must work accurately BEFORE any unhinted free
+    // triggers lazy sorting of address_index_.
+    for (std::size_t b = 0; b < kBlocks; ++b)
+    {
+        const AllocateItemResult& first = items[b * kSlots];
+        const AllocateItemResult& last = items[b * kSlots + (kSlots - 1)];
+        EXPECT_EQ(slab.findBlockForSlot(first.ptr), std::optional<std::size_t>{first.block_index});
+        EXPECT_EQ(slab.findBlockForSlot(last.ptr), std::optional<std::size_t>{last.block_index});
+    }
+
+    // Free odd Blocks via unhinted deallocateItem (triggers lazy sort on first
+    // call, then O(log m) binary search), keeping even Blocks live.
+    for (std::size_t b = 1; b < kBlocks; b += 2)
+    {
+        for (std::size_t s = 0; s < kSlots; ++s)
+        {
+            slab.deallocateItem(items[b * kSlots + s].ptr);
+        }
+    }
+
+    // Trim odd empty Blocks, then refill them (appends new buffers into
+    // trimmed_blocks_ shells, potentially making address_index_ unsorted again).
+    const std::size_t trimmed = slab.reclaimEmptyBlocks(1);
+    EXPECT_EQ(trimmed, kBlocks / 2);
+
+    std::vector<AllocateItemResult> refilled;
+    refilled.reserve((kBlocks / 2) * kSlots);
+    for (std::size_t i = 0; i < (kBlocks / 2) * kSlots; ++i)
+    {
+        refilled.push_back(slab.allocateItem(kElem));
+    }
+    EXPECT_EQ(slab.getBlockCount(), kBlocks);
+
+    // Verify both surviving even Blocks and newly refilled odd Blocks via
+    // findBlockForSlot() and unhinted deallocateItem().
+    for (std::size_t b = 0; b < kBlocks; b += 2)
+    {
+        const AllocateItemResult& sample = items[b * kSlots];
+        EXPECT_EQ(slab.findBlockForSlot(sample.ptr), std::optional<std::size_t>{sample.block_index});
+        for (std::size_t s = 0; s < kSlots; ++s)
+        {
+            slab.deallocateItem(items[b * kSlots + s].ptr);
+        }
+    }
+    for (const AllocateItemResult& r : refilled)
+    {
+        EXPECT_EQ(slab.findBlockForSlot(r.ptr), std::optional<std::size_t>{r.block_index});
+        slab.deallocateItem(r.ptr);
+    }
+
+    // Unknown pointer still rejected cleanly after sorting + trimming.
+    alignas(16) std::byte bogus[64]{};
+    EXPECT_EQ(slab.findBlockForSlot(bogus), std::nullopt);
+    EXPECT_THROW(slab.deallocateItem(bogus), std::invalid_argument);
+}
+
+
 void pre_test()
 {
     println("Running pre-test setup...");

@@ -79,7 +79,7 @@ you need the “why pools / why slabs” story without code structure.
                ├── std::vector<Block<…>> blocks_   (durable Block indices; trimmed shells)
                │     └── Block                     (aligned buffer, generation_, live_count_, SlotFreemap)
                ├── std::vector<uint32_t> trimmed_blocks_  (O(1) refill list for trimmed shells)
-               └── std::map<byte*, size_t> base_address_map_  (cold unhinted / align-8 lookup)
+               └── std::vector<BlockAddrEntry> address_index_  (lazy-sorted flat unhinted / align-8 lookup)
 
   Smart pointers / PoolAllocator / PoolMemoryResource ──► clients via PoolLifetimeToken / PoolHandle
   LifetimeObserver                                    (stand-alone in mlvlib; not part of Pool)
@@ -88,7 +88,7 @@ you need the “why pools / why slabs” story without code structure.
 | Layer | Responsibility |
 |-------|----------------|
 | **`Pool`** | Allocation *domain*: construct/destroy as a unit, isolate shards, lock-free routing by footprint + alignment, write/validate the allocation header (including routing hints), `trim` / accounting |
-| **`Slab`** | Size-class *engine*: owns `vector<Block>`, `DynBitset` availability map, `trimmed_blocks_` refill list, `base_address_map_` fallback, next-fit cursor, and per-slab `Lock`; allocates/frees backing buffers **outside** `slab_lock` |
+| **`Slab`** | Size-class *engine*: owns `vector<Block>`, `DynBitset` availability map, `trimmed_blocks_` refill list, lazy-sorted flat `address_index_` fallback, next-fit cursor, and per-slab `Lock`; allocates/frees backing buffers **outside** `slab_lock` |
 | **`Block`** | Single backing chunk (`spallocator/impl/block.hpp`): RAII aligned buffer (`nullptr` when trimmed), 16-bit `generation_`, `live_count_`, and inline `SlotFreemap<slots_per_block>` |
 | **`SlabProxy`** | Same `ISlab` interface; lock-free system `new[]` / `delete[]` for oversized requests (no Block/Slot freemap or retention) |
 | **Smart pointers** | Clients via `PoolLifetimeToken` / `PoolHandle` (typed RAII) |
@@ -352,11 +352,11 @@ calling out lock boundaries and asymptotic cost at each step.
 | **Alloc — Hot** (cursor hit) | Warm `Slab`, cursor `Block` & `Slot` free | `slab_lock` (brief) | **O(1)** bit test + set | No |
 | **Alloc — Warm** (same Block scan) | Cursor `Slot` occupied, same `Block` has free slot | `slab_lock` | **O(slots / 64)** (`SlotFreemap` CTZ) | No |
 | **Alloc — Warm** (other Block scan) | Cursor `Block` full, another `Block` available | `slab_lock` | **O(blocks / 64)** (`DynBitset` CTZ) + **O(slots / 64)** | No |
-| **Alloc — Cold A** (refill / grow) | All live `Block`s full (or first touch on cold Slab) | **Released** during `new[]`; re-acquired to publish | **O(1)** shell pop / amortized vector append + **O(log m)** `base_address_map_` insert | Yes (`allocateRawBuffer` **outside** lock) |
+| **Alloc — Cold A** (refill / grow) | All live `Block`s full (or first touch on cold Slab) | **Released** during `new[]`; re-acquired to publish | **O(1)** amortized shell pop / vector append + **O(1)** `address_index_` append | Yes (`allocateRawBuffer` **outside** lock) |
 | **Alloc — Cold B** (oversized) | `alloc_size` > alignment-class max | **None** (`SlabProxy`) | **O(1)** routing (`selectClassIndex`) | Yes (`operator new[]`) |
-| **Dealloc — Hot** (`align ≥ 16` Pool) | `header_size ≥ 16` with valid `(block_index, slot_index, gen)` | `slab_lock` (brief) | **O(1)** direct array index + geometry verify; **0 map lookups, 0 division** | No |
+| **Dealloc — Hot** (`align ≥ 16` Pool) | `header_size ≥ 16` with valid `(block_index, slot_index, gen)` | `slab_lock` (brief) | **O(1)** direct array index + geometry verify; **0 address-index lookups, 0 division** | No |
 | **Dealloc — Cold A1** (unhinted, 1 Block) | `align ≤ 8` Pool or direct unhinted `Slab` call; `m == 1` | `slab_lock` | **O(1)** single-Block range check + `offset / ElemSize` | No |
-| **Dealloc — Cold A2** (unhinted, `m > 1`) | `align ≤ 8` Pool or direct unhinted `Slab` call; `m > 1` | `slab_lock` | **O(log m)** `base_address_map_.upper_bound` + `offset / ElemSize` | No |
+| **Dealloc — Cold A2** (unhinted, `m > 1`) | `align ≤ 8` Pool or direct unhinted `Slab` call; `m > 1` | `slab_lock` | **O(log m)** contiguous binary search over `address_index_` (lazy `std::sort` once if grown out-of-order) + `offset / ElemSize` | No |
 | **Dealloc — Cold B** (oversized) | Footprint > alignment-class max | **None** (`SlabProxy`) | **O(1)** routing | Yes (`operator delete[]`) |
 
 *(Here `m` = number of live `Block`s in that single `Slab` size class, `blocks` =
@@ -454,24 +454,25 @@ on a cold Slab or all live Blocks are full):
    - Re-checks `live_block_count_ < max_blocks` (throwing cleanly if another
      thread took the last allowed Block while we were unlocked).
 4. **Publish buffer (`publishBlockBuffer`, under `slab_lock`):**
-   - **Sub-path A1 — Refill a trimmed `Block` shell (`!trimmed_blocks_.empty()`, O(log m)):**
-     - Reads `idx = trimmed_blocks_.back()`.
-     - Inserts `{raw_buf, idx}` into `base_address_map_` (**O(log m)**). If that
-       throws `std::bad_alloc`, nothing has been mutated and `RawBufferGuard`
-       frees `raw_buf` outside the lock.
-     - Pops `trimmed_blocks_`, calls `blocks_[idx].attachBuffer(raw_buf.release(), gen)`
-       (using and advancing the 16-bit non-zero `next_block_generation_` counter
-       to defeat ABA against any stale pointer from the previous buffer at
-       index `idx`), sets `block_available_map_.set(idx)`, and increments
-       `live_block_count_`.
-   - **Sub-path A2 — Append a new `Block` (`trimmed_blocks_.empty()`, O(log m)):**
+   - First reserves `address_index_` geometrically (`capacity * 2`, amortized **O(1)**)
+     before mutating any Slab container so appending `{raw_buf, idx}` cannot throw.
+   - **Sub-path A1 — Refill a trimmed `Block` shell (`!trimmed_blocks_.empty()`, O(1) amortized):**
+     - Pops `idx = trimmed_blocks_.back()`.
+     - Appends `{raw_buf, idx}` to `address_index_` (**O(1)**; clears
+       `address_index_sorted_` only if `raw_buf < address_index_.back().base`,
+       avoiding O(m²) shifts when OS addresses arrive in descending/LIFO order).
+     - Calls `blocks_[idx].attachBuffer(raw_buf.release(), gen)` (using and
+       advancing the 16-bit non-zero `next_block_generation_` counter to defeat
+       ABA against any stale pointer from the previous buffer at index `idx`),
+       sets `block_available_map_.set(idx)`, and increments `live_block_count_`.
+   - **Sub-path A2 — Append a new `Block` (`trimmed_blocks_.empty()`, O(1) amortized):**
      - If `blocks_.size() == blocks_.capacity()`, grows `blocks_` geometrically
-       (`capacity * 2`, amortized **O(1)**) *before* touching `base_address_map_`
-       so `emplace_back` cannot throw afterward.
-     - Inserts `{raw_buf, idx}` into `base_address_map_` (**O(log m)**).
-     - `blocks_.emplace_back(raw_buf.release(), gen)`,
-       `block_available_map_.push_set()` (amortized **O(1)**),
-       advances `next_block_generation_`, `++live_block_count_`.
+       (`capacity * 2`, amortized **O(1)**) and reserves `block_available_map_`
+       *before* mutating any container size so the final commit is non-throwing.
+     - Appends `{raw_buf, idx}` to `address_index_` (**O(1)**), calls
+       `blocks_.emplace_back(raw_buf.release(), gen)`,
+       `block_available_map_.push_set()` (amortized **O(1)**), advances
+       `next_block_generation_`, `++live_block_count_`.
 5. **Take Slot 0 (under `slab_lock`, O(1)):** sets cursor to
    `(published_index, 0)` and calls `tryAllocateFromExistingLocked()` to
    claim Slot 0, then releases `slab_lock` and returns to `Pool::allocate` step 7.
@@ -513,7 +514,7 @@ alignment class 16):
 3. **`Slab::deallocateItem` — O(1) indexed fast path (under `slab_lock`):**
    - Acquires `slab_lock`.
    - Sees `has_index && has_gen` (`block_index != kInvalidBlockIndex && block_generation != 0`).
-   - **Zero `std::map` lookup, zero integer division:**
+   - **Zero `address_index_` lookup, zero integer division:**
      1. Bounds check `block_index < block_available_map_.size()` (plain `size_t` load).
      2. Direct index `auto& blk = blocks_[block_index]` (**O(1)**).
      3. Verify `blk.isLive() && blk.generation() == block_generation` (rejects
@@ -547,12 +548,17 @@ When `header_size == 8` (request align 4 or 8) or a caller invokes
 
 - Note: partial hints (`has_index != has_gen`) are rejected immediately with
   `std::invalid_argument` (fail closed).
-- Under `slab_lock`, calls `findBlockForSlot(item)`:
-  - **Sub-path A1 — Single live Block (`base_address_map_.size() == 1`, O(1)):**
-    range-checks `item ∈ [block_start, block_start + block_bytes)` directly
-    without walking the tree.
-  - **Sub-path A2 — Multi-Block (`base_address_map_.size() > 1`, O(log m)):**
-    calls `base_address_map_.upper_bound(item)`, steps back one node (`--it`),
+- Under `slab_lock`, tail-calls `deallocateUnhintedLocked(item)` (split out with
+  `SPALLOCATOR_NOINLINE` so the hinted `deallocateItem()` fast path stays
+  compact with minimal prologue spills while unhinted free still receives full
+  `-O3` optimization):
+  - **Sub-path A1 — Single live Block (`block_available_map_.size() == 1 && blocks_[0].isLive()`, O(1)):**
+    range-checks `blocks_[0].containsAddress(item)` directly without touching
+    `address_index_`.
+  - **Sub-path A2 — Multi-Block (`findBlockForSlotLocked(item)`, O(log m)):**
+    lazily runs `std::sort` on `address_index_` once if any newly published
+    Blocks arrived out of ascending address order, then runs a contiguous binary
+    search over the flat `BlockAddrEntry` array (16 B/entry, cache-line dense)
     and verifies `item ∈ [block_start, block_start + block_bytes)`.
 - Indexes `auto& blk = blocks_[resolved_block]`, computes
   `byte_offset = item - blk.buffer()` and `item_index = byte_offset / ElemSize`,
@@ -656,20 +662,35 @@ fit in `uint16_t` so `slot_index` fits cleanly in the 16-byte Pool header.
 
 ### `Slab` state
 
+Members are ordered **hot-first** so the allocate/deallocate hot fields
+(`blocks_`, `block_available_map_`, cursor, and `slab_lock`) stay packed into
+the leading cache lines while growth/trim/unhinted-lookup metadata sits behind
+them:
+
 - `std::vector<Block<ElemSize, Alignment>> blocks_` — durable index table
   (`block_index` never shifts on trim; geometric capacity growth on append)
-- `std::vector<std::uint32_t> trimmed_blocks_` — LIFO list of trimmed `Block`
-  indices ready for **O(1) refill** on the next growth
 - `DynBitset block_available_map_` — 1 bit per `blocks_` entry (`1` iff live AND
   has at least one free Slot; trimmed and full Blocks both have `0`)
-- `std::map<std::byte*, std::size_t> base_address_map_` — maps live `buffer_`
-  base → durable `block_index` (used only by unhinted / align-8 frees and
-  `findBlockForSlot()`)
-- `live_block_count_` (capped at `max_blocks = kMaxClassBytes / block_bytes`,
-  default **4 GiB** class cap), `next_generation_` (`uint16_t` wrapping `1..65535`,
-  skipping `0`), and next-fit cursor `(alloc_cursor_block_, alloc_cursor_slot_)`
+- Next-fit cursor `(alloc_cursor_block_, alloc_cursor_slot_)`
 - `MLVLIB_NO_UNIQUE_ADDRESS Lock slab_lock` — per-slab lock (defaults to
   `DefaultSlabLock` = `mlvlib::SpinLock`)
+- `live_block_count_` (capped at `max_blocks = kMaxClassBytes / block_bytes`,
+  default **4 GiB** class cap)
+- `std::vector<BlockAddrEntry> address_index_` + `bool address_index_sorted_` —
+  compact 16 B/entry flat array mapping live `buffer_` base → durable
+  `uint32_t block_index` (O(1) append on publish, lazily sorted on first
+  unhinted lookup if out of order; used only by unhinted / align-8 frees and
+  `findBlockForSlot()`)
+- `std::vector<std::uint32_t> trimmed_blocks_` — LIFO list of trimmed `Block`
+  indices ready for **O(1) refill** on the next growth
+- `next_block_generation_` (`uint16_t` wrapping `1..65535`, skipping `0`)
+
+Cold slow paths (`Block::allocateSlotSlow`, `Slab::findAvailableBlockLocked`,
+`Slab::allocateSlow`, and out-of-line `detail::throw*` helpers) are annotated
+with `SPALLOCATOR_COLD_NOINLINE` so exception construction / `std::format` IR
+and landing pads stay out of `allocateItem()` and `deallocateItem()` — see
+[Hot/cold codegen & `SPALLOCATOR_*INLINE` macros](#hotcold-codegen--spallocator_inline-macros)
+for details.
 
 **Invariants**
 
@@ -677,7 +698,7 @@ fit in `uint16_t` so `slot_index` fits cleanly in the 16-byte Pool header.
 - `block_available_map_.size() == blocks_.size()` at all quiescent points under
   `slab_lock`  
 - `block_available_map_.test(i)` is `1` iff `blocks_[i].isLive() && !blocks_[i].isFull()`  
-- `live_block_count_ == base_address_map_.size()`  
+- `live_block_count_ == address_index_.size()`  
 - Every live `Block`'s durable index `i` remains constant for the lifetime of the
   `Slab` (no swap-with-last); trimming detaches `buffer_` and bumps `generation_`
   on refill  
@@ -740,20 +761,25 @@ On free, the Slab must locate the owning **Block** and **Slot** for `slot_base`:
   indexed lookup** via `blocks_[block_index]`, verified in O(1) against
   `blk.isLive()`, `blk.generation() == block_generation`, and
   `slot_index < slots_per_block && item == blk.slotAddress(slot_index)`.
-  `base_address_map_` is **never touched** on this path.
+  `address_index_` is **never touched** on this path.
 - **Fallback path (`Pool` with `align ≤ 8`, direct unhinted `Slab` calls, and
   `findBlockForSlot()`):** Blocks occupy half-open intervals
-  `[base, base + block_bytes)`. `base_address_map_` (`std::map<std::byte*, std::size_t>`)
-  maps each live Block's base address to its durable index:
-  - **O(1)** single-live-Block fast path when `base_address_map_.size() == 1`.
-  - **O(log m)** interval lookup (`upper_bound` then `--it`, checking
-    `slot_base ∈ [block_start, block_end)`) when `m > 1`.
+  `[base, base + block_bytes)`. `address_index_` (`std::vector<BlockAddrEntry>`,
+  16 B per live Block) maps each live Block's base address to its durable
+  `uint32_t` index without per-node heap allocations or red-black-tree pointer
+  chasing:
+  - **O(1)** direct `blocks_[0]` check in `deallocateUnhintedLocked` when
+    `block_available_map_.size() == 1 && blocks_[0].isLive()`.
+  - **O(log m)** contiguous binary search (`upper_bound` style, checking
+    `slot_base ∈ [block_start, block_end)`) when `m > 1`. New Blocks are
+    appended in **O(1)** during growth and lazily sorted once on the first
+    locked unhinted lookup if any OS backing addresses arrived out of order.
 
 | Lookup path | Cost | When used |
 |-------------|------|-----------|
 | Header hint (`block_index`, `slot_index`, `gen`) | **O(1)** | Default `Pool` (`align ≥ 16`) |
-| `base_address_map_` (`m == 1`) | **O(1)** | `align ≤ 8` / direct `Slab`, 1 live Block |
-| `base_address_map_` (`m > 1`) | **O(log m)** | `align ≤ 8` / direct `Slab`, multiple live Blocks |
+| Single-Block fast path (`m == 1`) | **O(1)** | `align ≤ 8` / direct `Slab`, 1 live Block |
+| Flat `address_index_` binary search (`m > 1`) | **O(log m)** | `align ≤ 8` / direct `Slab`, multiple live Blocks |
 
 ### Interior pointers
 
@@ -792,9 +818,10 @@ the caller explicitly invokes `Pool::trim()`.
   allocation headers.
 - With durable indices, trimming an empty `Block` detaches its ≥8 KiB backing
   buffer (`blk.detachBuffer()` → `buffer_ = nullptr`, `generation_ = 0`),
-  erases its base from `base_address_map_`, clears its bit in
-  `block_available_map_`, and pushes `idx` onto `trimmed_blocks_`. Surviving
-  live Blocks keep their exact `block_index` unchanged.
+  clears its bit in `block_available_map_`, pushes `idx` onto `trimmed_blocks_`,
+  and batch-removes detached entries from `address_index_` in one linear
+  `std::erase_if` pass. Surviving live Blocks keep their exact `block_index`
+  unchanged.
 - **Trailing-shell compaction in `trim()` only (never on `deallocateItem`):**
   `reclaimEmptyBlocks` scans empty Blocks **high-to-low** (`find_prev_set`) so
   lower-indexed empty Blocks are kept first, then synchronously pops all
@@ -1086,13 +1113,13 @@ Concurrency follows the pool-vs-slab split: **`Pool` routing is lock-free**
 because all alignment-class Slab registries (`slabs16`, `slabs32`, `slabs64`)
 are installed eagerly in `Pool()` and remain immutable for the pool’s lifetime.
 Each **`Slab`** owns an independent per-slab lock protecting its `blocks_`,
-`block_available_map_`, `trimmed_blocks_`, `base_address_map_`, and cursor.
+`block_available_map_`, `trimmed_blocks_`, `address_index_`, and cursor.
 Different size classes therefore run in parallel with zero shared lock
 contention, and separate `Pool` instances share no locks at all.
 
 | Lock | Protects | Hold time intent |
 |------|----------|------------------|
-| Per-`Slab` `Lock` (`DefaultSlabLock` or `Pool(std::in_place_type<Lock>)`) | `blocks_`, `SlotFreemap`s, `block_available_map_`, `trimmed_blocks_`, `base_address_map_`, cursor | Brief — bit ops, O(1) array index / O(log m) map op; **never** holds OS `new[]` / `delete[]` |
+| Per-`Slab` `Lock` (`DefaultSlabLock` or `Pool(std::in_place_type<Lock>)`) | `blocks_`, `SlotFreemap`s, `block_available_map_`, `trimmed_blocks_`, `address_index_`, cursor | Brief — bit ops, O(1) array index / O(log m) flat binary search; **never** holds OS `new[]` / `delete[]` |
 
 **No OS heap calls under `slab_lock`:**
 - **Growth (`Slab::allocateSlow`):** `slab_lock` is released before calling
@@ -1267,12 +1294,12 @@ checks — do not mix debug and release TUs against the same `SpinLock` layout.
 |-----------|-----------------|-------------------|-------|
 | `Pool::resolveSlab` (`selectClassIndex`) | **O(1)** | **O(1)** | Lock-free ladder of compares + immutable array index |
 | Alloc (size class, warm) | **O(1)** | **O(blocks/64 + slots/64)** | Next-fit cursor fast path; CTZ word scans in `DynBitset` & `SlotFreemap` |
-| Alloc (size class, grow / refill) | **O(log m)** + OS `new[]` | **O(log m)** + OS `new[]` | `new[]` runs **outside** `slab_lock`; `trimmed_blocks_` refill or geometric `blocks_` append + `base_address_map_` insert |
-| Free (`Pool`, `align ≥ 16`, hinted) | **O(1)** | **O(1)** | Direct `blocks_[block_index]` + generation + exact slot address check; **zero map lookup, zero division** |
-| Free (`Pool` `align ≤ 8` / unhinted `Slab`) | **O(1)** (`m = 1`) | **O(log m)** (`m > 1`) | Single-Block range check when `m = 1`; `base_address_map_.upper_bound` + `offset / ElemSize` otherwise |
+| Alloc (size class, grow / refill) | **O(1)** amortized + OS `new[]` | **O(1)** amortized + OS `new[]` | `new[]` runs **outside** `slab_lock`; `trimmed_blocks_` refill or geometric `blocks_` append + O(1) `address_index_` append |
+| Free (`Pool`, `align ≥ 16`, hinted) | **O(1)** | **O(1)** | Direct `blocks_[block_index]` + generation + exact slot address check; **zero address-index lookup, zero division** |
+| Free (`Pool` `align ≤ 8` / unhinted `Slab`) | **O(1)** (`m = 1`) | **O(log m)** (`m > 1`) | Single-Block range check when `m = 1`; lazy-sorted flat `address_index_` binary search + `offset / ElemSize` otherwise |
 | `SpinLock` uncontended / `NullLock` | **O(1)** / **0** | Spin → backoff → `wait` | `NullLock` compiles away completely in `NDEBUG` |
 | `SlabProxy` alloc/free | OS dependent | OS dependent | Lock-free; no slot freemap or retention |
-| `trim` (`reclaimEmptyBlocks`) | **O(classes × blocks/64)** | **O(classes × (blocks/64 + k log m))** | Word-level `find_prev_set` scans high-to-low, pops trailing shells (with 4× hysteresis shrink), and frees `k` detached buffers **outside** `slab_lock` |
+| `trim` (`reclaimEmptyBlocks`) | **O(classes × blocks/64)** | **O(classes × (blocks/64 + m))** | Word-level `find_prev_set` scans high-to-low, batch `std::erase_if` on `address_index_`, pops trailing shells (with 4× hysteresis shrink), and frees `k` detached buffers **outside** `slab_lock` |
 
 “Hot O(1)” alloc assumes `block_available_map_` keeps you on a non-full `Block`
 and that the next-fit cursor lands on a free Slot (typical sequential / LIFO
@@ -1290,21 +1317,77 @@ Waste has three buckets:
 3. Retained empty `Block` backing buffers until `trim` (RSS), plus ~24–80 B per
    trimmed `Block` shell in `blocks_` (reused O(1) on next growth)  
 
+### Hot/cold codegen & `SPALLOCATOR_*INLINE` macros
+
+`spallocator/impl/helper.hpp` defines three portable `#ifndef`-guarded
+compiler-hint macros used across `Block` and `Slab` to control code layout,
+inlining budgets, and register pressure on the allocation and deallocation fast
+paths:
+
+| Macro | GCC / Clang | MSVC | Effect on **caller** | Effect on **callee** | Current call sites |
+|-------|-------------|------|----------------------|----------------------|--------------------|
+| **`SPALLOCATOR_COLD_NOINLINE`** | `[[gnu::cold, gnu::noinline]]` | `__declspec(noinline)` | Never inlined; branches leading to the call are treated as unlikely (`[[unlikely]]` inferred), keeping the hot path straight-line with minimal stack frame and zero EH landing-pad pollution | Optimized for size (`-Os`) and placed in `.text.unlikely` away from hot I-cache lines | `detail::throwSizeExceedsElemSize`, `detail::throwMaxBlocksExceeded`, `detail::throwInvalidArgument`, `Slab::allocateSlow`, `Slab::findAvailableBlockLocked`, `Block::allocateSlotSlow` |
+| **`SPALLOCATOR_NOINLINE`** | `[[gnu::noinline]]` | `__declspec(noinline)` | Never inlined; keeps the primary hot path compact, avoids callee-saved register spills, and allows tail-call dispatch | Compiled at **full `-O3`** in normal `.text` and free to inline its own callees | `Slab::deallocateUnhintedLocked` |
+| **`SPALLOCATOR_ALWAYS_INLINE`** | `[[gnu::always_inline]] inline` | `__forceinline` | Forced inline into caller even when compiler cost heuristics hesitate around lock guards or template wrappers; keeps register-returned structs (`AllocateItemResult`) in registers | Inline linkage preserved for header-defined templates | `Slab::tryAllocateFromExistingLocked` |
+
+**Why throws are outlined into non-template `detail::throw*` helpers:**
+In C++, writing `throw std::invalid_argument(std::format(...))` directly inside
+`Slab::allocateItem()` or `Slab::deallocateItem()` forces the compiler to keep
+`std::format` buffers, `std::string` destructors, and exception-handling unwind
+landing pads inside the hot function's frame — even though those branches are
+never taken in normal execution. That has three compounding costs:
+1. **Stack frame & spill tax:** extra callee-saved registers are pushed/popped in
+   the prologue/epilogue on *every* hot call, even when the fast path returns
+   without throwing.
+2. **Inlining-budget collapse:** the bloated IR pushes `allocateItem()` /
+   `deallocateItem()` over the compiler's inline threshold so tiny helpers like
+   `tryAllocateFromExistingLocked()` stop inlining.
+3. **Template code bloat:** `Slab<ElemSize, Alignment, Lock>` is instantiated
+   dozens of times (3 alignment ladders × ~16 size classes × lock policies).
+   Calling non-template `[[noreturn]] SPALLOCATOR_COLD_NOINLINE` helpers shares
+   one cold throw implementation across every `Slab` instantiation and reduces
+   each error check in the hot function to a single conditional branch to a cold
+   tail call.
+
+**Why `SPALLOCATOR_NOINLINE` is distinct from `SPALLOCATOR_COLD_NOINLINE`:**
+Unhinted frees (`Pool` with `align ≤ 8` or direct `Slab::deallocateItem(ptr)`)
+are *not* error paths — for an `align=8` workload they execute on every single
+free. Marking `deallocateUnhintedLocked()` as `[[gnu::cold]]` would compile its
+contiguous binary search (`findBlockForSlotLocked()`) at `-Os` in
+`.text.unlikely` and discourage inlining inside it. Using plain
+`SPALLOCATOR_NOINLINE` gets the best of both worlds:
+- The hinted `align ≥ 16` path in `Slab::deallocateItem()` stays small (~190 B
+  on x86-64 Clang `-O3`) with zero callee-saved spills and tail-calls
+  `deallocateUnhintedLocked()` when routing hints are absent.
+- `deallocateUnhintedLocked()` itself still compiles at full `-O3` in `.text`
+  and inlines `findBlockForSlotLocked()`.
+
+**Data-cache counterpart (hot-first `Slab` layout):**
+Just as the macros separate hot and cold *instructions* into different cache
+lines, `Slab`'s member layout places the hot per-op fields (`blocks_`,
+`block_available_map_`, next-fit cursor, and `slab_lock`) in the leading two
+cache lines and moves growth/trim/unhinted-lookup metadata (`live_block_count_`,
+`address_index_`, `trimmed_blocks_`, `next_block_generation_`,
+`address_index_sorted_`) behind them (reducing `sizeof(Slab)` by 24 B across all
+lock policies).
+
 ### Scalability levers
 
 | Lever | Effect |
 |-------|--------|
 | Lock-free `Pool::resolveSlab` + per-`Slab` locks | Different size classes proceed in parallel with zero pool-wide lock |
 | Out-of-lock `allocateSlow` / `reclaimEmptyBlocks` | OS heap / `mmap` / page-fault latency never holds `slab_lock` |
-| O(1) header-hinted free (`align ≥ 16`) | Shorter `slab_lock` hold time on multi-Block frees (no RB-tree walk) |
+| O(1) header-hinted free (`align ≥ 16`) | Shorter `slab_lock` hold time on multi-Block frees (no address-index search) |
+| Lazy-sorted flat `address_index_` (`align ≤ 8` / unhinted) | Contiguous 16 B/entry binary search replaces per-Block `std::map` nodes; faster unhinted bulk frees and cleaner glibc coalescing on `~Pool()` |
+| Hot/cold codegen split (`SPALLOCATOR_*INLINE`) & hot-first `Slab` layout | Keeps `allocateItem` / `deallocateItem` compact in I-cache with minimal register spills and hot metadata in the first two D-cache lines |
 | Multiple pools | Isolate shards / tenants; reduce cross-talk and lock sharing |
 | Compile-time `Lock` policy (`NullLock` / `std::mutex` / `SpinLock`) | Eliminates atomic TAS cost completely for single-thread domains |
 | Eager Slabs + selective first-Block | Lock-free resolve on all alignment classes; cold RSS only for configured warm classes |
 | `trim` | Synchronously reclaims empty `Block` buffers after spikes without a background thread |
 | `SlabProxy` | Avoids forcing huge objects through size-class bookkeeping |
 
-Measure before replacing the address map or moving to a freelist — both are
-deliberate simplicity until profiles disagree.
+Measure before moving to an intrusive freelist — `SlotFreemap` + next-fit CTZ
+remains deliberate simplicity until profiles disagree.
 
 ### P4 re-baseline (measure-gated hot path)
 
@@ -1474,7 +1557,7 @@ Solid for concurrent service use of the pool, slabs, smart-pointer helpers, and
 |-------|--------|
 | Pool destroy while clients hold pointers | **Addressed** — ControlBlock / Handle / BlockToken; orderly + arena + heap auto-retire |
 | Alloc bit scan | Next-fit + CTZ (`SlotFreemap` + `DynBitset::find_next_set`, production); freelist deferred |
-| Free routing / address map | **O(1)** indexed routing via header hints (`align ≥ 16`); **O(1)** single-Block / **O(log m)** `std::map` fallback for `align ≤ 8` and direct unhinted `Slab` frees (denser unhinted lookup is an S5 candidate) |
+| Free routing / address index | **O(1)** indexed routing via header hints (`align ≥ 16`); **O(1)** single-Block / **O(log m)** lazy-sorted flat `address_index_` binary search for `align ≤ 8` and direct unhinted `Slab` frees |
 | Trimmed Block shells | `trim()` frees ≥8 KiB backing buffers outside `slab_lock` and synchronously pops trailing trimmed `Block` shells (with 4× hysteresis `shrink_to_fit`, never during `deallocateItem`); interior trimmed shells below a live higher-index Block stay at ~24–80 B for O(1) refill until the tail empties |
 | Fixed size-class ladders | Deliberate; exact-pack buffers within classes; non-ladder shaping is backlog R2 |
 | Lock type | **Done** — compile-time selectable (`mlvlib::SpinLock` default, `std::mutex`, or zero-overhead `mlvlib::NullLock` for single-thread domains) via `--with-lock-policy=` / `LOCK_POLICY=` or `Pool(std::in_place_type<Lock>)` |

@@ -377,7 +377,7 @@ namespace spallocator
         Allocation alloc;
         alloc.size = item_size;
 
-        if (item_size > kMaxAllocationBytes)
+        if (item_size > kMaxAllocationBytes) [[unlikely]]
         {
             // excessively large allocations don't belong in the pool
             // slabs; use other allocation methods instead
@@ -388,7 +388,7 @@ namespace spallocator
         // Range and power-of-two checks throw in all builds (including release).
         // Non-power-of-two values in [4, 64] (e.g. 12) would break header/alignment-class math.
         if (alignment < kMinAlignment || alignment > kMaxAlignment ||
-            (alignment & (alignment - 1)) != 0)
+            (alignment & (alignment - 1)) != 0) [[unlikely]]
         {
             note_alloc_fail();
             throw std::invalid_argument("Unsupported alignment requested");
@@ -442,6 +442,8 @@ namespace spallocator
         *magic_ptr = kAllocMagic;
 
         // Routing hints (header_size ≥ 16 only). 8-byte headers have no pad.
+        // Slab populates valid (block_index, slot_index, block_generation);
+        // SlabProxy populates (kInvalidBlockIndex, 0, 0), so no branch is needed.
         if (header_size >= 16)
         {
             auto* gen_ptr = reinterpret_cast<std::uint16_t*>(alloc.ptr + header_size - 8);
@@ -449,18 +451,9 @@ namespace spallocator
             auto* slot_idx_ptr = reinterpret_cast<std::uint16_t*>(alloc.ptr + header_size - 12);
             auto* block_idx_ptr = reinterpret_cast<std::uint32_t*>(alloc.ptr + header_size - 16);
             *reserved_ptr = 0;
-            if (item.hasRoutingHint())
-            {
-                *gen_ptr = item.block_generation;
-                *slot_idx_ptr = item.slot_index;
-                *block_idx_ptr = item.block_index;
-            }
-            else
-            {
-                *gen_ptr = 0;
-                *slot_idx_ptr = 0;
-                *block_idx_ptr = kInvalidBlockIndex;
-            }
+            *gen_ptr = item.block_generation;
+            *slot_idx_ptr = item.slot_index;
+            *block_idx_ptr = item.block_index;
         }
 
         control_->note_alloc();

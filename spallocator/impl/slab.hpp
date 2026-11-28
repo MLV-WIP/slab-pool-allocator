@@ -38,8 +38,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <functional>
+#include <iterator>
 #include <limits>
-#include <map>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -54,6 +55,32 @@
 
 namespace spallocator
 {
+
+    namespace detail
+    {
+        // Out-of-line cold throw helpers keep std::format / exception-construction
+        // IR and landing pads out of Slab::allocateItem() and Slab::deallocateItem(),
+        // allowing the hot fast paths to inline cleanly and avoid stack-frame spills.
+        [[noreturn]] SPALLOCATOR_COLD_NOINLINE inline void throwSizeExceedsElemSize(
+            std::size_t size, std::size_t elem_size)
+        {
+            throw std::invalid_argument(
+                std::format("Requested size {} exceeds slab element size {}", size, elem_size));
+        }
+
+        [[noreturn]] SPALLOCATOR_COLD_NOINLINE inline void throwMaxBlocksExceeded(
+            std::size_t max_blocks, std::size_t block_bytes)
+        {
+            throw std::out_of_range(
+                std::format("Cannot allocate more than {} blocks of size {} bytes",
+                            max_blocks, block_bytes));
+        }
+
+        [[noreturn]] SPALLOCATOR_COLD_NOINLINE inline void throwInvalidArgument(const char* msg)
+        {
+            throw std::invalid_argument(msg);
+        }
+    } // namespace detail
 
     // Runtime-sized bit vector over uint64_t words. Used for per-Slab Block
     // availability and empty-live tracking so empty size classes do not embed
@@ -135,7 +162,7 @@ namespace spallocator
         std::size_t reclaimEmptyBlocks(std::size_t keep_min = 1) override;
 
         // `slot_base` must be an exact Slot start (not a Pool user pointer).
-        // O(1) when 1 live Block; O(log m) otherwise via base_address_map_.
+        // O(1) when 1 live Block; O(log m) contiguous binary search via address_index_.
         std::optional<std::size_t> findBlockForSlot(std::byte* slot_base) const;
 
         // preallocate_first_block: map one data block at construction (warm
@@ -145,6 +172,12 @@ namespace spallocator
         ~Slab() override;
 
     private: // types
+        struct BlockAddrEntry
+        {
+            std::byte* base{nullptr};
+            std::uint32_t block_index{0};
+        };
+
         struct RawBufferGuard
         {
             std::byte* ptr{nullptr};
@@ -180,18 +213,38 @@ namespace spallocator
         // Returns AllocateItemResult{} (ptr == nullptr) when no live Block has a free slot.
         // Returning the 16-byte struct directly avoids both an out-parameter and
         // std::optional's 24-byte stack-return (sret) ABI on x86-64.
-        AllocateItemResult tryAllocateFromExistingLocked() noexcept;
+        SPALLOCATOR_ALWAYS_INLINE AllocateItemResult tryAllocateFromExistingLocked() noexcept;
 
         // Cold block-availability word scan (called when alloc_cursor_block_ is full).
-        std::size_t findAvailableBlockLocked(std::size_t start, std::size_t nblocks) const noexcept;
+        SPALLOCATOR_COLD_NOINLINE std::size_t
+        findAvailableBlockLocked(std::size_t start, std::size_t nblocks) const noexcept;
 
         // Cold growth path: allocates backing buffer outside slab_lock, publishes
         // (or reuses a concurrently grown Block), and allocates one slot.
-        AllocateItemResult allocateSlow();
+        SPALLOCATOR_COLD_NOINLINE AllocateItemResult allocateSlow();
+
+        // Unhinted free path (align-8 Pool frees and direct unhinted Slab calls).
+        // Split out with NOINLINE (not COLD) so the hinted O(1) fast path in
+        // deallocateItem() stays compact while unhinted free still gets full -O3.
+        // Caller must hold slab_lock.
+        SPALLOCATOR_NOINLINE void deallocateUnhintedLocked(std::byte* item);
+
+        // Lookup owning Block index via address_index_, lazily sorting if needed.
+        // Caller must hold slab_lock.
+        std::optional<std::size_t> findBlockForSlotLocked(std::byte* slot_base) noexcept;
+
+        // Binary search over a sorted address_index_.
+        std::optional<std::size_t> binarySearchAddressIndex(std::byte* slot_base) const noexcept;
 
         // Publish a pre-allocated buffer into a trimmed Block (O(1)) or append
         // a new Block. Caller must hold slab_lock.
         std::size_t publishBlockBuffer(RawBufferGuard& raw_buf);
+
+        // Append a (base, block_index) pair to address_index_ in O(1), marking
+        // address_index_sorted_ false if out of ascending order (sorted lazily
+        // only if an unhinted free / lookup actually runs). Caller must have
+        // reserved capacity so append cannot throw.
+        void appendAddressEntryNoThrow(std::byte* base, std::uint32_t block_index) noexcept;
 
     private: // data members
         static constexpr std::size_t block_bytes{block_type::block_bytes};
@@ -202,30 +255,40 @@ namespace spallocator
         static_assert(max_blocks <= std::numeric_limits<std::uint32_t>::max(),
             "max_blocks must fit in uint32_t block_index routing hint");
 
+        // Hot-first layout: alloc & hinted-free fields sit in the first two
+        // 64-byte cache lines (vptr + blocks_ + block_available_map_ + cursors
+        // + slab_lock), keeping cold growth/trim/unhinted-lookup metadata separate.
+
         // Index-stable collection of Blocks. Trimmed Blocks keep buffer_ == nullptr
         // and are recycled via trimmed_blocks_ without shifting indices.
         std::vector<block_type> blocks_;
-        std::uint16_t next_block_generation_{1};
-        std::size_t live_block_count_{0};
 
         // Bit i == 1 iff blocks_[i].hasFree() (live buffer and >= 1 free slot).
         DynBitset block_available_map_;
-
-        // LIFO stack of trimmed Block indices (buffer_ == nullptr) for O(1) refill.
-        std::vector<std::uint32_t> trimmed_blocks_;
-
-        // Cold O(log m) address-range index used ONLY for hint-less frees
-        // (align-8 Pool frees and direct unhinted Slab::deallocateItem) and
-        // findBlockForSlot(). Never touched on the O(1) hinted free path.
-        std::map<std::byte*, std::size_t> base_address_map_;
 
         // Next-fit cursors for allocateItem (indices into blocks_ / freemap).
         std::size_t alloc_cursor_block_{0};
         std::size_t alloc_cursor_slot_{0};
 
-        // Placed last so [[no_unique_address]] collapses empty Lock types (NullLock
-        // in release) to 0 bytes without exposing tail padding to later members.
+        // Placed right after 8-byte aligned hot fields so [[no_unique_address]]
+        // collapses empty Lock types (NullLock in release) to 0 bytes while keeping
+        // SpinLock/std::mutex inside cache line 1 alongside the cursors.
         MLVLIB_NO_UNIQUE_ADDRESS Lock slab_lock;
+
+        // Cold metadata (touched on growth, trim, stats, or unhinted free only).
+        std::size_t live_block_count_{0};
+
+        // Sorted contiguous (base, block_index) array used ONLY for hint-less frees
+        // (align-8 Pool frees and direct unhinted Slab::deallocateItem) and
+        // findBlockForSlot(). Replaces std::map to eliminate RB-tree pointer chasing
+        // and per-node heap allocations.
+        std::vector<BlockAddrEntry> address_index_;
+
+        // LIFO stack of trimmed Block indices (buffer_ == nullptr) for O(1) refill.
+        std::vector<std::uint32_t> trimmed_blocks_;
+
+        std::uint16_t next_block_generation_{1};
+        bool address_index_sorted_{true};
     };
 
 
@@ -484,9 +547,7 @@ namespace spallocator
 
             if (live_block_count_ >= max_blocks)
             {
-                throw std::out_of_range(
-                    std::format("Cannot allocate more than {} blocks of size {} bytes",
-                                max_blocks, block_bytes));
+                detail::throwMaxBlocksExceeded(max_blocks, block_bytes);
             }
 
             const std::size_t published_index = publishBlockBuffer(staged_buf);
@@ -508,10 +569,9 @@ namespace spallocator
     {
         // Must remain active in release builds: an oversized request would
         // otherwise be placed in a too-small slot (silent overrun).
-        if (size > ElemSize)
+        if (size > ElemSize) [[unlikely]]
         {
-            throw std::invalid_argument(
-                std::format("Requested size {} exceeds slab element size {}", size, ElemSize));
+            detail::throwSizeExceedsElemSize(size, ElemSize);
         }
 
         {
@@ -522,11 +582,9 @@ namespace spallocator
                 return result;
             }
 
-            if (live_block_count_ >= max_blocks)
+            if (live_block_count_ >= max_blocks) [[unlikely]]
             {
-                throw std::out_of_range(
-                    std::format("Cannot allocate more than {} blocks of size {} bytes",
-                                max_blocks, block_bytes));
+                detail::throwMaxBlocksExceeded(max_blocks, block_bytes);
             }
         }
 
@@ -535,22 +593,25 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
-    std::optional<std::size_t> Slab<ElemSize, Alignment, Lock>::findBlockForSlot(std::byte* slot_base) const
+    std::optional<std::size_t>
+    Slab<ElemSize, Alignment, Lock>::binarySearchAddressIndex(std::byte* slot_base) const noexcept
     {
-        if (base_address_map_.empty())
+        const std::size_t n = address_index_.size();
+        if (n == 0)
         {
             return std::nullopt;
         }
 
-        // Single-live-Block fast path: O(1) without tree traversal.
-        if (base_address_map_.size() == 1)
+        // Single-live-Block fast path: O(1) without binary search.
+        if (n == 1)
         {
-            const auto it = base_address_map_.begin();
-            std::byte* const block_start = it->first;
+            const BlockAddrEntry& entry = address_index_[0];
+            std::byte* const block_start = entry.base;
             std::byte* const block_end = block_start + block_bytes;
-            if (slot_base >= block_start && slot_base < block_end)
+            if (!std::ranges::less{}(slot_base, block_start) &&
+                std::ranges::less{}(slot_base, block_end))
             {
-                return it->second;
+                return entry.block_index;
             }
             debug_println(
                 "Slot base {} is not within sole block range {} - {}; treating as unknown pointer",
@@ -560,19 +621,24 @@ namespace spallocator
             return std::nullopt;
         }
 
-        auto it = base_address_map_.upper_bound(slot_base);
-        if (it != base_address_map_.begin())
+        // Contiguous binary search for upper_bound(slot_base): find the first
+        // entry with base > slot_base (under strict pointer total order), then
+        // inspect its predecessor.
+        const auto it = std::ranges::upper_bound(
+            address_index_, slot_base, std::ranges::less{}, &BlockAddrEntry::base);
+        if (it != address_index_.begin())
         {
-            --it;
-            std::byte* const block_start = it->first;
+            const BlockAddrEntry& candidate = *std::prev(it);
+            std::byte* const block_start = candidate.base;
             std::byte* const block_end = block_start + block_bytes;
 
             // Predecessor start is only a candidate. Invalid pointers (or
             // addresses in gaps between Blocks) can upper_bound into this path
             // without falling inside [block_start, block_end).
-            if (slot_base >= block_start && slot_base < block_end)
+            if (!std::ranges::less{}(slot_base, block_start) &&
+                std::ranges::less{}(slot_base, block_end))
             {
-                return it->second;
+                return candidate.block_index;
             }
 
             debug_println(
@@ -586,12 +652,118 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    std::optional<std::size_t>
+    Slab<ElemSize, Alignment, Lock>::findBlockForSlotLocked(std::byte* slot_base) noexcept
+    {
+        mlvlib::assert_lock_held(slab_lock);
+
+        if (!address_index_sorted_) [[unlikely]]
+        {
+            std::ranges::sort(address_index_, std::ranges::less{}, &BlockAddrEntry::base);
+            address_index_sorted_ = true;
+        }
+        return binarySearchAddressIndex(slot_base);
+    }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    std::optional<std::size_t> Slab<ElemSize, Alignment, Lock>::findBlockForSlot(std::byte* slot_base) const
+    {
+        if (address_index_sorted_)
+        {
+            return binarySearchAddressIndex(slot_base);
+        }
+
+        // Read-only const fallback if Blocks were published out of ascending
+        // address order and no locked unhinted free has sorted address_index_ yet.
+        for (const BlockAddrEntry& entry : address_index_)
+        {
+            if (!std::ranges::less{}(slot_base, entry.base) &&
+                std::ranges::less{}(slot_base, entry.base + block_bytes))
+            {
+                return entry.block_index;
+            }
+        }
+        return std::nullopt;
+    }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    void Slab<ElemSize, Alignment, Lock>::deallocateUnhintedLocked(std::byte* item)
+    {
+        mlvlib::assert_lock_held(slab_lock);
+
+        std::size_t resolved_block = 0;
+        if (block_available_map_.size() == 1 && blocks_[0].isLive())
+        {
+            // Direct single-Block fast path: skip address_index_ completely when
+            // Block 0 is the only entry (steady-state single-Block LIFO/churn).
+            if (!blocks_[0].containsAddress(item)) [[unlikely]]
+            {
+                debug_println(
+                    "Invalid item pointer; not within sole block: item={}",
+                    static_cast<void*>(item));
+                detail::throwInvalidArgument(
+                    "Invalid item pointer; no corresponding block found");
+            }
+            resolved_block = 0;
+        }
+        else
+        {
+            const auto block_index_opt = findBlockForSlotLocked(item);
+            if (!block_index_opt.has_value()) [[unlikely]]
+            {
+                debug_println(
+                    "Invalid item pointer; no corresponding block found: item={}",
+                    static_cast<void*>(item));
+                detail::throwInvalidArgument(
+                    "Invalid item pointer; no corresponding block found");
+            }
+            resolved_block = *block_index_opt;
+        }
+
+        auto& blk = blocks_[resolved_block];
+        std::byte* const block_start = blk.buffer();
+
+        // Require an exact slot base. Integer division alone would map an
+        // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
+        // the freemap — or free a live neighbor.
+        const auto offset = item - block_start;
+        if (offset < 0) [[unlikely]]
+        {
+            detail::throwInvalidArgument(
+                "Invalid item pointer; address is before block start");
+        }
+        const std::size_t byte_offset = static_cast<std::size_t>(offset);
+        const std::size_t item_index = byte_offset / ElemSize;
+        if (item_index >= slots_per_block || item != blk.slotAddress(item_index)) [[unlikely]]
+        {
+            detail::throwInvalidArgument(
+                "Invalid item pointer; not aligned to a slot boundary");
+        }
+
+        if (!blk.testSlot(item_index)) [[unlikely]]
+        {
+            detail::throwInvalidArgument("Item is already free");
+        }
+
+        blk.deallocateSlot(item_index);
+        if (blk.liveCount() == slots_per_block - 1)
+        {
+            block_available_map_.set(resolved_block);
+        }
+        debug_println("Item freed ({}/{}), block_freemaps: {}",
+                      resolved_block, item_index, printHex(blk.freemap()));
+    }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
     void Slab<ElemSize, Alignment, Lock>::deallocateItem(std::byte* item,
                                                          std::uint32_t block_index,
                                                          std::uint16_t slot_index,
                                                          std::uint16_t block_generation)
     {
-        if (!item)
+        if (!item) [[unlikely]]
         {
             return;
         }
@@ -601,43 +773,43 @@ namespace spallocator
         const bool has_index = (block_index != kInvalidBlockIndex);
         const bool has_gen = (block_generation != 0);
 
-        if (has_index && has_gen)
+        if (has_index && has_gen) [[likely]]
         {
-            // O(1) indexed fast path: zero std::map lookup, zero integer division.
-            if (block_index >= block_available_map_.size())
+            // O(1) indexed fast path: zero address-index lookup, zero integer division.
+            if (block_index >= block_available_map_.size()) [[unlikely]]
             {
-                throw std::invalid_argument(
+                detail::throwInvalidArgument(
                     "Invalid item pointer; block_index out of range");
             }
 
             auto& blk = blocks_[block_index];
-            if (!blk.isLive() || blk.generation() != block_generation)
+            if (!blk.isLive() || blk.generation() != block_generation) [[unlikely]]
             {
                 debug_println(
                     "Invalid item pointer; Block not live or generation mismatch: "
                     "block_index={}, live={}, blk_gen={}, hint_gen={}",
                     block_index, blk.isLive(), blk.generation(), block_generation);
-                throw std::invalid_argument(
+                detail::throwInvalidArgument(
                     "Invalid item pointer; block generation mismatch");
             }
 
-            if (slot_index >= slots_per_block || item != blk.slotAddress(slot_index))
+            if (slot_index >= slots_per_block || item != blk.slotAddress(slot_index)) [[unlikely]]
             {
                 debug_println(
                     "Invalid item pointer; slot_index address mismatch: "
                     "slot_index={}, blk_addr={}, blk_slot_addr={}",
                     slot_index, static_cast<void*>(item), static_cast<void*>(blk.slotAddress(slot_index)));
-                throw std::invalid_argument(
+                detail::throwInvalidArgument(
                     "Invalid item pointer; slot_index address mismatch");
             }
 
-            if (!blk.testSlot(slot_index))
+            if (!blk.testSlot(slot_index)) [[unlikely]]
             {
                 debug_println(
                     "Invalid item pointer; slot already free: "
                     "block_index={}, slot_index={}",
                     block_index, slot_index);
-                throw std::invalid_argument("Item is already free");
+                detail::throwInvalidArgument("Item is already free");
             }
 
             blk.deallocateSlot(slot_index);
@@ -650,61 +822,17 @@ namespace spallocator
             return;
         }
 
-        if (has_index != has_gen)
+        if (has_index != has_gen) [[unlikely]]
         {
             debug_println(
                 "Invalid item pointer; inconsistent block routing hint: "
                 "has_index={}, has_gen={}",
                 has_index, has_gen);
-            throw std::invalid_argument(
+            detail::throwInvalidArgument(
                 "Invalid item pointer; inconsistent block routing hint");
         }
 
-        // Cold unhinted fallback (align-8 Pool frees and direct unhinted Slab calls).
-        // O(1) for 1 live Block, O(log m) via base_address_map_ otherwise.
-        const auto block_index_opt = findBlockForSlot(item);
-        if (!block_index_opt.has_value())
-        {
-            debug_println(
-                "Invalid item pointer; no corresponding block found: "
-                "item={}",
-                static_cast<void*>(item));
-            throw std::invalid_argument("Invalid item pointer; no corresponding block found");
-        }
-
-        const std::size_t resolved_block = *block_index_opt;
-        auto& blk = blocks_[resolved_block];
-        std::byte* const block_start = blk.buffer();
-
-        // Require an exact slot base. Integer division alone would map an
-        // interior pointer (e.g. slot + 1) onto the wrong bit and corrupt
-        // the freemap — or free a live neighbor.
-        const auto offset = item - block_start;
-        if (offset < 0)
-        {
-            throw std::invalid_argument(
-                "Invalid item pointer; address is before block start");
-        }
-        const std::size_t byte_offset = static_cast<std::size_t>(offset);
-        const std::size_t item_index = byte_offset / ElemSize;
-        if (item_index >= slots_per_block || item != blk.slotAddress(item_index))
-        {
-            throw std::invalid_argument(
-                "Invalid item pointer; not aligned to a slot boundary");
-        }
-
-        if (!blk.testSlot(item_index))
-        {
-            throw std::invalid_argument("Item is already free");
-        }
-
-        blk.deallocateSlot(item_index);
-        if (blk.liveCount() == slots_per_block - 1)
-        {
-            block_available_map_.set(resolved_block);
-        }
-        debug_println("Item freed ({}/{}), block_freemaps: {}",
-                      resolved_block, item_index, printHex(blk.freemap()));
+        deallocateUnhintedLocked(item);
     }
 
 
@@ -777,14 +905,27 @@ namespace spallocator
                     throw;
                 }
 
-                std::byte* doomed = blk.detachBuffer();
-                base_address_map_.erase(doomed);
+                (void)blk.detachBuffer();
                 block_available_map_.reset(idx);
                 --live_block_count_;
 
                 if (alloc_cursor_block_ == idx)
                 {
                     alloc_cursor_slot_ = 0;
+                }
+            }
+
+            // Batch-remove all detached entries from address_index_ in one
+            // linear pass (preserving sortedness if already sorted) BEFORE
+            // popping trailing Block shells so every e.block_index is in bounds.
+            if (!to_free.empty())
+            {
+                std::erase_if(address_index_, [this](const BlockAddrEntry& e) {
+                    return !blocks_[e.block_index].isLive();
+                });
+                if (address_index_.size() <= 1)
+                {
+                    address_index_sorted_ = true;
                 }
             }
 
@@ -817,7 +958,7 @@ namespace spallocator
                 std::byte* const buf = blocks_.back().detachBuffer();
                 block_available_map_.reset(blocks_.size() - 1);
                 blocks_[0].attachBuffer(buf, gen);
-                base_address_map_[buf] = 0;
+                address_index_[0].block_index = 0;
                 block_available_map_.set(0);
                 next_block_generation_ = next_gen;
 
@@ -857,6 +998,7 @@ namespace spallocator
                 {
                     blocks_.shrink_to_fit();
                     trimmed_blocks_.shrink_to_fit();
+                    address_index_.shrink_to_fit();
                     block_available_map_.shrink_to_fit();
                 }
                 catch (...)
@@ -879,6 +1021,19 @@ namespace spallocator
 
 
     template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
+    void Slab<ElemSize, Alignment, Lock>::appendAddressEntryNoThrow(
+        std::byte* base, std::uint32_t block_index) noexcept
+    {
+        if (address_index_sorted_ && !address_index_.empty() &&
+            std::ranges::less{}(base, address_index_.back().base))
+        {
+            address_index_sorted_ = false;
+        }
+        address_index_.push_back(BlockAddrEntry{base, block_index});
+    }
+
+
+    template<std::size_t ElemSize, std::size_t Alignment, mlvlib::BasicLockable Lock>
     std::size_t Slab<ElemSize, Alignment, Lock>::publishBlockBuffer(RawBufferGuard& raw_buf)
     {
         mlvlib::assert_lock_held(slab_lock);
@@ -890,13 +1045,21 @@ namespace spallocator
             next_gen = 1; // 0 reserved for "no hint"
         }
 
+        // Grow address_index_ geometrically before mutating any Slab container
+        // so append below is non-throwing (strong exception safety).
+        if (address_index_.size() == address_index_.capacity())
+        {
+            const std::size_t grown =
+                address_index_.empty() ? 1 : address_index_.capacity() * 2;
+            address_index_.reserve(grown);
+        }
+
         // O(1) reuse of a previously trimmed Block shell when available.
         if (!trimmed_blocks_.empty())
         {
             const std::size_t idx = trimmed_blocks_.back();
-            // Insert into address map first so bad_alloc leaves Slab untouched.
-            base_address_map_.emplace(raw_buf.ptr, idx);
             trimmed_blocks_.pop_back();
+            appendAddressEntryNoThrow(raw_buf.ptr, static_cast<std::uint32_t>(idx));
             blocks_[idx].attachBuffer(raw_buf.release(), gen);
             block_available_map_.set(idx);
             next_block_generation_ = next_gen;
@@ -905,28 +1068,19 @@ namespace spallocator
         }
 
         // Append a new Block with strong exception safety: do all potentially-
-        // throwing allocations/reserves before mutating any container size.
+        // throwing reserves before mutating any container size.
         // Grow blocks_ geometrically so reserve() preserves O(1) amortized append.
         const std::size_t idx = blocks_.size();
-        auto [map_it, inserted] = base_address_map_.emplace(raw_buf.ptr, idx);
-        (void)inserted;
-        try
+        if (blocks_.capacity() <= idx)
         {
-            if (blocks_.capacity() <= idx)
-            {
-                const std::size_t grown =
-                    blocks_.capacity() == 0 ? 1 : blocks_.capacity() * 2;
-                blocks_.reserve(grown > (idx + 1) ? grown : (idx + 1));
-            }
-            block_available_map_.reserve(idx + 1);
+            const std::size_t grown =
+                blocks_.capacity() == 0 ? 1 : blocks_.capacity() * 2;
+            blocks_.reserve(grown > (idx + 1) ? grown : (idx + 1));
         }
-        catch (...)
-        {
-            base_address_map_.erase(map_it);
-            throw;
-        }
+        block_available_map_.reserve(idx + 1);
 
         // Non-throwing final commit (all capacities >= idx + 1).
+        appendAddressEntryNoThrow(raw_buf.ptr, static_cast<std::uint32_t>(idx));
         blocks_.emplace_back(raw_buf.release(), gen);
         block_available_map_.push_set();
         next_block_generation_ = next_gen;

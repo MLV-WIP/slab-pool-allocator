@@ -265,7 +265,7 @@ namespace spallocator
         }
 
     private:
-        std::size_t allocateSlotSlow(std::size_t slot_start) noexcept
+        SPALLOCATOR_COLD_NOINLINE std::size_t allocateSlotSlow(std::size_t slot_start) noexcept
         {
             if (!hasFree())
             {

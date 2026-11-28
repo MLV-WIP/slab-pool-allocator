@@ -462,7 +462,7 @@ must then locate the specific Block and Slot.
 |----------|-----------|--------------|----------------|
 | **Direct index + verify** | Read `(block_index, slot_index, gen)` from header padding; index `blocks_[block_index]` and verify generation + exact address | **O(1)** | Default `Pool` (`align ≥ 16`, `header_size ≥ 16`) |
 | **Single-Block range check** | If only one live Block exists, check `[base, base + length)` directly | **O(1)** | Unhinted free when `m == 1` |
-| **Ordered map of bases** | `upper_bound` then step back to the candidate interval `[base, base + length)` | **O(log m)** | `align ≤ 8` `Pool` or direct unhinted `Slab` call when `m > 1` |
+| **Flat address index** | Contiguous binary search over `{base, block_index}` entries (lazily sorted on first unhinted lookup) to check `[base, base + length)` | **O(log m)** | `align ≤ 8` `Pool` or direct unhinted `Slab` call when `m > 1` |
 
 Notice the security / safety principle on *both* paths: **hints are verified,
 never blindly trusted.** On the indexed path, `Slab` checks bounds, live state,
